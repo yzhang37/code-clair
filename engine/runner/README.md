@@ -20,23 +20,25 @@
 
 ## 安装与入口
 
+本节 Make 命令在安装后的宿主根目录运行。原厂仓库直接使用根 `engine/`，宿主才使用 `.clarity/engine/`；软件安装、Git 更新和生成 Make 入口见[安装说明](../../README.md#安装与更新)。原厂根 Makefile 只负责离线测试。
+
 需要 Python 3.10+ 和可用 Codex CLI；配置未指定模型时使用 CLI 默认。API key/auth.json 认证适配已有，只有系统钥匙串的方式仍未验证。
 
-在仓库根目录安装：
+填好宿主自己的正式资料后，首次启用提交审核：
 
 ```sh
 make review-install
 ```
 
-此入口先调用 Python 安装器，再安装自己的 commit-msg，移除自己的旧 pre-commit；不运行语义审核、不覆盖外来 hook、不改当前资料或未填底稿。运行引擎复制到 Git common dir 并绑定版本，其中包括模型正文、唯一 Principles、流程、全部共享 Markdown 提示词及安装清单中的 runner 模块；`material_check.py`、`maintenance.py` 和 `material-check.md` 已纳入清单。已有安装快照不会随源文件编辑自动更新；修改源引擎的模型、Principles、流程、程序或提示词后须重新运行此入口。普通仓库通常使用 `.git/clarity/`，worktree 由 Git 决定控制目录。直接调用 Python 安装器仍会安装 pre-commit，不能代替此入口。
+此入口先调用 Python 审核安装器，再安装自己的 commit-msg，移除自己的旧 pre-commit；不运行语义审核、不覆盖外来 hook、不改当前资料或未填底稿。运行引擎复制到 Git common dir 并绑定版本，其中包括模型正文、唯一 Principles、流程、全部共享 Markdown 提示词及安装清单中的 runner 模块；`material_check.py`、`maintenance.py` 和 `material-check.md` 已纳入清单。已有安装快照不会随源文件编辑自动更新。普通仓库通常使用 `.git/clarity/`，worktree 由 Git 决定控制目录。直接调用 Python 审核安装器仍会安装 pre-commit，不能代替此入口。
 
-该 Make 入口按默认依据选择、默认模型、两个首审及 600 秒调用上限重建配置，不继承旧配置中的自定义安装参数。
+该 Make 入口按默认依据选择、默认模型、两个首审及 600 秒调用上限重建配置，不继承旧配置中的自定义安装参数。它不是软件更新入口：已有独立安装在宿主运行 `python3 .clarity/setup.py update`，会同步源文件、运行快照及自己的 hook，保留审核配置与规则采用哈希，仅更新引擎摘要。
 
 不传 `--basis` 时，默认发现目标仓库自己的 `current/rules.md` 和 `current/cases/`；前者是代码准则，后者是检验规则的 fixtures。不自动读取其他仓库资料或把来源原文当独立依据。普通代码审核按固定基线与当前 Git 快照的路径并集展开选择，之后加案例不必逐个重装，删除与空白材料也不从本次选择中悄悄消失。空底稿不等于正式规则或 fixtures。
 
 显式 `--basis` 仍可选目标仓库的自定义规则位置，但不能把 `.clarity/engine/` 内的元文档、提示词或程序选为产品依据；选文件或展开目录均拒绝，既有配置在运行时也检查这一边界。该限制按引擎位置识别，不禁止其他目录中的同名文件。
 
-优先使用仓库根目录现有 [Makefile](../../../Makefile)：
+使用宿主根目录加载的生成入口：
 
 ```sh
 make review

@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from make_integration import rendered_sidecar_makefile
 import maintenance
 import material_check
 import review
@@ -27,7 +28,7 @@ from codex_model import ModelFailure
 
 RUNNER = Path(__file__).resolve().parent
 ENGINE = RUNNER.parent
-MAKEFILE = ENGINE.parents[1] / "Makefile"
+MAKEFILE = rendered_sidecar_makefile()
 RULE = ".clarity/current/rules.md"
 CASE = ".clarity/current/cases/0001. offline-positive-negative.md"
 FIXTURE = """# 固定片段的正反判定
@@ -208,7 +209,7 @@ class IsolatedMaintenanceTests(unittest.TestCase):
         self.git("config", "commit.gpgsign", "false")
         self.engine = self.repo / ".clarity/engine"
         shutil.copytree(ENGINE, self.engine, ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copyfile(MAKEFILE, self.repo / "Makefile")
+        (self.repo / "Makefile").write_bytes(MAKEFILE)
         self.write(RULE, "保留明确给定的事实，不以遗漏事实的片段作为完整表达。\n")
         self.write(CASE, FIXTURE)
         self.write("ordinary.py", "ORDINARY_SOURCE_MUST_NOT_REACH_MATERIAL_CHECKS = True\n")
