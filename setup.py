@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -41,13 +41,69 @@ def git(directory: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
-def repository_paths(requested: Path) -> tuple[Path, Path, Path]:
-    """repository_paths() 向宿主 Git 询问工作树、共享状态及 hook 位置，兼容 .git 文件布局。"""
-    repo = Path(git(requested.expanduser().resolve(), "rev-parse", "--show-toplevel").decode().strip())
+def repository_paths(requested: Path) -> tuple[Path, Path, Path | None]:
+    """repository_paths() 固定用户指定目录；Git 只提供本地状态位置，不改变安装目标或创建仓库。
+
+    已有 Git 根目录沿用原来的控制目录，以保留审核配置和历史；其他目录把本机状态留在 sidecar 内。
+    """
+    repo = requested.expanduser().resolve()
+    if not repo.is_dir():
+        raise SetupError("安装目标目录不存在：" + str(repo))
+    root = git_root(repo)
+    if root != repo:
+        return repo, repo / ".clarity/.local", None
     values = [Path(git(repo, "rev-parse", *arguments).decode().strip())
               for arguments in (("--git-common-dir",), ("--git-path", "hooks"))]
     common, hooks = [(value if value.is_absolute() else repo / value).resolve() for value in values]
-    return repo.resolve(), common / "clarity", hooks
+    local = repo / ".clarity/.local"
+    state = local if (local / "installation.json").is_file() else common / "clarity"
+    return repo.resolve(), state, hooks
+
+
+def git_root(target: Path) -> Path | None:
+    """git_root() 只检测当前目录所属 Git 工作树，不把没有 Git 当作软件无法安装。"""
+    try:
+        return Path(git(target, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+    except SetupError:
+        return None
+
+
+def existing_installation(target: Path) -> bool:
+    """existing_installation() 按程序、模型和模板的常规文件结构识别已有安装，不用目录是否为空判定。"""
+    sidecar = target / ".clarity"
+    required = ("engine/README.md", "engine/principles.md", "engine/workflow.md",
+                "engine/runner/install.py", "engine/runner/review.py", "engine/runner/codex_model.py",
+                "initial/rules.md", "initial/cases/case.md")
+    return (not sidecar.is_symlink() and all((sidecar / name).is_file()
+            and not (sidecar / name).is_symlink() for name in required))
+
+
+def ask(message: str, choices: dict[str, str], default: str) -> str:
+    """ask() 在终端读取一次明确选择；回车或非交互输入结束采用显示的默认值。
+
+    下载入口可能占用标准输入，因此优先从控制终端读取；没有控制终端时仍支持管道和自动化输入。
+    """
+    try:
+        terminal = open("/dev/tty", "r+", encoding="utf-8")
+    except OSError:
+        terminal = None
+    try:
+        while True:
+            print(message, end="", flush=True)
+            answer = (terminal.readline() if terminal else sys.stdin.readline()).strip().lower()
+            if not answer:
+                return default
+            if answer in choices:
+                return choices[answer]
+            print("请按提示输入选项，或按回车采用默认值。")
+    finally:
+        if terminal:
+            terminal.close()
+
+
+def sidecar_ignore() -> bytes:
+    """sidecar_ignore() 将本机缓存和运行记录排除在跟踪之外，Git 以后才建立时也不会误收这些状态。"""
+    return b"/.local/\n__pycache__/\n*.py[cod]\n.DS_Store\n"
 
 
 def read_file(path: Path) -> tuple[bytes, int] | None:
@@ -81,7 +137,7 @@ def factory_path(name: str) -> bool:
     """factory_path() 限定原厂拥有的文件；current 和宿主 Makefile 不进入原厂部署清单。"""
     path = PurePosixPath(name)
     return (not path.is_absolute() and ".." not in path.parts
-            and (name in {"setup.py", "README.md"} or name.startswith(("engine/", "initial/"))))
+            and (name in {"setup.py", "README.md", "update"} or name.startswith(("engine/", "initial/"))))
 
 
 def snapshot(cache: Path, commit: str) -> dict[str, tuple[bytes, int]]:
@@ -164,7 +220,7 @@ def legacy_files(sidecar: Path) -> dict[str, tuple[bytes, int]]:
     """
     files = {}
     for base in (sidecar / "engine", sidecar / "initial", sidecar / "README.md", sidecar / "setup.py",
-                 sidecar / "Makefile"):
+                 sidecar / "Makefile", sidecar / ".gitignore", sidecar / "update"):
         if not os.path.lexists(base):
             continue
         safe_parents(base / "placeholder" if base.is_dir() else base)
@@ -190,7 +246,14 @@ def adopt_legacy(cache: Path, commit: str, existing: dict) -> tuple[dict, bytes 
     ancestors = git(cache, "rev-list", "--max-count=200", commit).decode().splitlines()
     for ancestor in ancestors:
         previous = snapshot(cache, ancestor)
-        if all(previous.get(name) == value for name, value in existing.items() if name != "Makefile"):
+        if all(previous.get(name) == value for name, value in existing.items() if name not in {"Makefile", ".gitignore"}):
+            if ".gitignore" in existing:
+                with tempfile.TemporaryDirectory(prefix=".legacy-", dir=cache.parent) as temporary:
+                    root = Path(temporary)
+                    materialize(root, previous)
+                    old_setup = load_module("clarity_legacy_setup", root / "setup.py")
+                    if not hasattr(old_setup, "sidecar_ignore") or existing[".gitignore"] != (old_setup.sidecar_ignore(), 0o644):
+                        continue
             if "Makefile" in existing:
                 if "engine/runner/make_integration.py" not in previous:
                     continue
@@ -202,6 +265,8 @@ def adopt_legacy(cache: Path, commit: str, existing: dict) -> tuple[dict, bytes 
                         continue
             listing = git(cache, "ls-tree", ancestor, "--", "Makefile")
             legacy_makefile = git(cache, "show", ancestor + ":Makefile") if listing else None
+            if legacy_makefile and b".clarity/engine/runner/" not in legacy_makefile:
+                legacy_makefile = None
             return existing, legacy_makefile
     raise SetupError("已有 .clarity 程序与原厂最近 200 个版本均不一致；未覆盖本地文件。")
 
@@ -210,7 +275,7 @@ def installed_files(sidecar: Path, manifest: dict) -> dict:
     """installed_files() 核对上次登记的每份原厂文件，修改、删除或权限变化都须先由所有者处理。"""
     files = {}
     for name, expected in manifest["files"].items():
-        if not factory_path(name) and name != "Makefile":
+        if not factory_path(name) and name not in {"Makefile", ".gitignore"}:
             raise SetupError("安装记录包含越界文件：" + name)
         path = sidecar / name
         safe_parents(path)
@@ -368,6 +433,91 @@ def runtime_changes(state: Path, hooks: Path, staged: Path, manifest: dict | Non
     return changes
 
 
+def local_exclude(target: Path, root: Path, ignored: bool = True) -> tuple[Path, tuple[bytes, int]]:
+    """local_exclude() 管理此 sidecar 的本地忽略行；用户选择加入跟踪时移除此行，其他规则保持原样。"""
+    value = Path(git(root, "rev-parse", "--git-path", "info/exclude").decode().strip())
+    path = (root / value).resolve() if not value.is_absolute() else value.resolve()
+    relative = (target / ".clarity").relative_to(root).as_posix()
+    if "\n" in relative or "\r" in relative:
+        raise SetupError("Git 本地忽略不支持含换行的安装路径。")
+    pattern = "/" + "".join("\\" + ch if ch in "\\*?[] !#" else ch for ch in relative) + "/"
+    original = read_file(path)
+    content, mode = original if original else (b"", 0o644)
+    line = pattern.encode() + b"\n"
+    if not ignored:
+        content = b"".join(part for part in content.splitlines(keepends=True) if part.rstrip(b"\r\n") != line.rstrip(b"\n"))
+    elif line.rstrip(b"\n") not in content.splitlines():
+        content += (b"" if not content or content.endswith(b"\n") else b"\n") + line
+    return path, (content, mode)
+
+
+@contextmanager
+def tracking_index(root: Path, target: Path, state: Path, changes: dict, host_make=None, make=None, legacy=None):
+    """tracking_index() 只暂存用户选中的 sidecar，保留其他文件的暂存状态且不创建提交。
+
+    新索引在临时文件中按即将交付的字节准备，再纳入同一次回滚事务；Git 索引锁阻止并发暂存覆盖。
+    本机缓存不进入清单；Makefile 从原暂存版本仅加入安装入口，不夹带其工作树业务改动。
+    """
+    raw = Path(git(root, "rev-parse", "--git-path", "index").decode().strip())
+    index = raw if raw.is_absolute() else root / raw
+    safe_parents(index)
+    lock = index.with_name(index.name + ".lock")
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        raise SetupError("Git 正在暂存其他操作，未修改其索引。") from error
+    os.close(descriptor)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".index-", dir=state) as temporary:
+            staged = Path(temporary) / "index"
+            original = read_file(index)
+            if original:
+                staged.write_bytes(original[0])
+            environment = dict(os.environ)
+            for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+                environment.pop(name, None)
+            environment["GIT_INDEX_FILE"] = str(staged)
+
+            def index_git(*arguments, data=None):
+                """index_git() 只向临时索引送入确定字节，不从尚未写入的工作树重新取材。"""
+                result = subprocess.run(["git", "-C", str(root), *arguments], input=data,
+                                        capture_output=True, env=environment)
+                if result.returncode:
+                    raise SetupError(result.stderr.decode(errors="replace").strip())
+                return result.stdout
+
+            if not original:
+                index_git("read-tree", "--empty")
+            entries = {path: value for path, value in changes.items()
+                       if path.is_relative_to(target / ".clarity")
+                       and not path.is_relative_to(target / ".clarity/.local")}
+            current = target / ".clarity/current"
+            if current.is_dir():
+                for path in current.rglob("*"):
+                    if path.is_file() and path not in entries and "__pycache__" not in path.parts and path.name != ".DS_Store":
+                        entries[path] = read_file(path)
+            if host_make is not None:
+                relative = host_make.relative_to(root).as_posix()
+                indexed = index_git("ls-files", "--stage", "--", relative)
+                if indexed and (len(indexed.splitlines()) != 1 or indexed.split(b"\t", 1)[0].split()[2] != b"0"):
+                    raise SetupError("宿主 Makefile 有未解决的 Git 冲突，未自动暂存。")
+                content = index_git("show", ":" + relative) if indexed else None
+                mode = 0o755 if indexed.startswith(b"100755 ") else 0o644
+                entries[host_make] = (make.host_makefile(content, legacy), mode)
+            commands = []
+            for path, value in entries.items():
+                relative = path.relative_to(root).as_posix()
+                content, mode = value if value else (b"", 0)
+                oid = index_git("hash-object", "-w", "--stdin", data=content).decode().strip()
+                git_mode = ("100755" if mode & 0o111 else "100644") if value else "0"
+                commands.append((git_mode + " " + oid + "\t" + relative).encode() + b"\0")
+            index_git("update-index", "-z", "--index-info", data=b"".join(commands))
+            changes[index] = (staged.read_bytes(), original[1] if original else 0o644)
+            yield
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def install(args: argparse.Namespace) -> dict:
     """install() 从固定 Git 版本准备原厂文件，再一次交付程序、Make 入口、运行快照及版本记录。
 
@@ -375,10 +525,19 @@ def install(args: argparse.Namespace) -> dict:
     同一共享 Git 控制目录目前只绑定一个已登记工作树，拒绝另一工作树悄悄替换共享运行版本。
     """
     repo, state, hooks = repository_paths(Path(args.repo))
+    root = git_root(repo)
+    already_tracked = bool(git(root, "ls-files", "--", (repo / ".clarity").relative_to(root).as_posix())) if root else False
+    review_state = state
+    if root == repo:
+        common = Path(git(root, "rev-parse", "--git-common-dir").decode().strip())
+        review_state = (common if common.is_absolute() else root / common).resolve() / "clarity"
     sidecar = repo / ".clarity"
     safe_parents(sidecar / "setup.py")
     safe_parents(state / "installation.json")
-    with installation_lock(state):
+    with ExitStack() as locks:
+        locks.enter_context(installation_lock(state))
+        if review_state != state and (review_state / "config.json").is_file():
+            locks.enter_context(installation_lock(review_state))
         manifest_path = state / "installation.json"
         previous_record = read_file(manifest_path)
         manifest = json.loads(previous_record[0]) if previous_record else None
@@ -410,6 +569,7 @@ def install(args: argparse.Namespace) -> dict:
             new_install.engine_sources(staged / "engine")
             make = load_module("clarity_release_make", staged / "engine/runner/make_integration.py")
             files["Makefile"] = (make.rendered_sidecar_makefile(), 0o644)
+            files[".gitignore"] = (sidecar_ignore(), 0o644)
             changes = {}
             for name in owned.keys() | files.keys():
                 path = sidecar / name
@@ -417,14 +577,19 @@ def install(args: argparse.Namespace) -> dict:
                 if name not in owned and read_file(path) is not None:
                     raise SetupError("新原厂路径已被本地文件占用：" + str(path))
                 changes[path] = files.get(name)
+            make_name = manifest.get("host_makefile") if manifest else None
+            promote = args.command == "install" and getattr(args, "track", None) == "yes" and root is not None
             names = {entry.name for entry in repo.iterdir()}
-            make_name = next((name for name in ("GNUmakefile", "makefile", "Makefile") if name in names), "Makefile")
-            if manifest and make_name != manifest["host_makefile"]:
-                raise SetupError("宿主生效的 Makefile 已改变，须先核对原入口。")
-            host_make = repo / make_name
-            original_make = read_file(host_make)
-            changes[host_make] = (make.host_makefile(original_make[0] if original_make else None, legacy_makefile),
-                                  original_make[1] if original_make else 0o644)
+            effective = next((name for name in ("GNUmakefile", "makefile", "Makefile") if name in names), "Makefile")
+            original_make = read_file(repo / effective)
+            managed_make = original_make is not None and make.BEGIN_MARKER in original_make[0]
+            if promote or make_name or managed_make or legacy_makefile is not None:
+                if make_name and effective != make_name:
+                    raise SetupError("宿主生效的 Makefile 已改变，须先核对原入口。")
+                make_name = effective
+                host_make = repo / make_name
+                changes[host_make] = (make.host_makefile(original_make[0] if original_make else None, legacy_makefile),
+                                      original_make[1] if original_make else 0o644)
             current = sidecar / "current"
             if os.path.lexists(current):
                 if current.is_symlink() or not current.is_dir():
@@ -435,9 +600,12 @@ def install(args: argparse.Namespace) -> dict:
                         changes[current / name.removeprefix("initial/")] = value
             # 旧迁移仍以当前宿主为 hook 来源，只有逐文件核对成功后才允许刷新已启用快照。
             hook_manifest = manifest or {"worktree_root": str(repo)}
-            changes.update(runtime_changes(state, hooks, staged, hook_manifest))
+            if hooks is not None:
+                changes.update(runtime_changes(review_state, hooks, staged, hook_manifest))
             hook_records = {}
             for name in ("commit-msg", "pre-commit"):
+                if hooks is None:
+                    continue
                 path = hooks / name
                 value = changes.get(path, read_file(path))
                 if value is not None and new_install.is_owned_hook(path):
@@ -446,23 +614,61 @@ def install(args: argparse.Namespace) -> dict:
                       "commit": commit, "previous_commit": manifest["commit"] if manifest else None,
                       "previous_source": manifest["source"] if manifest else None,
                       "installed_at": datetime.now(timezone.utc).isoformat(), "host_makefile": make_name,
+                      "track_git": manifest.get("track_git", already_tracked) if args.command == "update" and manifest else bool(promote or already_tracked),
                       "files": {name: fingerprint(value) for name, value in sorted(files.items())},
                       "hooks": hook_records}
             changes[manifest_path] = (encoded(record), 0o600)
-            apply_transaction(state, changes)
+            if args.command == "install" and root is not None and not promote and not already_tracked:
+                exclude, value = local_exclude(repo, root)
+                changes[exclude] = value
+            if promote:
+                exclude, value = local_exclude(repo, root, ignored=False)
+                if exclude.exists():
+                    changes[exclude] = value
+                with tracking_index(root, repo, state, changes, repo / make_name if make_name else None, make, legacy_makefile):
+                    apply_transaction(state, changes)
+            else:
+                apply_transaction(state, changes)
     return record
 
 
 def main(argv: list[str] | None = None) -> int:
-    """main() 区分 install 和 update；成功只表示软件交付已回读，不表示规则或业务代码审核通过。"""
+    """main() 先检测安装并处理升级；只有全新安装才询问 Git 跟踪，不替用户建立仓库。
+
+    重新安装程序也保留已有 current；恢复出厂不属于这里的选择。
+    """
     parser = argparse.ArgumentParser(description="安装或更新 Clarity sidecar。")
     commands = parser.add_subparsers(dest="command", required=True)
     for command in ("install", "update"):
         child = commands.add_parser(command)
-        child.add_argument("--repo", default=".", help="目标宿主 Git 仓库，默认当前目录。")
+        child.add_argument("--repo", default=".", help="安装目录，默认当前目录；不会改装到上级 Git 根目录。")
         child.add_argument("--source", help="原厂 Git 地址或本地路径；首次默认 GitHub HTTPS，后续沿用已选来源；显式提供可换源。")
         child.add_argument("--ref", help="原厂 Git 分支、tag 或 commit；默认沿用已登记选择，首次为 HEAD。")
+        if command == "install":
+            child.add_argument("--track", choices=("yes", "no"), help="全新安装是否加入宿主 Git 跟踪；默认询问，回车为 no。")
     args = parser.parse_args(argv)
+    try:
+        target = Path(args.repo).expanduser().resolve()
+        if args.command == "update":
+            if not existing_installation(target):
+                raise SetupError("当前目录没有符合结构的 Clarity 安装，请先运行首次安装入口。")
+        elif existing_installation(target):
+            choice = ask("检测到 Clarity：[1] 更新（默认）  [2] 全新安装（保留 current）：",
+                         {"1": "update", "update": "update", "更新": "update", "2": "install", "install": "install", "全新安装": "install"}, "update")
+            if choice == "update":
+                args.command = "update"
+                return deliver(args)
+        if args.command == "install" and git_root(target) is not None and args.track is None:
+            args.track = ask("是否将 .clarity 加入 Git 跟踪？[y/N]：",
+                             {"y": "yes", "yes": "yes", "是": "yes", "n": "no", "no": "no", "否": "no"}, "no")
+        return deliver(args)
+    except (SetupError, OSError, ValueError, KeyError, TypeError, ImportError) as error:
+        print("Clarity 安装/更新未完成：" + str(error), file=sys.stderr)
+        return 2
+
+
+def deliver(args: argparse.Namespace) -> int:
+    """deliver() 执行已经选定的安装或升级，成功仅表示软件交付，不宣称代码审核已启用或通过。"""
     try:
         record = install(args)
     except (SetupError, OSError, ValueError, KeyError, TypeError, ImportError) as error:

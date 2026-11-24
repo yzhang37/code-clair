@@ -29,51 +29,65 @@ code-clair/                  host-project/
 
 ## 安装与更新
 
-安装管理使用 Python 3.10+ 和 Git，不调用模型。普通用户在已经包含 sidecar 的宿主根目录运行：
+进入你要安装的目录，执行：
 
 ```sh
-python3 .clarity/setup.py update
+curl -fsSL https://raw.githubusercontent.com/yzhang37/code-clair/main/install.sh | sh
 ```
 
-首次默认从 `https://github.com/yzhang37/code-clair.git` 通过 HTTPS 获取 `HEAD`，无需用户另行维护原厂源码工作树。克隆宿主后没有本机安装记录时，会先核对现有 sidecar 与原厂历史版本；匹配后建立本机记录，保留宿主已经跟踪的 `current/`。尚无 sidecar 的空宿主须由安装入口先部署，`update` 不隐式替代首次安装。
+安装位置始终是当前目录的 `.clarity/`。目录可以没有 Git，也可以是有业务代码、历史、构建文件和未提交修改的成熟 Git 项目，甚至是已有 Git 仓库里的一个子目录。安装器不会跳到上级 Git 根目录，也不会替用户初始化 Git。机器需要可用的 Git、curl、Python 3.10+；Git 程序用于下载版本，不代表目标目录必须已有 Git 仓库。
 
-维护者从本原厂仓库给新的宿主部署时，也可以明确选用本地已提交版本：
+入口按这个顺序执行：
+
+1. 检测当前目录是否已有符合结构的 `.clarity` 安装。
+2. 已有安装时询问“更新（默认）”还是“全新安装”。
+3. 选择更新后直接进入升级，保留既有 Git 归属，不再询问跟踪。
+4. 全新安装且没有 Git 仓库时，直接安装文件，不管理 Git。
+5. 全新安装且属于 Git 仓库时，询问“是否将 `.clarity` 加入 Git 跟踪”，默认 **no**。
+
+“全新安装”是重新安装程序并重新选择跟踪，不是恢复出厂；已有 `current/` 仍保留。只有缺少 `current/` 时才从同版本 `initial/` 创建，原厂自己的规则与案例不分发给宿主。
+
+选择 **no** 时，Git 项目使用本机 `info/exclude` 排除未跟踪的 sidecar，不修改共享 `.gitignore` 或已有构建入口。选择 **yes** 时，安装器将程序、模板、当前资料和生成的 Make 入口加入暂存区，不自动提交；已有业务文件的暂存状态保持，Makefile 也只暂存新增入口，不夹带工作树里的其他改动。已经由 Git 跟踪的旧文件不会因为回答 no 被自动移出 Git。
+
+安装后直接升级：
 
 ```sh
-python3 setup.py install --repo ../x4-data --source .
+./.clarity/update
 ```
 
-`--source` 可明确指定原厂 Git 地址或本地路径；后续不传时沿用已选来源，显式提供另一来源可切换。`--ref` 可指定分支、tag 或 commit。记录保存实际来源、选择和完整 commit，不把未提交工作树冒充发行版本。现有本地安装不会因为新增 HTTPS 默认值而自动换源。
+升级只更新程序、模板及已启用的运行快照，保留 `current/`、配置、规则采用哈希和审核状态，也不重新询问 Git 跟踪。没有 Git 的目录同样可以升级。
 
-首次安装把原厂 `setup.py`、`README.md`、`engine/`、`initial/` 放入宿主 `.clarity/`。宿主已有 `current/` 时保留原样，否则从同版本 `initial/` 建立。原厂自己的规则与案例不会进入宿主。
-
-安装器生成 `.clarity/Makefile`，其中审核路径指向宿主 `.clarity/engine/`。宿主有效的 `GNUmakefile`、`makefile` 或 `Makefile` 末尾只增加一个标记明确的 include 块，保留原有正文及默认目标；不存在时建立 `Makefile`。显式同名审核目标冲突会拒绝安装，不执行宿主构建来探测变量、eval 或外部 include 生成的目标。
-
-在宿主根目录切换到本地同步，例如本机的原厂目录：
+首次默认从 `https://github.com/yzhang37/code-clair.git` 通过 HTTPS 获取版本。之后沿用已选来源。需要本地同步时，在安装目录执行：
 
 ```sh
-python3 .clarity/setup.py update --source ../code-clair
+./.clarity/update --source ../code-clair
 ```
 
-改回 GitHub HTTPS：
+改回 GitHub：
 
 ```sh
-python3 .clarity/setup.py update --source https://github.com/yzhang37/code-clair.git
+./.clarity/update --source https://github.com/yzhang37/code-clair.git
 ```
 
-成功部署后才登记新的来源；切换失败保留原来源、原部署和原配置。来源选择只影响程序和模板，不影响各宿主自己的 `current/`。普通更新不传 `--source` 即继续使用上次选择。
+维护者也可从目标目录直接运行原厂管理程序：
 
-更新也可用 `--ref` 改选版本。它更新原厂程序和模板，删除上一版本拥有而新版已移除的文件，保留宿主 `current/`、审核记录和人的回应。本地改动过的原厂文件会使更新拒绝；新路径已被本地文件占用时也不会覆盖。
+```sh
+python3 ../code-clair/setup.py install --source ../code-clair
+```
 
-已启用审核的项目会同步 Git 控制目录中的运行引擎及自己的 hook；配置只同步 `engine_digest`，保留模型、调用上限、规则选择、规则采用哈希和其他字段。安装与更新不重新采用当前规则。首次软件安装没有审核配置时，不自动接入提交 hook。
+底层 `setup.py install` 与 `setup.py update` 仍保留，支持 `--repo`、`--source`、`--ref`；显式 `--repo` 只按给定目录安装，不解析成上级工作树根。非交互安装可以用 `--track yes` 或 `--track no` 指明跟踪选择，未提供时采用提示中的默认值。来源只读取已提交的 Git 版本，记录实际完整 commit。
 
-安装记录在 `clarity/installation.json`，含当前及上次来源、完整 commit、文件摘要与权限、宿主入口及 hook 记录。Git 下载缓存按来源隔离在 `clarity/sources/<来源摘要>/`；已有的 `clarity/source/` 只在来源匹配时复用，换源不修改旧缓存的 origin。它们都由实际 Git common dir 定位，不假定宿主 `.git` 必须是目录。目前一个共享控制目录只登记一个工作树；另一工作树不能隐式替换该安装的共享运行版本。
+## 安装记录和保护边界
 
-已有旧版 sidecar 首次运行 `install`，或克隆现代宿主后首次运行 `update` 时，会逐文件寻找匹配的原厂历史版本，最多核对最近 200 个祖先；不匹配便停止。已生成的 `.clarity/Makefile` 还须匹配同一历史版本的生成器。旧宿主 Makefile 只有与该历史版本的纯审核入口完全一致时才整体迁移。软件更新不调用旧的审核启用安装器，以免重建用户配置。
+Git 根目录继续沿用 Git common dir 的 `clarity/` 状态，以保留已有审核配置与记录。没有 Git、或安装在仓库子目录时，本机状态在 `.clarity/.local/`；随后由用户建立 Git 时仍沿用该状态。生成的 `.clarity/.gitignore` 排除本机状态和 Python 缓存。下载缓存按来源隔离，切换失败不更改原来源。
 
-交付前准备完整版本并检查输入，写入失败会恢复已触及文件；回读一致后才登记成功。安装与代码审核、组合维护共用锁。强制终止或回滚失败留下的锁及原文备份需要核对，不自动按时间删除，也不保证断电时的跨文件原子切换。网络获取失败保留旧部署。
+记录包括当前及上次来源、实际 commit、部署文件的摘要和权限、Git 跟踪选择和 Make 入口。本地修改过的原厂文件会使升级拒绝；新路径已被本地文件占用时也不会覆盖。克隆已跟踪的 sidecar 而缺少本机记录时，升级先逐文件匹配原厂历史版本，最多核对最近 200 个祖先，并核对该版本生成的 Makefile 和忽略文件，不能仅凭目录名认领。
 
-`reset` 和自动合并本地程序修改尚未实现。原厂版本通过正常 Git 推送发布，安装器不承担发布操作。
+已存在的 Make 集成在升级时保留。新的独立安装在 `.clarity/Makefile` 提供目标；加入跟踪时才在宿主有效的 Makefile 中集成加载入口。原有正文和默认构建目标保留，外来同名目标及被修改的管理块会拒绝覆盖。
+
+交付前准备完整版本，写入失败恢复原文；加入跟踪时，Git 索引也在同一事务中回读和恢复。安装与既有代码审核、组合维护使用相应排他锁。强制终止或回滚失败留下的锁及备份需要核对，不按时间自动删除；不保证断电时的跨文件原子切换。
+
+软件安装不自动启用提交审核。代码审核仍需要 Git 快照；仅本机模式不会把 `.clarity/current/` 自动送入宿主 Git 快照，本轮未改变审核依据的取材契约。`reset` 和自动合并本地程序修改尚未实现。
 
 ## 在宿主运行审核
 

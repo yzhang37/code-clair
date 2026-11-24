@@ -70,7 +70,7 @@ class SidecarSetupTests(unittest.TestCase):
     def install(self, *, host=None, check=True):
         target = host or self.host
         return self.run_command([sys.executable, str(self.source / "setup.py"), "install",
-                                 "--repo", str(target), "--source", str(self.source)],
+                                 "--repo", str(target), "--source", str(self.source), "--track", "yes"],
                                 cwd=target, check=check)
 
     def update(self, *, check=True):

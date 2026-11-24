@@ -33,7 +33,7 @@ class SetupSourceTests(unittest.TestCase):
                           "url." + self.source.as_uri() + ".insteadOf", DEFAULT_SOURCE])
 
     def install(self, *, source=None, check=True):
-        arguments = [sys.executable, str(self.source / "setup.py"), "install", "--repo", str(self.host)]
+        arguments = [sys.executable, str(self.source / "setup.py"), "install", "--repo", str(self.host), "--track", "yes"]
         if source is not None:
             arguments.extend(["--source", str(source)])
         return self.run_command(arguments, check=check)
