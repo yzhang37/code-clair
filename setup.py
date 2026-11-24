@@ -84,7 +84,7 @@ def ask(message: str, choices: dict[str, str], default: str) -> str:
     下载入口可能占用标准输入，因此优先从控制终端读取；没有控制终端时仍支持管道和自动化输入。
     """
     try:
-        terminal = open("/dev/tty", "r+", encoding="utf-8")
+        terminal = open("/dev/tty", "r", encoding="utf-8")
     except OSError:
         terminal = None
     try:

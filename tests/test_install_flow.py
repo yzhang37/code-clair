@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+import time
+import select
 
 import test_setup as fixture
 
@@ -105,6 +107,50 @@ class InstallFlowTests(unittest.TestCase):
         self.assertNotIn("UNSTAGED_BUSINESS", indexed_make)
         self.assertIn("UNSTAGED_BUSINESS = yes", (self.host / "Makefile").read_text())
         self.assertTrue(self.read_manifest(self.host)["track_git"])
+
+    @unittest.skipUnless(os.name == "posix", "控制终端行为只适用于 POSIX 入口")
+    def test_tracking_answer_uses_controlling_terminal_when_stdin_is_not_the_terminal(self):
+        import fcntl
+        import pty
+        import termios
+
+        master, slave = pty.openpty()
+
+        def attach_terminal():
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+        process = subprocess.Popen([sys.executable, str(self.source / "setup.py"), "install",
+                                    "--source", str(self.source)], cwd=self.host, env=self.environment,
+                                   stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
+                                   preexec_fn=attach_terminal, pass_fds=(slave,))
+        os.close(slave)
+        output = b""
+        answered = False
+        deadline = time.monotonic() + 30
+        try:
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        block = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not block:
+                        break
+                    output += block
+                    if b"[y/N]" in output and not answered:
+                        os.write(master, b"y\n")
+                        answered = True
+                if process.poll() is not None:
+                    break
+            self.assertEqual(process.wait(timeout=5), 0, output.decode(errors="replace"))
+            self.assertTrue(answered)
+            self.assertTrue(self.read_manifest(self.host)["track_git"], output.decode(errors="replace"))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
 
     def test_existing_installation_defaults_to_update_and_skips_tracking_question(self):
         self.launch(self.host, "n\n")
