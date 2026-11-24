@@ -185,6 +185,25 @@ class InstallFlowTests(unittest.TestCase):
         self.assertEqual(rule.read_text(), "keep registry on reinstall\n")
         self.assertNotIn("/.clarity/", (self.host / ".git/info/exclude").read_text().splitlines())
 
+    def test_localized_wizard_keeps_default_update_and_accepts_translated_yes(self):
+        self.environment["CLARITY_LANG"] = "en"
+        first = self.launch(self.host, "\n")
+        self.assertIn("Add .clarity to Git tracking? [y/N]", first.stdout)
+        self.assertFalse(self.read_manifest(self.host)["track_git"])
+        rule = self.host / ".clarity/current/rules.md"
+        original = rule.read_bytes()
+        self.environment["CLARITY_LANG"] = "es-MX"
+        upgraded = self.launch(self.host, "\nsí\n")
+        self.assertIn("Actualizar (predeterminado)", upgraded.stdout)
+        self.assertNotIn("[y/N]", upgraded.stdout)
+        self.assertFalse(self.read_manifest(self.host)["track_git"])
+        self.environment["CLARITY_LANG"] = "ja-JP"
+        fresh = self.launch(self.host, "2\nはい\n")
+        self.assertIn("Git 管理対象に追加しますか", fresh.stdout)
+        self.assertTrue(self.read_manifest(self.host)["track_git"])
+        self.assertEqual(rule.read_bytes(), original)
+        self.assertIn(".clarity/engine/runner/locales/ja.json", self.git(self.host, "ls-files"))
+
     def test_index_write_failure_rolls_back_deployment_and_prior_business_staging(self):
         import argparse
         import importlib.util

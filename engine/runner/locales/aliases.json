@@ -1,0 +1,14 @@
+{
+  "aliases": {
+    "zh": "zh-Hans",
+    "zh-cn": "zh-Hans",
+    "zh-sg": "zh-Hans",
+    "zh-tw": "zh-Hant",
+    "zh-hk": "zh-Hant",
+    "zh-mo": "zh-Hant"
+  },
+  "fallbacks": {
+    "zh-Hans": ["en"],
+    "zh-Hant": ["en"]
+  }
+}

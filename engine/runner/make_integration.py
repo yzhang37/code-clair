@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+# 动态安装会按文件路径加载本模块；只补同版 runner 搜索路径，不依赖宿主技术栈。
+import sys
+from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from i18n import tr
+
+
 import re
 
 
@@ -65,15 +73,15 @@ def _remove_managed_block(existing: bytes) -> bytes:
         body = line.rstrip(b"\r\n")
         if BEGIN_MARKER in body or END_MARKER in body:
             if body not in (BEGIN_MARKER, END_MARKER):
-                raise ValueError("Clarity Makefile 管理标记必须独立成行。")
+                raise ValueError(tr('Clarity Makefile markers must occupy complete lines.'))
             markers.append((body, offset, offset + len(line)))
         offset += len(line)
     if not markers:
         return existing
     if len(markers) != 2 or markers[0][0] != BEGIN_MARKER or markers[1][0] != END_MARKER:
-        raise ValueError("Clarity Makefile 管理块缺失、重复或顺序错误。")
+        raise ValueError(tr('Clarity Makefile managed block is missing, duplicated, or out of order.'))
     if existing[markers[0][1]:markers[1][2]] != INCLUDE_BLOCK:
-        raise ValueError("Clarity Makefile 管理块有本地修改，未覆盖。")
+        raise ValueError(tr('Clarity Makefile managed block has local changes; it was not overwritten.'))
     return existing[:markers[0][1]] + existing[markers[1][2]:]
 
 
@@ -116,7 +124,7 @@ def host_makefile(existing: bytes | None, legacy: bytes | None = None) -> bytes:
     preserved = _remove_managed_block(existing)
     conflicts = _explicit_review_targets(preserved)
     if conflicts:
-        raise ValueError("宿主 Makefile 已定义 Clarity 保留目标：" + ", ".join(sorted(conflicts)))
+        raise ValueError(tr('Host Makefile already defines reserved Clarity targets: ') + ", ".join(sorted(conflicts)))
     # 仅补必需的行边界，不清理用户空行；重复生成不会不断追加分隔行。
     separator = b"" if not preserved or preserved.endswith(b"\n") else b"\n"
     return preserved + separator + INCLUDE_BLOCK

@@ -4,12 +4,12 @@ set -eu
 # 首次入口从项目外取得管理程序；目标始终是当前目录，不要求已有 Clarity，也不创建 Git 仓库。
 for clarity_dependency in git curl python3; do
     if ! command -v "$clarity_dependency" >/dev/null 2>&1; then
-        printf 'Clarity 安装未完成：找不到 %s。\n' "$clarity_dependency" >&2
+        printf 'Clarity installation cannot start: %s was not found.\n' "$clarity_dependency" >&2
         exit 2
     fi
 done
 if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
-    printf '%s\n' 'Clarity 安装需要 Python 3.10 或更新版本。' >&2
+    printf '%s\n' 'Clarity installation requires Python 3.10 or newer.' >&2
     exit 2
 fi
 
@@ -24,9 +24,10 @@ trap 'exit 143' TERM
 clarity_head=$(git ls-remote --exit-code https://github.com/yzhang37/code-clair.git HEAD)
 clarity_commit=${clarity_head%%[[:space:]]*}
 case "$clarity_commit" in
-    ''|*[!0-9a-f]*) printf '%s\n' '无法确认 Clarity 的发布版本。' >&2; exit 2 ;;
+    ''|*[!0-9a-f]*) printf '%s\n' 'Cannot identify the published Clarity version.' >&2; exit 2 ;;
 esac
 # 只有完整下载成功才执行；所有安装/升级选择由同一管理程序处理，避免两层提示产生不同决定。
-curl -fsSL "https://raw.githubusercontent.com/yzhang37/code-clair/$clarity_commit/setup.py" \
-    -o "$clarity_staging/setup.py"
-python3 "$clarity_staging/setup.py" install "$@" --repo "$clarity_target"
+git clone --quiet --no-checkout https://github.com/yzhang37/code-clair.git "$clarity_staging/release"
+git -C "$clarity_staging/release" checkout --quiet "$clarity_commit" -- \
+    setup.py engine/runner/i18n.py engine/runner/locales
+python3 "$clarity_staging/release/setup.py" install "$@" --repo "$clarity_target"

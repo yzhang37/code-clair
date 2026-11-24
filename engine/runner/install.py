@@ -3,23 +3,29 @@
 
 from __future__ import annotations
 
+# 动态安装会按文件路径加载本模块；只补同版 runner 搜索路径，不依赖宿主技术栈。
+import sys
+from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from i18n import tr
+
+
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import shlex
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 
 
 HOOK_MARKER = "# clarity-review-hook v1"
 HOOK_NAMES = ("pre-commit",)
 ENGINE_RUNNERS = ("review.py", "codex_model.py", "install.py", "rules_check.py", "rules_report.py",
-                  "material_check.py", "maintenance.py")
+                  "material_check.py", "maintenance.py", "i18n.py")
 REQUIRED_PROMPTS = ("health.md", "fixtures.md", "review.md", "summarize.md", "learn.md", "rules-check.md",
                     "material-check.md")
 DEFAULT_BASIS_SELECTIONS = (".clarity/current/rules.md", ".clarity/current/cases")
@@ -40,7 +46,7 @@ def git_output(repo: Path, *arguments: str) -> str:
         check=False,
     )
     if result.returncode:
-        raise InstallError(result.stderr.strip() or "Git 无法读取仓库信息。")
+        raise InstallError(result.stderr.strip() or tr('Git could not read repository information.'))
     return result.stdout.strip()
 
 
@@ -74,7 +80,7 @@ def check_hook_ownership(hooks_dir: Path) -> None:
     conflicts = [str(hooks_dir / name) for name in HOOK_NAMES
                  if os.path.lexists(hooks_dir / name) and not is_owned_hook(hooks_dir / name)]
     if conflicts:
-        raise InstallError("已有非本安装器拥有的 pre-commit hook，未覆盖入口：\n" + "\n".join(conflicts))
+        raise InstallError(tr('An existing pre-commit hook is not owned by this installer; it was not overwritten:\n') + "\n".join(conflicts))
 
 
 def engine_sources(source_root: Path) -> dict[str, Path]:
@@ -83,19 +89,21 @@ def engine_sources(source_root: Path) -> dict[str, Path]:
     必须的角色文件先逐项验证；其他共享 Markdown 提示词也随同版引擎保存。
     本层只检查依赖可读取，不把文件齐全当作模型审查已完成。
     """
-    required = ["README.md", "principles.md", "workflow.md"]
+    required = ["README.md", "principles.md", "workflow.md", "runner/locales/aliases.json"]
     required.extend("prompts/" + name for name in REQUIRED_PROMPTS)
     required.extend("runner/" + name for name in ENGINE_RUNNERS)
     sources = {name: source_root / name for name in required}
     for path in (source_root / "prompts").glob("*.md"):
         sources[path.relative_to(source_root).as_posix()] = path
+    for path in (source_root / "runner/locales").glob("*.json"):
+        sources[path.relative_to(source_root).as_posix()] = path
     for name, path in sources.items():
         if path.is_symlink() or not path.is_file():
-            raise InstallError("安装依赖缺失或不是常规文件：" + str(path))
+            raise InstallError(tr('Installation dependency is missing or is not a regular file: ') + str(path))
         try:
             path.read_bytes()
         except OSError as error:
-            raise InstallError("安装依赖不可读取：" + name + ": " + str(error)) from error
+            raise InstallError(tr('Installation dependency cannot be read: ') + name + ": " + str(error)) from error
     return dict(sorted(sources.items()))
 
 
@@ -126,34 +134,34 @@ def basis_files(repo: Path, requested: list[str]) -> list[str]:
     for selection in selections:
         relative = Path(selection)
         if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
-            raise InstallError("依据必须是仓库内的明确相对路径：" + selection)
+            raise InstallError(tr('Basis must be an explicit relative path inside the repository: ') + selection)
         if relative.as_posix() == ENGINE_BASIS_ROOT or relative.as_posix().startswith(ENGINE_BASIS_ROOT + "/"):
-            raise InstallError("引擎资料不能作为产品依据：" + selection)
+            raise InstallError(tr('Engine materials cannot be used as product rules: ') + selection)
         selected = repo / relative
         if selected.is_symlink():
-            raise InstallError("依据路径不能是符号链接：" + selection)
+            raise InstallError(tr('Basis path cannot be a symbolic link: ') + selection)
         if not selected.exists():
             if requested:
-                raise InstallError("明确选入的依据不存在：" + selection)
+                raise InstallError(tr('Explicitly selected basis does not exist: ') + selection)
             continue
         try:
             selected.resolve().relative_to(repo)
         except ValueError as error:
-            raise InstallError("依据路径越出目标仓库：" + selection) from error
+            raise InstallError(tr('Basis path is outside the target repository: ') + selection) from error
         candidates = sorted(selected.rglob("*")) if selected.is_dir() else [selected]
         for candidate in candidates:
             name = candidate.relative_to(repo).as_posix()
             if name == ENGINE_BASIS_ROOT or name.startswith(ENGINE_BASIS_ROOT + "/"):
-                raise InstallError("引擎资料不能作为产品依据：" + name)
+                raise InstallError(tr('Engine materials cannot be used as product rules: ') + name)
             if candidate.is_symlink():
-                raise InstallError("依据目录包含符号链接：" + candidate.relative_to(repo).as_posix())
+                raise InstallError(tr('Basis directory contains a symbolic link: ') + candidate.relative_to(repo).as_posix())
             if not candidate.is_file() or candidate.name == ".gitkeep":
                 continue
             if not candidate.read_bytes().strip():
                 continue
             collected.add(candidate.relative_to(repo).as_posix())
     if not collected:
-        raise InstallError("未找到目标仓库的有效依据文件；请建立自己的 .clarity 资料或用 --basis 明确选入。")
+        raise InstallError(tr('No valid target-repository basis files were found; create project .clarity materials or select them with --basis.'))
     return sorted(collected)
 
 
@@ -161,7 +169,7 @@ def codex_executable(requested: str | None) -> str:
     """codex_executable() 固定实际可执行文件位置，避免 hook 从另一套 PATH 误选调用器。"""
     executable = shutil.which(requested or "codex")
     if not executable:
-        raise InstallError("找不到可执行的 Codex CLI；请安装后重试或提供 --codex-bin PATH。")
+        raise InstallError(tr('Codex CLI executable was not found; install it or provide --codex-bin PATH.'))
     return str(Path(executable).resolve())
 
 
@@ -212,7 +220,7 @@ def install(args: argparse.Namespace) -> None:
     engine_dir = clarity_dir / "engine"
     config_path = clarity_dir / "config.json"
     if engine_dir.exists() and (not config_path.is_file() or engine_dir.is_symlink()):
-        raise InstallError("现有引擎没有本安装器配置或是符号链接，拒绝覆盖：" + str(engine_dir))
+        raise InstallError(tr('Existing engine has no installer configuration or is a symbolic link; overwrite refused: ') + str(engine_dir))
     config = {
         "version": 1,
         "basis": adopted_basis,
@@ -276,9 +284,9 @@ def install(args: argparse.Namespace) -> None:
             if moved_previous:
                 os.replace(previous_engine, engine_dir)
             raise
-    print("已安装本地审核 pre-commit hook：" + str(hooks_dir / "pre-commit"))
-    print("共享引擎与配置：" + str(clarity_dir))
-    print("审核 scope：当前完整 tracked 内容；安装没有执行模型审核。")
+    print(tr('Local review pre-commit hook installed: ') + str(hooks_dir / "pre-commit"))
+    print(tr('Shared engine and configuration: ') + str(clarity_dir))
+    print(tr('Review scope: all current tracked content; installation did not run a model review.'))
 
 
 def uninstall(args: argparse.Namespace) -> None:
@@ -290,27 +298,27 @@ def uninstall(args: argparse.Namespace) -> None:
         if is_owned_hook(hook):
             hook.unlink()
             removed.append(name)
-    print("已卸载本安装器拥有的 pre-commit hook：" + str(hooks_dir / "pre-commit") + "（" + str(len(removed)) + " 个）")
-    print("保留规则、引擎、配置与运行记录：" + str(common_dir / "clarity"))
+    print(tr('Owned pre-commit hook removed: ') + str(hooks_dir / "pre-commit") + " (" + str(len(removed)) + tr(' hooks)'))
+    print(tr('Rules, engine, configuration, and run records were retained: ') + str(common_dir / "clarity"))
 
 
 def main(argv: list[str] | None = None) -> int:
     """main() 接受显式安装选择并返回非零失败，不把配置成功当作语义审核通过。"""
-    parser = argparse.ArgumentParser(description="安装或卸载仓库本地 Clarity code-review pre-commit hook。")
-    parser.add_argument("--repo", required=True, help="目标 Git 仓库路径。")
-    parser.add_argument("--basis", action="append", default=[], metavar="RELPATH", help="显式选入目标仓库的依据文件或目录，可重复。")
-    parser.add_argument("--model", help="显式选择 Codex 模型；未提供时使用 CLI 内置默认模型。")
-    parser.add_argument("--codex-bin", metavar="PATH", help="Codex 可执行文件；默认从当前 PATH 查找。")
-    parser.add_argument("--reviewers", type=int, default=2, help="独立首审数量，范围 2..8，默认 2。")
-    parser.add_argument("--timeout", type=int, default=300, help="每次模型调用的超时秒数，默认 300。")
-    parser.add_argument("--uninstall", action="store_true", help="仅卸载本安装器拥有的 pre-commit hook。")
+    parser = argparse.ArgumentParser(description=tr('Install or uninstall the repository-local Clarity code-review pre-commit hook.'))
+    parser.add_argument("--repo", required=True, help=tr('Target Git repository directory.'))
+    parser.add_argument("--basis", action="append", default=[], metavar="RELPATH", help=tr('Explicit basis file or directory in the target repository; may be repeated.'))
+    parser.add_argument("--model", help=tr('Explicit Codex model; otherwise use the CLI built-in default.'))
+    parser.add_argument("--codex-bin", metavar="PATH", help=tr('Codex executable; default is resolved from the current PATH.'))
+    parser.add_argument("--reviewers", type=int, default=2, help=tr('Independent first reviewers, 2..8; default is 2.'))
+    parser.add_argument("--timeout", type=int, default=300, help=tr('Timeout per model call in seconds; default is 300.'))
+    parser.add_argument("--uninstall", action="store_true", help=tr('Uninstall only the pre-commit hook owned by this installer.'))
     args = parser.parse_args(argv)
     if not args.uninstall and (not 2 <= args.reviewers <= 8 or args.timeout <= 0):
-        parser.error("--reviewers 必须为 2..8，--timeout 必须大于 0。")
+        parser.error(tr('--reviewers must be 2..8 and --timeout must be greater than 0.'))
     try:
         uninstall(args) if args.uninstall else install(args)
     except (InstallError, OSError) as error:
-        print("Clarity 安装未完成：" + str(error), file=sys.stderr)
+        print(tr('Clarity review activation did not complete: ') + str(error), file=sys.stderr)
         return 2
     return 0
 

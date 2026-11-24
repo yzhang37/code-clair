@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """review.py() 把完整 Git 快照交给独立审核模型，并将有依据的质疑交回 Git 调用方。"""
 
+# 动态安装会按文件路径加载本模块；只补同版 runner 搜索路径，不依赖宿主技术栈。
+import sys
+from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from i18n import tr
+
+
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
-import sys
 import time
 
 from codex_model import CodexModel, ModelFailure
@@ -19,7 +25,7 @@ from install import engine_sources, engine_digest, ENGINE_BASIS_ROOT, InstallErr
 
 ENGINE = Path(__file__).resolve().parents[1]
 ORIGINS = ["pre_existing", "introduced", "modified", "uncertain"]
-LABELS = dict(zip(ORIGINS, ["仓库原有", "本次新增", "修改后产生", "来源待核实"]))
+LABELS = dict(zip(ORIGINS, ['pre-existing', 'introduced', 'modified', 'uncertain provenance']))
 CURRENT_CASES = ".clarity/current/cases/"
 
 
@@ -44,7 +50,7 @@ def git(repo, *args, optional=False):
     """git() 保留调用方的 GIT_INDEX_FILE，读取 Git 本次真正准备提交的索引。"""
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
     if result.returncode and not optional:
-        raise Incomplete("Git 取材失败：" + result.stderr.decode(errors="replace").strip())
+        raise Incomplete(tr('Git input collection failed: ') + result.stderr.decode(errors="replace").strip())
     return result.stdout if result.returncode == 0 else None
 
 
@@ -70,7 +76,7 @@ def tree_id(repo, target):
         return None
     value = git(repo, "rev-parse", "--verify", "--end-of-options", target + "^{tree}", optional=True)
     if value is None:
-        raise Incomplete("找不到审核对象：" + target)
+        raise Incomplete(tr('Review target was not found: ') + target)
     return value.decode().strip()
 
 
@@ -86,18 +92,18 @@ def read_tree(repo, tree):
         mode, kind, oid = header.decode().split()
         path = raw_path.decode("utf-8")
         if Path(path).is_absolute() or ".." in Path(path).parts:
-            raise Incomplete("不安全的 Git 文件路径")
+            raise Incomplete(tr('Unsafe Git file path'))
         if kind != "blob":
-            raise Incomplete("尚不能审查嵌套 Git 对象：" + path)
+            raise Incomplete(tr('Review of nested Git objects is not supported: ') + path)
         if mode not in {"100644", "100755"}:
-            raise Incomplete("尚不能审查此 Git 文件类型：" + path + "（mode=" + mode + "）")
+            raise Incomplete(tr('Review of this Git file type is not supported: ') + path + "（mode=" + mode + "）")
         data = git(repo, "cat-file", "blob", oid)
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError as error:
-            raise Incomplete("非 UTF-8 文件需要另行确定审核方式：" + path) from error
+            raise Incomplete(tr('Non-UTF-8 files need an explicitly supported review method: ') + path) from error
         if "\0" in text:
-            raise Incomplete("二进制文件尚无语义审核方式：" + path)
+            raise Incomplete(tr('Semantic review of binary files is not supported: ') + path)
         files[path] = {"oid": oid, "mode": mode, "text": text}
     return files
 
@@ -122,13 +128,13 @@ def basis_pairs(before, current, config):
     pairs = {}
     for path in paths:
         if path == ENGINE_BASIS_ROOT or path.startswith(ENGINE_BASIS_ROOT + "/"):
-            raise Incomplete("引擎资料不能作为产品依据：" + path)
+            raise Incomplete(tr('Engine materials cannot be used as product rules: ') + path)
         old, new = before.get(path), current.get(path)
         if old is None and new is None:
-            raise Incomplete("新旧快照均缺少已选依据：" + path)
+            raise Incomplete(tr('Both snapshots lack the selected basis: ') + path)
         pairs[path] = (old, new)
     if not pairs:
-        raise Incomplete("目标仓库尚未选入正式规则与案例")
+        raise Incomplete(tr('No formal rules or cases have been selected for the target repository'))
     return pairs
 
 
@@ -194,30 +200,30 @@ def validate(output, snapshot, expected, files, rules, *, candidate_files=None, 
     代码阶段不传这两个额外集合，因此元原则和候选资料不能成为代码 finding 的准则。
     """
     if not isinstance(output, dict) or set(output) != set(schema()["properties"]):
-        raise Incomplete("模型没有交回完整审核记录")
+        raise Incomplete(tr('Model did not return a complete review record'))
     if output["snapshot_id"] != snapshot:
-        raise Incomplete("模型结果对应另一份输入")
+        raise Incomplete(tr('Model result belongs to different inputs'))
     if output["status"] not in {"usable", "clear", "issues", "unhealthy", "incomplete"}:
-        raise Incomplete("模型审核状态无效")
+        raise Incomplete(tr('Invalid model-review status'))
     if output["status"] == "incomplete":
-        raise Incomplete(output["incomplete_reason"] or "模型没有完成审核")
+        raise Incomplete(output["incomplete_reason"] or tr('Model did not complete the review'))
     if set(output["covered_paths"]) != set(expected) or not output["summary"].strip():
-        raise Incomplete("完整已跟踪范围尚未覆盖，或缺少判断理由")
+        raise Incomplete(tr('The complete tracked scope is not covered, or a rationale is missing'))
     findings = output["findings"]
     if bool(findings) != (output["status"] in {"issues", "unhealthy"}):
-        raise Incomplete("审核状态与问题证据不一致")
+        raise Incomplete(tr('Review status disagrees with finding evidence'))
     ids = set()
     for issue in findings:
         if set(issue) != set(schema()["properties"]["findings"]["items"]["properties"]):
-            raise Incomplete("问题记录字段不完整")
+            raise Incomplete(tr('Finding record fields are incomplete'))
         if not issue["id"] or issue["id"] in ids:
-            raise Incomplete("问题标识缺失或重复")
+            raise Incomplete(tr('Missing or duplicated finding identifier'))
         ids.add(issue["id"])
         for key in ["category", "title", "question", "reason", "origin_reason", "counterevidence"]:
             if not isinstance(issue[key], str) or not issue[key].strip():
-                raise Incomplete("质疑缺少理由、前提或反证：" + key)
+                raise Incomplete(tr('Finding lacks a rationale, premise, or counterevidence: ') + key)
         if issue["origin"] not in ORIGINS:
-            raise Incomplete("问题来源标记无效")
+            raise Incomplete(tr('Invalid finding-origin marker'))
         issue_rules = principles if principles is not None and issue["category"] == "writing_quality" else rules
         for path_key, line_key, quote_key, source in [
                 ("path", "line", "code_quote", files), ("rule_path", "rule_line", "rule_quote", issue_rules)]:
@@ -228,13 +234,13 @@ def validate(output, snapshot, expected, files, rules, *, candidate_files=None, 
             lines = [version.get("text", "").splitlines() for version in versions]
             if (not isinstance(line, int) or isinstance(line, bool)
                     or not any(1 <= line <= len(version) for version in lines)):
-                raise Incomplete("质疑没有有效的代码或准则位置：" + str(path))
+                raise Incomplete(tr('Finding has no valid code or rule location: ') + str(path))
             if (not isinstance(quote, str) or not quote.strip()
                     or not any(1 <= line <= len(version) and quote in version[line - 1] for version in lines)):
-                raise Incomplete("质疑引用与快照原文不符：" + str(path))
+                raise Incomplete(tr('Finding quotation differs from snapshot text: ') + str(path))
     for item in output["resolved"]:
         if set(item) != {"id", "reason"} or not item["id"] or not item["reason"].strip():
-            raise Incomplete("撤回问题没有保留反证理由")
+            raise Incomplete(tr('A withdrawn finding has no retained counterevidence rationale'))
     return output
 
 
@@ -245,10 +251,10 @@ def account_for(previous, output):
     resolved = {item["id"] for item in output["resolved"]}
     pending = set(output["unresolved_ids"])
     if before - after - resolved - pending or after & resolved or pending - before - after:
-        raise Incomplete("交叉反证或汇总遗漏了先前发现的处理依据")
+        raise Incomplete(tr('Cross-check or summary omitted the disposition evidence for an earlier finding'))
     # 等待人解释的保留问题可以正常报告为 issues；只有缺少问题证据的悬空 id 才是未完成。
     if pending - after:
-        raise Incomplete("仍有争议未完成处理：" + ", ".join(sorted(pending)))
+        raise Incomplete(tr('Disputed findings remain unresolved: ') + ", ".join(sorted(pending)))
 
 
 def make_prompt(role, packet, instruction, prior=None, texts=None):
@@ -351,7 +357,7 @@ def fixture_expectations(path, document):
         expected[f"{kind}:{number}"] = {"kind": kind, "title": title,
                                           "start_line": number + 1, "end_line": end}
     if {item["kind"] for item in expected.values()} != {"positive", "negative"}:
-        raise Incomplete("fixture 缺少可核对的明确正例或反例：" + path)
+        raise Incomplete(tr('Fixture has no verifiable explicit positive or negative example: ') + path)
     expected["boundary"] = {"kind": "boundary", "title": "判断理由和适用边界",
                             "start_line": 1, "end_line": len(lines)}
     return expected
@@ -374,39 +380,39 @@ def fixture_schema():
 def validate_fixture(output, snapshot, path, document, rules, expected):
     """validate_fixture() 拒绝漏项、错误引用和与逐项判断不符的通过状态。"""
     if not isinstance(output, dict) or set(output) != set(fixture_schema()["properties"]):
-        raise Incomplete("fixture 没有交回完整核对记录：" + path)
+        raise Incomplete(tr('Fixture verification did not return a complete record: ') + path)
     if output["snapshot_id"] != snapshot or output["case_path"] != path:
-        raise Incomplete("fixture 核对对应另一份输入：" + path)
+        raise Incomplete(tr('Fixture verification belongs to different inputs: ') + path)
     if output["status"] == "incomplete":
-        raise Incomplete(output["incomplete_reason"] or "fixture 尚未完成核对：" + path)
+        raise Incomplete(output["incomplete_reason"] or tr('Fixture verification is incomplete: ') + path)
     if not isinstance(output["checks"], list) or not isinstance(output["summary"], str) or not output["summary"].strip():
-        raise Incomplete("fixture 缺少逐项判断或理由：" + path)
+        raise Incomplete(tr('Fixture lacks individual verdicts or rationales: ') + path)
     ids = []
     for check in output["checks"]:
         if not isinstance(check, dict) or set(check) != set(fixture_schema()["properties"]["checks"]["items"]["properties"]):
-            raise Incomplete("fixture 判断字段不完整：" + path)
+            raise Incomplete(tr('Fixture verdict fields are incomplete: ') + path)
         identifier = check["id"]
         if not isinstance(identifier, str) or identifier not in expected or identifier in ids:
-            raise Incomplete("fixture 预期标识无效或重复：" + path)
+            raise Incomplete(tr('Fixture expectation identifier is invalid or duplicated: ') + path)
         ids.append(identifier)
         if not isinstance(check["matches"], bool) or not isinstance(check["reason"], str) or not check["reason"].strip():
-            raise Incomplete("fixture 缺少明确判断或理由：" + path)
+            raise Incomplete(tr('Fixture lacks an explicit verdict or rationale: ') + path)
         for line_key, quote_key, source in [
                 ("case_line", "case_quote", document),
                 ("rule_line", "rule_quote", rules.get(check["rule_path"], {}))]:
             number, quote = check[line_key], check[quote_key]
             lines = source.get("text", "").splitlines()
             if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= len(lines):
-                raise Incomplete("fixture 没有有效的案例或规则位置：" + path)
+                raise Incomplete(tr('Fixture verification has no valid case or rule location: ') + path)
             if not isinstance(quote, str) or not quote.strip() or quote not in lines[number - 1]:
-                raise Incomplete("fixture 引用与原文不符：" + path)
+                raise Incomplete(tr('Fixture quotation differs from the original: ') + path)
         if not expected[identifier]["start_line"] <= check["case_line"] <= expected[identifier]["end_line"]:
-            raise Incomplete("fixture 引用没有落在对应正反例区段：" + path)
+            raise Incomplete(tr('Fixture quotation is outside its corresponding positive/negative section: ') + path)
     if set(ids) != set(expected):
-        raise Incomplete("fixture 尚未覆盖全部正反预期和理由边界：" + path)
+        raise Incomplete(tr('Fixture verification does not cover every positive/negative expectation and rationale boundary: ') + path)
     status = "matched" if all(check["matches"] for check in output["checks"]) else "mismatched"
     if output["status"] != status:
-        raise Incomplete("fixture 状态与逐项判断不一致：" + path)
+        raise Incomplete(tr('Fixture status disagrees with individual verdicts: ') + path)
     return output
 
 
@@ -449,11 +455,11 @@ def check_fixtures(model, directory, snapshot, adopted, candidates, responses, t
     jobs = [("adopted", p, f, rules) for p, f in cases.items()]
     if proposed != rules:
         if not proposed:
-            raise Incomplete("当前候选规则集合为空，不能把删除全部规则后的固定核对记为匹配")
+            raise Incomplete(tr('The current candidate-rule set is empty; deleting all rules cannot make fixed verification pass'))
         jobs += [("candidate-rules", p, f, proposed) for p, f in cases.items()]
     jobs += [("candidate-case", p, f, proposed) for p, f in candidates.items() if is_case(p)]
     if jobs and not rules:
-        raise Incomplete("fixtures 已选入但缺少正式规则，不能用案例自己批准自己")
+        raise Incomplete(tr('Fixtures were selected without formal rules; cases cannot approve themselves'))
     records, findings = [], []
     for index, (view, path, document, selected_rules) in enumerate(jobs, 1):
         output = run_fixture(model, directory, f"fixture-{index:04}", snapshot, path, document,
@@ -492,7 +498,7 @@ def run_lock(state):
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError as error:
-        raise Incomplete("已有审核在运行，或上次中断待核对：" + str(lock)) from error
+        raise Incomplete(tr('A review is running, or a previous interrupted lock needs inspection: ') + str(lock)) from error
     try:
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
@@ -504,24 +510,26 @@ def run_lock(state):
 def render(report, directory):
     """render() 仅展开当前问题类别，其余发现保留在完整结果中供后续处理。"""
     state = report["status"]
-    title = {"issues": "BLOCK：代码审核有待回应的质疑", "unhealthy": "BLOCK：审核依据需要澄清",
-             "clear": "通过：当前完整快照已完成审核", "incomplete": "BLOCK：审核未完成"}[state]
-    lines = ["# " + title, "", report["summary"], "", "快照：`" + report["snapshot_id"] + "`", ""]
+    title = {"issues": tr('BLOCK: code-review findings need a response'), "unhealthy": tr('BLOCK: review basis needs clarification'),
+             "clear": tr('Passed: the complete current snapshot was reviewed'), "incomplete": tr('BLOCK: review incomplete')}[state]
+    lines = ["# " + title, "", report["summary"], "", tr('Snapshot: `') + report["snapshot_id"] + "`", ""]
     for issue in report["findings"]:
         if issue["category"] != report["current_category"]:
             continue
-        lines += [f"- **{issue['title']}**（{LABELS[issue['origin']]}）",
-                  f"  位置：`{issue['path']}:{issue['line']}`", "  " + issue["question"],
-                  f"  依据：`{issue['rule_path']}:{issue['rule_line']}` — {issue['rule_quote']}",
-                  "  理由：" + issue["reason"], "  反证核对：" + issue["counterevidence"], ""]
+        lines += [f"- **{issue['title']}** ({tr(LABELS[issue['origin']])})",
+                  tr('  Location: `{v0}:{v1}`', v0=(issue['path']), v1=(issue['line'])), "  " + issue["question"],
+                  tr('  Rule: `{v0}:{v1}` — {v2}', v0=(issue['rule_path']), v1=(issue['rule_line']), v2=(issue['rule_quote'])),
+                  tr('  Rationale: ') + issue["reason"], tr('  Counterevidence check: ') + issue["counterevidence"], ""]
     other = sum(item["category"] != report["current_category"] for item in report["findings"])
     if other:
-        lines += [f"另有 {other} 项其他类别发现已保存，待当前类别处理后继续。", ""]
-    lines += ["可以修改代码，也可以提供解释或反驳；解释需要重新按相同依据核对，不自动等同通过。", "",
-              "完整记录：" + str(directory), ""]
+        lines += [tr('Additional findings in other categories: {v0}. They are retained for the next response.', v0=(other)), ""]
+    lines += [tr('You may change the code or provide an explanation or rebuttal; responses require verification against the same rules and are not automatically accepted.'), "",
+              tr('Full records: ') + str(directory), ""]
     text = "\n".join(lines)
     (directory / "report.md").write_text(text)
     print(text, file=sys.stderr if state != "clear" else sys.stdout)
+    # 此行为 hook 的机器协议，始终保持同一 ASCII 标记，不从已翻译的标题中猜测报告路径。
+    print("CLARITY_REPORT_DIR=" + str(directory))
 
 
 def review(repo, target, baseline, config, state, config_path=None):
@@ -534,16 +542,16 @@ def review(repo, target, baseline, config, state, config_path=None):
     actual_engine = engine_digest(engine_bytes)
     texts = {p: data.decode("utf-8") for p, data in engine_bytes.items() if p.endswith(".md")}
     if config.get("engine_digest") != actual_engine:
-        raise Incomplete("运行引擎与安装版本不符，须先核对并重新安装，不能用候选改动批准自身")
+        raise Incomplete(tr('Runtime engine differs from the installed version; verify and reinstall before using candidate changes as approval'))
     current_tree, baseline_tree = tree_id(repo, target), tree_id(repo, baseline)
     current, before = read_tree(repo, current_tree), read_tree(repo, baseline_tree)
     if not current:
-        raise Incomplete("审核对象没有已跟踪文本，不能自动通过")
+        raise Incomplete(tr('Review target has no tracked text; it cannot pass automatically'))
     pairs = basis_pairs(before, current, config)
     basis = list(pairs)
     rules, candidate_rules, changes = basis_materials(pairs, config)
     if not rules:
-        raise Incomplete("本次只有新候选依据，需先由所有者明确采用；不能在同次变更中自行成为正式规则")
+        raise Incomplete(tr('Only new candidate rules are available; the owner must adopt them explicitly before they can govern the same change'))
     code_rules = {p: f for p, f in rules.items() if not p.startswith(CURRENT_CASES)}
     responses_file = state / "responses.json"
     responses = json.loads(responses_file.read_text()) if responses_file.exists() else []
@@ -564,13 +572,13 @@ def review(repo, target, baseline, config, state, config_path=None):
               "unchanged_paths": [p for p in current if same_version(before.get(p), current[p])],
               "adopted_rules": {p: numbered(f["text"]) for p, f in code_rules.items()}, "human_responses": responses}
     if len(json.dumps(packet, ensure_ascii=False).encode()) > 1_500_000:
-        raise Incomplete("完整快照超过此试行入口的输入容量，需先实现分批覆盖；没有截断或自动通过")
+        raise Incomplete(tr('Complete snapshot exceeds this trial entry input capacity; batching must be implemented first; nothing was truncated or automatically passed'))
     model = CodexModel(config.get("codex_bin", "codex"), config.get("model"), config.get("timeout", 300))
     pending_findings = []
-    incomplete_scope = "依据健康检查及后续审核"
+    incomplete_scope = tr('basis health check and subsequent review')
     try:
         if not code_rules:
-            raise Incomplete("尚未选入正式规则，fixtures 只能用于检验规则，不能代替规则完成健康或代码审核")
+            raise Incomplete(tr('No formal rules were selected; fixtures test rules and cannot replace them in health or code review'))
         principles = {"engine/principles.md": {"text": texts["principles.md"]}}
         health_materials = {path: old if old is not None else new for path, (old, new) in pairs.items()}
         # 首次采用的可能是当前非空正文，不能误用旧空白版本校验其引用。
@@ -594,15 +602,15 @@ def review(repo, target, baseline, config, state, config_path=None):
                            candidate_files=candidate_rules, principles=principles)
         if (health["status"] not in {"usable", "unhealthy"}
                 or set(health["unresolved_ids"]) - {f["id"] for f in health["findings"]}):
-            raise Incomplete("健康阶段没有明确给出依据可用或需澄清的结论")
+            raise Incomplete(tr('Health stage did not explicitly conclude whether the basis is usable or needs clarification'))
         pending_findings.extend(health["findings"])
         if health["status"] == "unhealthy":
             result = health
         else:
             empty_current = [path for path, (_, new) in pairs.items() if new is not None and not new["text"].strip()]
             if empty_current:
-                raise Incomplete("当前选入资料为空，不能作为有效依据或静默跳过：" + "、".join(empty_current))
-            incomplete_scope = "fixtures 兼容性核对及后续代码审核"
+                raise Incomplete(tr('Selected material is empty; it cannot serve as a valid basis or be silently skipped: ') + "、".join(empty_current))
+            incomplete_scope = tr('fixture compatibility checks and subsequent code review')
             proposed_rules = {path: new for path, (_, new) in pairs.items()
                               if new is not None and not path.startswith(CURRENT_CASES)}
             fixtures = check_fixtures(model, directory, snapshot, rules, candidate_rules, responses, texts, repository,
@@ -617,13 +625,13 @@ def review(repo, target, baseline, config, state, config_path=None):
             else:
                 result = None
         if health["status"] == "usable" and result is None:
-            incomplete_scope = "独立代码首审、交叉反证及汇总"
+            incomplete_scope = tr('independent code review, cross-check, and summary')
             # 初审者不继承健康审核会话，必须显式交付同快照的已完成健康记录。
             packet["basis_health"] = health
             packet["fixture_validation"] = {key: fixtures[key] for key in ("snapshot_id", "status")}
             count = config.get("reviewers", 2)
             if not isinstance(count, int) or not 2 <= count <= 8:
-                raise Incomplete("独立审核员数量须在2到8之间")
+                raise Incomplete(tr('The number of independent reviewers must be between 2 and 8'))
             prompt = make_prompt("review", packet, "独立首审。covered_paths必须覆盖current_files的全部路径。", texts=texts)
             initial, review_errors = [], []
             with ThreadPoolExecutor(max_workers=count) as pool:
@@ -634,9 +642,9 @@ def review(repo, target, baseline, config, state, config_path=None):
                     try:
                         output = future.result()
                         if output["status"] not in {"clear", "issues"}:
-                            raise Incomplete("独立首审没有形成可核对的代码判断")
+                            raise Incomplete(tr('Independent first review did not produce a verifiable code assessment'))
                         if set(output["unresolved_ids"]) - {f["id"] for f in output["findings"]}:
-                            raise Incomplete("独立首审仍有无法裁定的内容")
+                            raise Incomplete(tr('Independent first reviews still contain undecidable items'))
                         for item in output["findings"]:
                             item["id"] = f"reviewer-{i}:" + item["id"]
                         output["unresolved_ids"] = [f"reviewer-{i}:" + old for old in output["unresolved_ids"]]
@@ -648,24 +656,24 @@ def review(repo, target, baseline, config, state, config_path=None):
             if review_errors:
                 raise Incomplete("；".join(review_errors))
             findings = [item for output in initial for item in output["findings"]]
-            incomplete_scope = "交叉反证及汇总"
+            incomplete_scope = tr('cross-check and summary')
             cross = run_stage(model, directory, "cross", make_prompt("review", packet,
                               "独立初判已完成，现在逐项寻找反证。全范围再核对，不能按票数判断。保留每个旧id的去向。", initial, texts),
                               snapshot, current, current, code_rules)
             account_for(findings, cross)
             if cross["status"] not in {"clear", "issues"}:
-                raise Incomplete("交叉反证没有完成代码判断")
+                raise Incomplete(tr('Cross-check did not complete the code assessment'))
             pending_findings = list(cross["findings"])
-            incomplete_scope = "汇总"
+            incomplete_scope = tr('summary')
             result = run_stage(model, directory, "summarize", make_prompt("summarize", packet,
                                "核对全部初审及反证，保留cross中的每项id或给解除理由；选一类向人提问，其他发现不得丢失。",
                                [*initial, cross], texts), snapshot, current, current, code_rules)
             account_for(cross["findings"], result)
             if result["status"] not in {"clear", "issues"}:
-                raise Incomplete("汇总没有形成可核对的代码判断")
-        incomplete_scope = "最终反馈与输入一致性核对"
+                raise Incomplete(tr('Summary did not produce a verifiable code assessment'))
+        incomplete_scope = tr('final feedback and input consistency check')
         if result["findings"] and result["current_category"] not in {f["category"] for f in result["findings"]}:
-            raise Incomplete("当前反馈类别没有对应的保留问题")
+            raise Incomplete(tr('Current feedback category has no retained finding'))
         pending_findings = list(result["findings"])
         for issue in result["findings"]:
             if issue["origin"] == "pre_existing":
@@ -675,23 +683,23 @@ def review(repo, target, baseline, config, state, config_path=None):
                     issue["origin"] = "uncertain"
                     issue["origin_reason"] += "；脚本未核对到指定基线原文，保留来源未知。"
         if tree_id(repo, target) != current_tree:
-            raise Incomplete("审核期间目标快照已变化，旧判断不能放行新内容")
+            raise Incomplete(tr('Target snapshot changed during review; an old verdict cannot approve new content'))
         if tree_id(repo, baseline) != baseline_tree:
-            raise Incomplete("审核期间比较基线已变化，需要重新核对问题来源")
+            raise Incomplete(tr('Comparison baseline changed during review; finding provenance must be checked again'))
         if repository_identity(repo, basis) != repository:
-            raise Incomplete("审核期间目标仓库身份已变化，不能复用原仓库的判断")
+            raise Incomplete(tr('Target repository identity changed during review; results cannot be reused across repositories'))
         if engine_digest({p: path.read_bytes() for p, path in engine_sources(ENGINE).items()}) != actual_engine:
-            raise Incomplete("审核期间共享引擎已变化，不能混用不同版的阶段结果")
+            raise Incomplete(tr('Shared engine changed during review; stage results from different versions cannot be mixed'))
         if config_path and json.loads(config_path.read_text()) != config:
-            raise Incomplete("审核期间调用配置已变化，需要重新核对输入")
+            raise Incomplete(tr('Invocation configuration changed during review; inputs must be checked again'))
         current_responses = json.loads(responses_file.read_text()) if responses_file.exists() else []
         if current_responses != responses:
-            raise Incomplete("审核期间人的回应记录已变化，需要使用完整新输入")
+            raise Incomplete(tr('Human-response records changed during review; collect complete new inputs'))
     except (ModelFailure, Incomplete, InstallError, OSError, ValueError, TypeError, KeyError) as error:
-        reason = incomplete_scope + "未完成：" + str(error)
+        reason = incomplete_scope + ": " + tr('Incomplete: ') + str(error)
         result = {"status": "incomplete", "snapshot_id": snapshot, "findings": pending_findings,
                   "current_category": pending_findings[0]["category"] if pending_findings else "",
-                  "summary": reason + f"；保留本次原文与协议校验已通过的 {len(pending_findings)} 项待核实发现，不表示整体审核完成。",
+                  "summary": reason + tr('; retained findings whose original text and protocol checks passed: {v0}. The overall review is still incomplete.', v0=(len(pending_findings))),
                   "incomplete_reason": reason}
     save(directory / "result.json", result)
     save(state / "latest.json", {"run": str(directory), "snapshot_id": snapshot, "status": result["status"],
@@ -704,13 +712,13 @@ def response_text(args):
     """response_text() 原样读取显式文字或指定环境变量，空白回应不写入记录。"""
     text = args.text if args.text is not None else os.environ.get(args.text_env)
     if not isinstance(text, str) or not text.strip():
-        raise Incomplete("回应不能为空；请用 --text 提供原话，或设置 --text-env 指定的环境变量")
+        raise Incomplete(tr('Response cannot be empty; provide verbatim text with --text or the environment variable named by --text-env'))
     return text
 
 
 def main():
     """main() 分开处理 Git 代码审核、工作树材料维护及各自回应，不相互覆盖最新结果。"""
-    parser = argparse.ArgumentParser(description="代码审核、材料质量检查与 engine 维护")
+    parser = argparse.ArgumentParser(description=tr('Code review, material-quality checks, and engine maintenance'))
     sub = parser.add_subparsers(dest="command", required=True)
     for command in ("review", "hook", "respond", "check-rules", "check-rules-quality", "check-fixtures-quality",
                     "maintain", "maintain-respond"):
@@ -724,11 +732,11 @@ def main():
             child.add_argument("event", choices=["pre-commit"])
         elif command in {"respond", "maintain-respond"}:
             text = child.add_mutually_exclusive_group(required=True)
-            text.add_argument("--text", help="忠实保存的实际回应。")
-            text.add_argument("--text-env", metavar="NAME", help="从指定环境变量读取原话，不经 shell 展开。")
+            text.add_argument("--text", help=tr('Actual response text, preserved verbatim.'))
+            text.add_argument("--text-env", metavar="NAME", help=tr('Read the verbatim response from the named environment variable without shell expansion.'))
             if command == "maintain-respond":
                 child.add_argument("--stage", choices=["rules-quality", "fixtures-quality", "rules-regression"],
-                                   help="明确回应一个维护阶段；默认使用最新报告的 current_stage。")
+                                   help=tr('Respond to one maintenance stage; default is current_stage from the latest report.'))
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
     if args.command in {"check-rules", "check-rules-quality", "check-fixtures-quality", "maintain", "maintain-respond"}:
@@ -750,7 +758,7 @@ def main():
                     return respond_maintenance(repo, state, response_text(args), args.stage)
                 return maintain(repo, config_path, state)
         except (Incomplete, ModelFailure, InstallError, OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
-            print("材料检查或维护未完成：" + str(error), file=sys.stderr)
+            print(tr('Material check or maintenance did not complete: ') + str(error), file=sys.stderr)
             return 2
     state = control_dir(repo)
     state.mkdir(parents=True, exist_ok=True)
@@ -762,25 +770,25 @@ def main():
                 latest = json.loads((state / "latest.json").read_text())
                 directory = Path(latest["run"]).resolve()
                 if not directory.is_relative_to((state / "runs").resolve()):
-                    raise Incomplete("最新代码审核指针不属于本仓库审核记录")
+                    raise Incomplete(tr('Latest code-review pointer is outside this repository review records'))
                 result = json.loads((directory / "result.json").read_text())
                 source = json.loads((directory / "input.json").read_text())
                 identity = repository_identity(repo, source["basis"])
                 if (source["target_repository"] != identity or latest.get("target_repository", identity) != identity
                         or result["snapshot_id"] != latest["snapshot_id"] or result["status"] != latest["status"]):
-                    raise Incomplete("最新代码审核不属于本次工作树，或指针与结果不一致，未保存回应")
+                    raise Incomplete(tr('Latest code review belongs to another worktree or its pointer and result disagree; response was not saved'))
                 if result["status"] not in {"issues", "unhealthy"}:
-                    raise Incomplete("当前没有可对应的人类质疑回应")
+                    raise Incomplete(tr('There is no current finding for a human response'))
                 path = state / "responses.json"
                 responses = json.loads(path.read_text()) if path.exists() else []
                 if not isinstance(responses, list):
-                    raise Incomplete("代码审核回应记录不是列表")
+                    raise Incomplete(tr('Code-review response record is not a list'))
                 responses.append({"snapshot_id": latest["snapshot_id"], "target_repository": identity,
                                   "category": result["current_category"],
                                   "findings": [f for f in result["findings"] if f["category"] == result["current_category"]],
                                   "human_text": response_text(args), "time": time.time()})
                 save(path, responses)
-                print("已保存原始回应；下次按同版依据复核，不自动视为通过。")
+                print(tr('Verbatim response saved; it will be checked against the same rules and is not automatically accepted.'))
                 return 0
             target = args.target if args.command == "review" else "index"
             head = git(repo, "rev-parse", "--verify", "HEAD", optional=True)
@@ -788,7 +796,7 @@ def main():
             return review(repo, target, baseline, config, state, config_path)
     except (Incomplete, ModelFailure, InstallError, OSError, ValueError, TypeError, KeyError) as error:
         if args.command == "respond":
-            print("代码审核回应未保存：" + str(error), file=sys.stderr)
+            print(tr('Code-review response was not saved: ') + str(error), file=sys.stderr)
             return 2
         directory = state / "runs" / ("incomplete-" + str(time.time_ns()))
         directory.mkdir(parents=True, exist_ok=True)

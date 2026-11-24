@@ -470,6 +470,31 @@ class IsolatedReviewTests(unittest.TestCase):
         self.assertIn("Review-Result-Begin", recorded)
         self.assertIn("Review-Result-End", recorded)
 
+    def test_translated_hook_uses_the_machine_marker_and_retains_every_finding(self):
+        self.write("second.py", BROKEN)
+        self.git("add", "second.py")
+        self.install()
+        self.set_mode("cross_failure")
+        for language in ("en", "es", "ja"):
+            with self.subTest(language=language):
+                message = self.root / ("message-" + language + ".txt")
+                reason = "保留所有问题，原因 {原文}"
+                message.write_text("Offline fixture\n\nReview-Bypass: " + reason + "\n")
+                result = self.execute(["sh", str(RUNNER / "commit-msg"), str(message)],
+                                      environment={**self.environment, "CLARITY_LANG": language})
+                recorded = message.read_text()
+                self.assertIn("CLARITY_REPORT_DIR=", result.stdout)
+                self.assertIn("incomplete", recorded)
+                self.assertIn("legacy.py:", recorded)
+                self.assertIn("second.py:", recorded)
+                self.assertIn(reason, recorded)
+                self.assertIn("Review-Result-End", recorded)
+                findings = self.latest_result()["findings"]
+                self.assertEqual(len(findings), 4)
+                self.assertEqual({item["path"] for item in findings}, {"legacy.py", "second.py"})
+                self.assertEqual(recorded.count("[pre_existing]"), 2)
+                self.assertEqual(recorded.count("[introduced]"), 2)
+
     def test_commit_message_bypass_writes_all_categories_without_optional_jq(self):
         """test_commit_message_bypass_writes_all_categories_without_optional_jq() 从本次结构化报告保留全部类别，不能退回只展示一类的终端摘要。"""
         self.install()

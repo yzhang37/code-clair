@@ -1,16 +1,16 @@
-# Clarity：仓库无关的代码审核
+# Clarity: repository-independent code review
 
-这是 Clarity 的原厂源码仓库。根目录直接放 `engine/`、`initial/` 和本仓库自己的 `current/`，不套 `.clarity/`；安装到其他 Git 项目后，才在宿主根目录建立普通的 `.clarity/` 目录。
+This is the upstream source repository for Clarity. Its root contains `engine/`, `initial/`, and this project's own `current/`, without an enclosing `.clarity/` directory. Installation in another project creates a regular `.clarity/` directory inside the chosen host directory.
 
-| 位置 | 职责 | 安装或更新时 |
+| Location | Responsibility | During installation or update |
 | --- | --- | --- |
-| [engine/](engine/) | 审核模型、唯一 Principles、流程、角色提示词和程序 | 从选定原厂 Git commit 部署 |
-| [initial/](initial/) | 未填规则与案例底稿 | 与程序一起更新 |
-| [current/](current/) | 本项目自己的规则与固定案例，即 Registry | 不从原厂分发；首次缺失时从 initial 创建，已有内容保留 |
-| [setup.py](setup.py) | 软件安装、更新、来源记录及 Make 集成 | 一并部署，供宿主以后自行更新 |
-| [Makefile](Makefile) | 原厂离线测试入口 | 不复制到宿主；宿主审核入口由安装器生成 |
+| [engine/](engine/) | Review model, the single Principles source, workflow, role prompts, and programs | Deployed from the selected upstream Git commit |
+| [initial/](initial/) | Unfilled rule and case templates | Updated alongside the programs |
+| [current/](current/) | This project's own rules and fixed cases: its Registry | Never distributed from upstream; created from initial when missing during installation, with existing content preserved |
+| [setup.py](setup.py) | Software installation, updates, source records, and Make integration | Deployed so the host can update itself later |
+| [Makefile](Makefile) | Upstream offline test entry | Not copied to the host; the installer generates the host's review entries |
 
-原厂和宿主的目录关系如下：
+The upstream and host layouts relate as follows:
 
 ```text
 code-clair/                  host-project/
@@ -25,81 +25,93 @@ code-clair/                  host-project/
                                 └── current/
 ```
 
-宿主中的 `.clarity/` 可以由宿主 Git 跟踪，不是嵌套 Git 仓库或 submodule；安装器不会自动暂存或提交宿主文件。原厂下载副本、版本记录和审核运行状态位于 Git common dir 的 `clarity/` 中，普通仓库通常是 `.git/clarity/`。
+The host can track `.clarity/` in Git; it is not a nested Git repository or submodule. The default **no** tracking choice leaves the index unchanged. Choosing **yes** stages the sidecar and generated Make integration without committing. At a Git root, the upstream download cache, installation records, and review runtime state live under `clarity/` in the Git common directory, usually `.git/clarity/`; other installation locations use the local state directory described below.
 
-## 安装与更新
+## Installation and updates
 
-进入你要安装的目录，执行：
+Enter the directory where you want to install Clarity and run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yzhang37/code-clair/main/install.sh | sh
 ```
 
-安装位置始终是当前目录的 `.clarity/`。目录可以没有 Git，也可以是有业务代码、历史、构建文件和未提交修改的成熟 Git 项目，甚至是已有 Git 仓库里的一个子目录。安装器不会跳到上级 Git 根目录，也不会替用户初始化 Git。机器需要可用的 Git、curl、Python 3.10+；Git 程序用于下载版本，不代表目标目录必须已有 Git 仓库。
+The installation target is always `.clarity/` in the current directory. That directory can have no Git repository, belong to a mature Git project with business code, history, build files, and uncommitted changes, or be a subdirectory of an existing Git repository. The installer does not move the target to a parent Git root or initialize Git for you. The machine needs working Git, curl, and Python 3.10+. Git downloads the release; its use does not require the target directory to be a Git repository.
 
-入口按这个顺序执行：
+The entry follows this sequence:
 
-1. 检测当前目录是否已有符合结构的 `.clarity` 安装。
-2. 已有安装时询问“更新（默认）”还是“全新安装”。
-3. 选择更新后直接进入升级，保留既有 Git 归属，不再询问跟踪。
-4. 全新安装且没有 Git 仓库时，直接安装文件，不管理 Git。
-5. 全新安装且属于 Git 仓库时，询问“是否将 `.clarity` 加入 Git 跟踪”，默认 **no**。
+1. Check whether the current directory already contains a structurally valid `.clarity` installation.
+2. If installed, ask whether to update, the default, or perform a fresh installation.
+3. If update is selected, upgrade directly, retain the existing Git tracking choice, and do not ask about tracking again.
+4. For a fresh installation outside Git, install the files without managing Git.
+5. For a fresh installation inside Git, ask whether to add `.clarity` to Git tracking; the default is **no**.
 
-“全新安装”是重新安装程序并重新选择跟踪，不是恢复出厂；已有 `current/` 仍保留。只有缺少 `current/` 时才从同版本 `initial/` 创建，原厂自己的规则与案例不分发给宿主。
+A fresh installation reinstalls the programs and asks about tracking again; it is not a factory reset. Existing `current/` content remains. Only a missing `current/` is created from the same release's `initial/`; upstream's own rules and cases are not distributed to the host.
 
-选择 **no** 时，Git 项目使用本机 `info/exclude` 排除未跟踪的 sidecar，不修改共享 `.gitignore` 或已有构建入口。选择 **yes** 时，安装器将程序、模板、当前资料和生成的 Make 入口加入暂存区，不自动提交；已有业务文件的暂存状态保持，Makefile 也只暂存新增入口，不夹带工作树里的其他改动。已经由 Git 跟踪的旧文件不会因为回答 no 被自动移出 Git。
+Choosing **no** excludes an untracked sidecar through the local Git `info/exclude`, without changing the shared `.gitignore` or adding host build integration. Choosing **yes** stages the programs, templates, current materials, and generated Make entries without committing. Existing staging of business files is preserved. Only the added integration is staged for the host Makefile, without including its other working-tree changes. Answering no does not automatically remove already tracked files from Git.
 
-安装后直接升级：
+After installation, update directly:
 
 ```sh
 ./.clarity/update
 ```
 
-升级只更新程序、模板及已启用的运行快照，保留 `current/`、配置、规则采用哈希和审核状态，也不重新询问 Git 跟踪。没有 Git 的目录同样可以升级。
+Updates replace the programs, templates, and any enabled runtime snapshot while preserving `current/`, configuration, adopted-rule hashes, and review state. They do not ask about Git tracking again. Directories without Git can also update.
 
-首次默认从 `https://github.com/yzhang37/code-clair.git` 通过 HTTPS 获取版本。之后沿用已选来源。需要本地同步时，在安装目录执行：
+The first installation defaults to HTTPS from `https://github.com/yzhang37/code-clair.git`. Later updates reuse the selected source. To synchronize from a local repository, run in the installation directory:
 
 ```sh
 ./.clarity/update --source ../code-clair
 ```
 
-改回 GitHub：
+To switch back to GitHub:
 
 ```sh
 ./.clarity/update --source https://github.com/yzhang37/code-clair.git
 ```
 
-维护者也可从目标目录直接运行原厂管理程序：
+Maintainers can also run the upstream management program directly from the target directory:
 
 ```sh
 python3 ../code-clair/setup.py install --source ../code-clair
 ```
 
-底层 `setup.py install` 与 `setup.py update` 仍保留，支持 `--repo`、`--source`、`--ref`；显式 `--repo` 只按给定目录安装，不解析成上级工作树根。非交互安装可以用 `--track yes` 或 `--track no` 指明跟踪选择，未提供时采用提示中的默认值。来源只读取已提交的 Git 版本，记录实际完整 commit。
+The underlying `setup.py install` and `setup.py update` commands remain available with `--repo`, `--source`, and `--ref`. An explicit `--repo` installs only in that directory, without resolving it to a parent worktree root. Noninteractive installation can use `--track yes` or `--track no` to specify the tracking choice; otherwise it uses the prompt's default. Sources are read only from committed Git versions, and the actual full commit is recorded.
 
-## 安装记录和保护边界
+## Installation records and protection boundaries
 
-Git 根目录继续沿用 Git common dir 的 `clarity/` 状态，以保留已有审核配置与记录。没有 Git、或安装在仓库子目录时，本机状态在 `.clarity/.local/`；随后由用户建立 Git 时仍沿用该状态。生成的 `.clarity/.gitignore` 排除本机状态和 Python 缓存。下载缓存按来源隔离，切换失败不更改原来源。
+At a Git root, Clarity continues using `clarity/` in the Git common directory to preserve existing review configuration and records. Outside Git, or when installed in a repository subdirectory, local state lives in `.clarity/.local/`. If the user later creates a Git repository, that state remains in use. The generated `.clarity/.gitignore` excludes local state and Python caches. Download caches are isolated by source, and a failed source switch leaves the selected source unchanged.
 
-记录包括当前及上次来源、实际 commit、部署文件的摘要和权限、Git 跟踪选择和 Make 入口。本地修改过的原厂文件会使升级拒绝；新路径已被本地文件占用时也不会覆盖。克隆已跟踪的 sidecar 而缺少本机记录时，升级先逐文件匹配原厂历史版本，最多核对最近 200 个祖先，并核对该版本生成的 Makefile 和忽略文件，不能仅凭目录名认领。
+Records include the current and previous sources, actual commits, deployed-file hashes and permissions, Git tracking choice, and Make entry. Updates refuse locally modified upstream files or new paths occupied by local files. When a tracked sidecar is cloned without its local records, updating first matches its files against upstream history, checking at most the latest 200 ancestors. The Makefile and ignore file generated by that version are checked too; a directory name alone does not establish ownership.
 
-已存在的 Make 集成在升级时保留。新的独立安装在 `.clarity/Makefile` 提供目标；加入跟踪时才在宿主有效的 Makefile 中集成加载入口。原有正文和默认构建目标保留，外来同名目标及被修改的管理块会拒绝覆盖。
+Existing Make integration is retained during updates. A new standalone installation provides targets in `.clarity/Makefile`; the effective host Makefile receives an include entry only when tracking is chosen. Original content and the default build target are preserved. Conflicting targets owned by others and locally modified managed blocks are not overwritten.
 
-交付前准备完整版本，写入失败恢复原文；加入跟踪时，Git 索引也在同一事务中回读和恢复。安装与既有代码审核、组合维护使用相应排他锁。强制终止或回滚失败留下的锁及备份需要核对，不按时间自动删除；不保证断电时的跨文件原子切换。
+The complete release is prepared before deployment, and a write failure restores the original files. When tracking is chosen, the Git index is also read back and restored within the same transaction. Installation, existing code review, and combined maintenance use the corresponding exclusive locks. Locks and backups left by forced termination or failed rollback require inspection and are not deleted based on age. Cross-file atomic switching during power loss is not guaranteed.
 
-软件安装不自动启用提交审核。代码审核仍需要 Git 快照；仅本机模式不会把 `.clarity/current/` 自动送入宿主 Git 快照，本轮未改变审核依据的取材契约。`reset` 和自动合并本地程序修改尚未实现。
+Software installation does not automatically enable commit review. Code review still requires Git snapshots. Local-only mode does not automatically include `.clarity/current/` in host Git snapshots; this work has not changed how review basis materials are collected. `reset` and automatic merging of local program edits are not implemented.
 
-## 在宿主运行审核
+## UI language
 
-审核需要可用的独立 Codex CLI。填写宿主自己的正式规则和案例后，使用生成的入口首次启用提交审核：
+Interface messages support `en`, `zh-Hans`, `zh-Hant`, `es`, `fr`, `de`, `it`, and `ja`. Selection is automatic from the operating system's preferred UI languages, with English as the fallback. Set `CLARITY_LANG` to override that choice, for example:
+
+```sh
+CLARITY_LANG=fr ./.clarity/update
+```
+
+[i18n.py](engine/runner/i18n.py) uses the Strategy pattern for OS language detection and a gettext Chain of Responsibility for regional language, base language, then English fallback. Catalogs load on demand. Adding a language requires a JSON catalog in `engine/runner/locales/` and any necessary alias or fallback data, without a class per language. The 10,000-catalog test checks scalability with synthetic data; it does not represent 10,000 translated languages.
+
+Localization applies only to interface labels, help, errors, and progress. Rule text, `initial/`, `current/`, engine documents and prompts remain in their original language. Model inputs, evidence quotations, and original model reasoning in reports are not translated; values inserted into UI messages retain their original text.
+
+## Running reviews in a host
+
+Review requires a working standalone Codex CLI. After filling in the host's own formal rules and cases, use the generated entry to enable commit review for the first time:
 
 ```sh
 make review-install
 ```
 
-此命令仍是现有审核启用入口：它会按默认参数重建审核配置，不是软件更新命令。已有自定义配置的安装使用上面的 `setup.py update` 更新程序。
+This is the existing review activation command: it rebuilds review configuration using default parameters and is not a software update command. Installations with custom configuration use `setup.py update` above to update the programs.
 
-宿主日常入口：
+Daily host entries:
 
 ```sh
 make review
@@ -110,22 +122,24 @@ make review-rules
 make review-engine
 ```
 
-`review` 审核 HEAD，`review-staged` 审核暂存区，均不创建提交。它们读取所选 Git 快照的完整已跟踪文本，包括 `.clarity` 中的规则、案例、模板、文档和程序；diff 只帮助理解变化。未进入该快照的文件不会自动被读取。
+These commands use the host Make integration. If it is not installed, select the generated `.clarity/Makefile` with Make's `-f` option.
 
-两项 quality 检查共用同一检查器和唯一 Principles，分别检查完整 rules、完整 fixtures 的编写质量；`review-rules` 隐藏 GOLD 独立判断片段后比较固定预期，再核对理由和边界。`review-engine` 组合这三项，只形成工作树材料维护结果，不形成代码审核通过，也不改写正式资料。
+`review` examines HEAD and `review-staged` examines the index; neither creates a commit. They read all tracked text in the selected Git snapshot, including the rules, cases, templates, documents, and programs under `.clarity`. The diff only helps explain changes. Files outside that snapshot are not automatically read.
 
-Reviewer 报告审核结果，Git hook 决定是否提交。在 SourceTree 中正常暂存、填写说明和提交即可触发。若审核未通过仍要提交，在提交说明另起一行填写 `Review-Bypass: 你的一句话说明`；hook 会把全部已知问题和真实审核状态写入本次 commit message 后放行。人的说明无需 AI 批准，跳过不改变未修复或未完成状态。
+The two quality checks share one checker and the single Principles source, checking the writing quality of complete rules and complete fixtures respectively. `review-rules` hides GOLD while independently classifying samples, compares fixed expectations, and then checks rationales and scope. `review-engine` combines these three checks and produces only working-tree material-maintenance results; it does not establish a passing code review or rewrite formal materials.
 
-代码回应使用 `make review-respond RESPONSE='实际回应原话'`，材料维护回应使用 `make review-engine-respond RESPONSE='实际回应原话'`。回应只保存到各自记录，不自动修改规则、固定预期或生成 learn 候选。
+The Reviewer reports review results; the Git hook decides whether to permit a commit. Normal staging, commit-message entry, and committing in SourceTree trigger the review. To commit despite a review that did not pass, add `Review-Bypass: your one-sentence explanation` on a separate line in the commit message. The hook records all known findings and the actual review status in that commit message before allowing the commit. The explanation needs no AI approval, and bypassing does not change unresolved or incomplete status.
 
-## 材料与审核边界
+Use `make review-respond RESPONSE='your verbatim response'` for code-review responses and `make review-engine-respond RESPONSE='your verbatim response'` for material-maintenance responses. Responses are saved only in their respective records; they do not automatically change rules or fixed expectations, or generate learn candidates.
 
-对象、职责和术语集中维护在 [Engine 模型](engine/README.md)；rules 和完整 fcase 的编写质量统一使用 [Principles 及教学对照](engine/principles.md)。编写或修订材料前阅读它们，按 [workflow](engine/workflow.md) 核对材料质量及规则兼容性。
+## Material and review boundaries
 
-`current/rules.md` 是可独立用于编写和审查代码的标准；`current/cases/` 用固定正反预期、前提、理由和边界检验规则，不提供额外代码准则。一个 Markdown 文件管理一个案例，同一判断点的补充沿用原文件。模板中的标题和未填项不是正式依据；空模板不会让代码自动通过。
+Objects, responsibilities, and terminology are maintained in the [Engine model](engine/README.md). Writing quality for rules and complete fcases uses the same [Principles and teaching comparisons](engine/principles.md). Read them before writing or revising materials, and follow the [workflow](engine/workflow.md) to check material quality and rule compatibility.
 
-审核先核对依据健康及逐 case 兼容性，再组织独立代码审核、交叉反证和汇总。完整能力、退出码、记录位置及限制见 [runner 运行说明](engine/runner/README.md)。调用故障、引用或覆盖缺口不能标为通过；固定案例通过也不证明未知代码没有误判或漏判。Pi 和自动知识整理尚未接入。
+`current/rules.md` is a standalone standard for writing and reviewing code. `current/cases/` tests rules using fixed positive and negative expectations, premises, rationales, and scope; it adds no code criteria. One Markdown file manages one case, with additions concerning the same judgment kept in that file. Template headings and unfilled fields are not formal review basis materials; empty templates do not make code pass automatically.
 
-## 原厂验证
+Review checks basis health and compatibility per case before organizing independent code review, counterevidence checks, and a summary. Full capabilities, exit codes, record locations, and limitations are documented in the [runner guide](engine/runner/README.md). Call failures or quotation and coverage gaps cannot be marked as passes. Passing fixed cases does not prove that unknown code has no false positives or missed findings. Pi and automatic knowledge organization are not integrated.
 
-在本仓库运行 `make test`。离线测试使用临时原厂和宿主 Git 仓库及假模型，核对现有审核流程、Make 集成和安装更新，不运行目标业务或真实模型审核。原厂 Makefile 不提供宿主 `review` 目标。
+## Upstream verification
+
+Run `make test` in this repository. Offline tests use temporary upstream and host Git repositories and fake models to check the existing review flow, Make integration, installation, and updates. They do not run target business programs or real model reviews. The upstream Makefile does not provide host `review` targets.

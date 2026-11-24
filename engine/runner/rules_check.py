@@ -1,8 +1,15 @@
 """独立验证当前规则能否正确判定固定案例，不修改案例或提交状态。"""
 
+# 动态安装会按文件路径加载本模块；只补同版 runner 搜索路径，不依赖宿主技术栈。
+import sys
+from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from i18n import tr
+
+
 import hashlib
 import json
-from pathlib import Path
 import re
 import time
 
@@ -33,27 +40,27 @@ def read_inputs(repo):
     paths = [repo / RULES]
     directory = repo / CASES
     if directory.is_symlink() or not directory.is_dir():
-        raise CheckIncomplete("没有常规 cases 目录")
+        raise CheckIncomplete(tr('No regular cases directory'))
     for path in sorted(directory.rglob("*")):
         if path.is_symlink():
-            raise CheckIncomplete("案例不能是符号链接：" + str(path))
+            raise CheckIncomplete(tr('Case cannot be a symbolic link: ') + str(path))
         if path.is_file() and path.name != ".gitkeep":
             if path.suffix != ".md":
-                raise CheckIncomplete("案例不是 Markdown，未静默忽略：" + str(path))
+                raise CheckIncomplete(tr('Case is not Markdown; it was not silently skipped: ') + str(path))
             paths.append(path)
     if len(paths) == 1:
-        raise CheckIncomplete("没有待验收的固定案例")
+        raise CheckIncomplete(tr('No fixed cases are available for verification'))
     documents = {}
     for path in paths:
         if path.is_symlink() or not path.is_file():
-            raise CheckIncomplete("资料不是常规文件：" + str(path))
+            raise CheckIncomplete(tr('Material is not a regular file: ') + str(path))
         try:
             path.resolve().relative_to(repo)
         except ValueError as error:
-            raise CheckIncomplete("资料越出目标仓库：" + str(path)) from error
+            raise CheckIncomplete(tr('Material is outside the target repository: ') + str(path)) from error
         text = path.read_text(encoding="utf-8")
         if not text.strip() or "\0" in text:
-            raise CheckIncomplete("资料为空或不是文本：" + str(path))
+            raise CheckIncomplete(tr('Material is empty or is not text: ') + str(path))
         documents[path.relative_to(repo).as_posix()] = text
     return documents
 
@@ -91,7 +98,7 @@ def headings(lines, path):
         if heading or label:
             result.append((index, heading[2] if heading else line, len(heading[1]) if heading else 7))
     if fence:
-        raise CheckIncomplete(f"{path}:{fence[2]}: 案例存在未闭合的原文围栏")
+        raise CheckIncomplete(tr('{v0}:{v1}: case contains an unclosed source fence', v0=(path), v1=(fence[2])))
     return result
 
 
@@ -106,7 +113,7 @@ def materials(lines, start, end, path):
             while index < end and not re.match(r"^\s*" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}\s*$", lines[index]):
                 index += 1
             if index == end:
-                raise CheckIncomplete(f"{path}:{first}: 待判片段的围栏未闭合")
+                raise CheckIncomplete(tr('{v0}:{v1}: sample code fence is not closed', v0=(path), v1=(first)))
             # 去掉首空行后，位置也必须前移，才能按原文行号核对同一片段。
             while first < index and not lines[first]:
                 first += 1
@@ -169,7 +176,7 @@ def fact_context(lines, end, path):
                 continue
             if title in {"目的", "检查目标"}:
                 if re.search(r"正例|反例|GOLD|固定预期|预期(?:答案|判断|结果)", line):
-                    raise CheckIncomplete(f"{path}:{number}: 检查目标混入固定预期，不能直接交给独立判别者")
+                    raise CheckIncomplete(tr('{v0}:{v1}: check objective contains fixed expectations and cannot be sent to an independent classifier', v0=(path), v1=(number)))
                 entries.append((owner, "检查目标：" + line))
                 continue
             for sentence in re.findall(r"[^。]+(?:。|$)", line):
@@ -190,7 +197,7 @@ def fact_context(lines, end, path):
                     candidate = sentence.split("，", 1)[0]
                 if candidate:
                     if re.search(r"正例|反例|GOLD|固定预期|预期(?:答案|判断|结果)", sentence):
-                        raise CheckIncomplete(f"{path}:{number}: 事实前提混入固定预期，不能直接交给独立判别者")
+                        raise CheckIncomplete(tr('{v0}:{v1}: factual context contains fixed expectations and cannot be sent to an independent classifier', v0=(path), v1=(number)))
                     entries.append((owner, candidate))
     return list(dict.fromkeys(text for owner, text in entries if parents[:len(owner)] == owner))
 
@@ -249,9 +256,9 @@ def collect_samples(documents):
                                 "subcase_title": subcase_title})
         for index in required_labels:
             if index not in covered_labels:
-                raise CheckIncomplete(f"{path}:{index + 1}: 正反区段没有可独立判定的代码或引用，未把理由冒充样本")
+                raise CheckIncomplete(tr('{v0}:{v1}: positive/negative section has no independently classifiable code or quotation; rationale was not substituted as a sample', v0=(path), v1=(index + 1)))
         if kinds != {"accept", "reject"}:
-            raise CheckIncomplete(f"{path}:1: 案例缺少明确正反预期")
+            raise CheckIncomplete(tr('{v0}:1: case has no explicit positive/negative expectations', v0=(path)))
     return samples
 
 
@@ -285,44 +292,44 @@ def quote_valid(text, line, quote):
 def validate_prediction(output, snapshot, sample, rules):
     """validate_prediction() 拒绝其他输入的输出和无证据判定，预期比较由工具随后执行。"""
     if not isinstance(output, dict) or set(output) != set(prediction_schema()["properties"]):
-        raise CheckIncomplete("独立判定字段不完整")
+        raise CheckIncomplete(tr('Independent verdict fields are incomplete'))
     if not isinstance(output["incomplete_reason"], str):
-        raise CheckIncomplete("独立判定的未完成说明类型无效")
+        raise CheckIncomplete(tr('Independent verdict has an invalid incomplete-reason type'))
     if output["snapshot_id"] != snapshot or output["sample_id"] != sample["sample_id"]:
-        raise CheckIncomplete("独立判定对应另一份输入")
+        raise CheckIncomplete(tr('Independent verdict belongs to different inputs'))
     if output["verdict"] == "incomplete" or output["incomplete_reason"]:
-        raise CheckIncomplete(output["incomplete_reason"] or "片段材料不足")
+        raise CheckIncomplete(output["incomplete_reason"] or tr('Sample material is insufficient'))
     if output["verdict"] not in {"accept", "reject"} or not isinstance(output["reason"], str) or not output["reason"].strip():
-        raise CheckIncomplete("独立判定缺少有效结论或理由")
+        raise CheckIncomplete(tr('Independent verdict lacks a valid decision or rationale'))
     if not quote_valid(rules, output["rule_line"], output["rule_quote"]):
-        raise CheckIncomplete("独立判定没有引用有效规则原文")
+        raise CheckIncomplete(tr('Independent verdict does not cite valid rule text'))
     return output
 
 
 def validate_audit(output, snapshot, case_id, group, document):
     """validate_audit() 核对每个片段的理由与范围覆盖，不能补救错误的正反判定。"""
     if not isinstance(output, dict) or set(output) != set(audit_schema()["properties"]):
-        raise CheckIncomplete("理由核对字段不完整")
+        raise CheckIncomplete(tr('Rationale-check fields are incomplete'))
     if not isinstance(output["incomplete_reason"], str):
-        raise CheckIncomplete("理由核对的未完成说明类型无效")
+        raise CheckIncomplete(tr('Rationale check has an invalid incomplete-reason type'))
     if output["snapshot_id"] != snapshot or output["case_id"] != case_id or output["incomplete_reason"]:
-        raise CheckIncomplete(output.get("incomplete_reason") or "理由核对对应另一份输入")
+        raise CheckIncomplete(output.get("incomplete_reason") or tr('Rationale check belongs to different inputs'))
     if not isinstance(output["checks"], list) or not isinstance(output["summary"], str) or not output["summary"].strip():
-        raise CheckIncomplete("理由核对没有完整记录")
+        raise CheckIncomplete(tr('Rationale check has no complete record'))
     expected, seen = {sample["sample_id"] for sample in group}, set()
     for check in output["checks"]:
         if not isinstance(check, dict) or set(check) != set(audit_schema()["properties"]["checks"]["items"]["properties"]):
-            raise CheckIncomplete("理由核对项字段不完整")
+            raise CheckIncomplete(tr('Rationale-check item fields are incomplete'))
         identifier = check["sample_id"]
         if not isinstance(identifier, str) or identifier not in expected or identifier in seen:
-            raise CheckIncomplete("理由核对样本标识缺失或重复")
+            raise CheckIncomplete(tr('Rationale-check sample identifier is missing or duplicated'))
         seen.add(identifier)
         if not isinstance(check["aligned"], bool) or not isinstance(check["reason"], str) or not check["reason"].strip():
-            raise CheckIncomplete("理由核对缺少明确判断或理由")
+            raise CheckIncomplete(tr('Rationale check lacks an explicit decision or rationale'))
         if not quote_valid(document, check["case_line"], check["case_quote"]):
-            raise CheckIncomplete("理由核对的案例引用无效")
+            raise CheckIncomplete(tr('Rationale check has an invalid case quotation'))
     if seen != expected:
-        raise CheckIncomplete("理由核对遗漏样本")
+        raise CheckIncomplete(tr('Rationale check omitted a sample'))
     return output
 
 
@@ -336,7 +343,7 @@ def check_rules(repo, config_path, state):
     prompt_path = engine / "prompts/rules-check.md"
     directory = state / "rules-checks" / ("run-" + str(time.time_ns()))
     report = {"status": "incomplete", "snapshot_id": "unresolved", "interrupted": False, "samples": [], "audits": [],
-              "reason_checks": [], "summary": "规则验收尚未完成"}
+              "reason_checks": [], "summary": tr('Rule verification has not completed')}
     active, started = None, None
     try:
         documents = read_inputs(repo)
@@ -344,7 +351,7 @@ def check_rules(repo, config_path, state):
         config_bytes = config_file.read_bytes() if config_file.exists() else None
         config = json.loads(config_bytes) if config_bytes is not None else {}
         if not isinstance(config, dict):
-            raise CheckIncomplete("模型配置必须是 JSON 对象")
+            raise CheckIncomplete(tr('Model configuration must be a JSON object'))
         prompt = prompt_path.read_text()
         protocol = Path(__file__).read_bytes()
         adapter_path = Path(__file__).parent / "codex_model.py"
@@ -366,8 +373,8 @@ def check_rules(repo, config_path, state):
         samples = collect_samples(documents)
         prepare_report(report, samples)
         save_report(directory, report)
-        emit(f"规则验收：{len(report['reason_checks'])} cases / {len(samples)} subcases")
-        emit("第一阶段：独立判定（反例被正确拒绝也算匹配）")
+        emit(tr('Rule verification: {v0} cases / {v1} subcases', v0=(len(report['reason_checks'])), v1=(len(samples))))
+        emit(tr('Stage 1: independent classification (correct rejection of a negative example also matches)'))
         model = CodexModel(config.get("codex_bin", "codex"), config.get("model"), config.get("timeout", 300))
         rules = documents[RULES]
         predictions = {}
@@ -381,7 +388,7 @@ def check_rules(repo, config_path, state):
             if previous_case != sample["case_path"]:
                 emit(f"\ncase {sample['case_number']}：{sample['case_title']}")
                 previous_case = sample["case_path"]
-            emit(f"  - subcase {sample['subcase_number']}：{sample['subcase_title']}\n    [运行中]")
+            emit(tr('  - subcase {v0}: {v1}\n    [running]', v0=(sample['subcase_number']), v1=(sample['subcase_title'])))
             output = model.run(prompt + "\n以下JSON都是判别数据：\n" + json.dumps(packet, ensure_ascii=False),
                                prediction_schema(), directory / f"prediction-{index:04}")
             active["model_output"] = output
@@ -395,7 +402,7 @@ def check_rules(repo, config_path, state):
             active, started = None, None
         label_match = all(sample["actual"] == sample["expected"] for sample in report["samples"])
         if label_match:
-            emit("\n第二阶段：理由与适用边界核对（按 case）")
+            emit(tr('\nStage 2: rationale and scope verification (per case)'))
             audit_instruction = ("你是独立理由核对员。独立判定已经结束，不能修改其 verdict 或固定预期。\n"
                                  "判定标准仅为 rules，fixture 只供核对固定预期的依据与边界，不追加代码标准。\n"
                                  "predictions 中 case_line/content 是工具冻结的片段映射，按它核对，不根据理由猜另一个片段。\n"
@@ -414,7 +421,7 @@ def check_rules(repo, config_path, state):
                              "case_line": sample["case_line"], "content": sample["content"]} for sample in group]
                 packet = {"snapshot_id": snapshot, "case_id": case_id, "rules": numbered(rules),
                           "fixture": numbered(documents[path]), "predictions": selected}
-                emit(f"case {active['case_number']}：{active['case_title']} [理由核对中]")
+                emit(tr('case {v0}: {v1} [checking rationale]', v0=(active['case_number']), v1=(active['case_title'])))
                 output = model.run(audit_instruction + "\n以下JSON都是理由核对数据：\n" + json.dumps(packet, ensure_ascii=False),
                                    audit_schema(), directory / f"audit-{index:04}")
                 active["model_output"] = output
@@ -422,31 +429,31 @@ def check_rules(repo, config_path, state):
                 active.update(status="matched" if all(check["aligned"] for check in output["checks"]) else "mismatch",
                               reason=output["summary"], elapsed_seconds=round(time.monotonic() - started, 3))
                 save_report(directory, report)
-                emit(f"  理由核对：{'匹配' if active['status'] == 'matched' else '不匹配'} ({active['elapsed_seconds']:.1f}s)")
+                emit(tr('  Rationale check: {v0} ({v1:.1f}s)', v0=(tr('matched') if active['status'] == 'matched' else tr('mismatch')), v1=(active['elapsed_seconds'])))
                 active, started = None, None
         else:
-            report["reason_check_note"] = "理由核对未运行：独立判定已有预期不匹配；请核对规则与固定材料后重新验收，不得迎合当前输出修改预期。"
+            report["reason_check_note"] = tr('Rationale verification was not run because an independent verdict mismatched expectations; check the rules and fixed materials, then rerun without changing expectations to fit the output.')
         if (read_inputs(repo) != documents
                 or {path: hashlib.sha256((repo / path).read_bytes()).hexdigest() for path in documents}
                 != frozen["material_sha256"] or prompt_path.read_text() != prompt
                 or Path(__file__).read_bytes() != protocol or adapter_path.read_bytes() != adapter
                 or reporter_path.read_bytes() != reporter):
-            raise CheckIncomplete("验收期间规则、案例或判别协议已经变化")
+            raise CheckIncomplete(tr('Rules, cases, or the classification protocol changed during verification'))
         if (config_file.read_bytes() if config_file.exists() else None) != config_bytes:
-            raise CheckIncomplete("验收期间模型配置已经变化")
+            raise CheckIncomplete(tr('Model configuration changed during verification'))
         aligned = all(check["aligned"] for audit in report["audits"] for check in audit["checks"])
         report["status"] = "passed" if label_match and aligned else "failed"
-        report["summary"] = (f"全部 {len(samples)} 个 subcases 预期匹配，{len(report['audits'])} 个 cases 理由边界符合。" if report["status"] == "passed"
-                             else "固定案例与规则的独立判定或理由不符；本次案例未修改，请核对规则与固定材料后重新验收，不得迎合当前输出修改预期。")
+        report["summary"] = (tr('All sample expectations matched ({v0} subcases); rationale and scope checks passed ({v1} cases).', v0=(len(samples)), v1=(len(report['audits']))) if report["status"] == "passed"
+                             else tr('Independent verdicts or rationales disagree with the fixed cases; cases were not changed. Check the rules and fixed materials, then rerun without changing expectations to fit the output.'))
     except (CheckIncomplete, ModelFailure, OSError, UnicodeError, ValueError, TypeError, KeyError, KeyboardInterrupt) as error:
         report["interrupted"] = isinstance(error, KeyboardInterrupt)
-        message = "用户中断规则验收" if isinstance(error, KeyboardInterrupt) else str(error)
+        message = tr('Rule verification was interrupted by the user') if isinstance(error, KeyboardInterrupt) else str(error)
         report["status"], report["summary"] = "incomplete", message
         if active is not None:
             active.update(status="incomplete", error=message, elapsed_seconds=round(time.monotonic() - started, 3))
-            emit("    [未完成] " + message)
+            emit(tr('    [incomplete] ') + message)
         if not any(check["status"] != "not_run" for check in report["reason_checks"]):
-            report["reason_check_note"] = "理由核对未运行：独立判定未完成。"
+            report["reason_check_note"] = tr('Rationale verification was not run because independent classification is incomplete.')
     finish_report(directory, report)
     state.mkdir(parents=True, exist_ok=True)
     pointer = state / "latest-rules-check.json"

@@ -1,8 +1,15 @@
 """按同一份 Principles 独立检查工作树 rules 或完整 fixtures 的编写质量。"""
 
+# 动态安装会按文件路径加载本模块；只补同版 runner 搜索路径，不依赖宿主技术栈。
+import sys
+from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from i18n import tr
+
+
 import hashlib
 import json
-from pathlib import Path
 import time
 
 from codex_model import CodexModel, ModelFailure
@@ -36,11 +43,11 @@ def regular_path(repo, path):
         if component == repo:
             break
         if component.is_symlink():
-            raise MaterialIncomplete("资料路径不能包含符号链接：" + str(component))
+            raise MaterialIncomplete(tr('Material path cannot contain a symbolic link: ') + str(component))
     try:
         path.resolve().relative_to(repo)
     except ValueError as error:
-        raise MaterialIncomplete("资料越出目标仓库：" + str(path)) from error
+        raise MaterialIncomplete(tr('Material is outside the target repository: ') + str(path)) from error
 
 
 def read_inputs(repo, kind):
@@ -50,41 +57,41 @@ def read_inputs(repo, kind):
     .gitkeep 仅是空目录占位，不能让没有完整 fcase 的检查通过。
     """
     if kind not in {"rules", "fixtures"}:
-        raise MaterialIncomplete("编写质量检查对象只能是 rules 或 fixtures")
+        raise MaterialIncomplete(tr('Material-quality target must be rules or fixtures'))
     if kind == "rules":
         paths = [repo / RULES]
     else:
         directory = repo / CASES
         regular_path(repo, directory)
         if not directory.is_dir():
-            raise MaterialIncomplete("没有常规 fixtures 目录：" + CASES)
+            raise MaterialIncomplete(tr('No regular fixtures directory: ') + CASES)
         paths = []
         for path in sorted(directory.rglob("*")):
             regular_path(repo, path)
             if path.is_dir():
                 continue
             if not path.is_file():
-                raise MaterialIncomplete("fixture 不是常规文件：" + str(path))
+                raise MaterialIncomplete(tr('Fixture is not a regular file: ') + str(path))
             if path.name == ".gitkeep":
                 continue
             if path.suffix != ".md":
-                raise MaterialIncomplete("fixture 不是 Markdown，未静默忽略：" + str(path))
+                raise MaterialIncomplete(tr('Fixture is not Markdown; it was not silently skipped: ') + str(path))
             paths.append(path)
         if not paths:
-            raise MaterialIncomplete("没有完整 fcase，编写质量检查没有覆盖")
+            raise MaterialIncomplete(tr('No complete fcase is available; material-quality coverage is absent'))
     documents = {}
     size = 0
     for path in paths:
         regular_path(repo, path)
         if not path.is_file():
-            raise MaterialIncomplete("材料缺失或不是常规文件：" + str(path))
+            raise MaterialIncomplete(tr('Material is missing or is not a regular file: ') + str(path))
         raw = path.read_bytes()
         size += len(raw)
         if size > MAX_INPUT_BYTES:
-            raise MaterialIncomplete("完整材料超过 1.5 MB，未截断后宣称覆盖")
+            raise MaterialIncomplete(tr('Complete materials exceed 1.5 MB; coverage was not claimed after truncation'))
         text = raw.decode("utf-8")
         if not text.strip() or "\0" in text:
-            raise MaterialIncomplete("材料为空或不是文本：" + str(path))
+            raise MaterialIncomplete(tr('Material is empty or is not text: ') + str(path))
         documents[path.relative_to(repo).as_posix()] = text
     return documents
 
@@ -143,47 +150,47 @@ def validate_output(output, snapshot, material, principles):
     errors, findings, coverage = [], [], []
     if (not isinstance(output, dict) or output.get("snapshot_id") != snapshot
             or output.get("material_id") != material["material_id"]):
-        return [], [], ["编写质量输出对应另一份输入或不是对象"]
+        return [], [], [tr('Material-quality output belongs to different inputs or is not an object')]
     schema = response_schema()["properties"]
     if set(output) != set(schema):
-        errors.append("编写质量输出字段不完整或包含未知字段")
+        errors.append(tr('Material-quality output has missing or unknown fields'))
     for name in ["summary", "incomplete_reason"]:
         if not isinstance(output.get(name), str) or (name == "summary" and not output[name].strip()):
-            errors.append("编写质量输出缺少有效的 " + name)
+            errors.append(tr('Material-quality output lacks a valid ') + name)
     if output.get("incomplete_reason"):
         errors.append(str(output["incomplete_reason"]))
     items = output.get("findings")
     if not isinstance(items, list):
-        errors.append("编写质量问题清单无效")
+        errors.append(tr('Invalid material-quality finding list'))
     else:
         fields = set(schema["findings"]["items"]["properties"])
         for item in items:
             if (not evidence_valid(item, material["text"], principles) or set(item) != fields):
-                errors.append("编写质量问题缺少有效材料、Principles 原文引用或理由")
+                errors.append(tr('Material-quality finding lacks valid material or Principles quotations or a rationale'))
             else:
                 findings.append(item)
     expected = {unit["unit_id"]: unit for unit in material["coverage_plan"]}
     seen = set()
     items = output.get("coverage")
     if not isinstance(items, list):
-        errors.append("编写质量覆盖清单无效")
+        errors.append(tr('Invalid material-quality coverage list'))
     else:
         fields = set(schema["coverage"]["items"]["properties"])
         for item in items:
             identifier = item.get("unit_id") if isinstance(item, dict) else None
             if not isinstance(identifier, str) or identifier not in expected or identifier in seen:
-                errors.append("编写质量覆盖标识无效或重复")
+                errors.append(tr('Material-quality coverage identifier is invalid or duplicated'))
                 continue
             seen.add(identifier)
             unit = expected[identifier]
             if (not evidence_valid(item, material["text"], principles) or set(item) != fields
                     or not unit["start_line"] <= item["material_line"] <= unit["end_line"]):
-                errors.append("编写质量行段缺少有效原文引用或理由：" + identifier)
+                errors.append(tr('Material-quality range lacks a valid original quotation or rationale: ') + identifier)
                 continue
             coverage.append(item)
     covered = {item["unit_id"] for item in coverage}
     if not expected or covered != set(expected):
-        errors.append("编写质量检查没有完整覆盖全部非空正文行段")
+        errors.append(tr('Material-quality check does not cover all nonempty text ranges'))
     return coverage, findings, errors
 
 
@@ -201,24 +208,24 @@ def save_report(directory, report):
                         for status in ["not_run", "running", "passed", "failed", "incomplete"]}
     report["finding_count"] = sum(len(item["findings"]) for item in report["materials"])
     save_json(directory / "result.json", report)
-    lines = [f"# {report['kind']} 编写质量检查", "", f"状态：{report['status']}",
-             f"输入：{report['snapshot_id']}", "", report["summary"], "",
-             f"材料状态：{json.dumps(report['counts'], ensure_ascii=False)}；已保留发现：{report['finding_count']}"]
+    lines = [tr('# {v0} material-quality check', v0=(report['kind'])), "", tr('Status: {v0}', v0=(report['status'])),
+             tr('Input: {v0}', v0=(report['snapshot_id'])), "", report["summary"], "",
+             tr('Material status: {v0}; retained findings: {v1}', v0=(json.dumps(report['counts'], ensure_ascii=False)), v1=(report['finding_count']))]
     for item in report["materials"]:
-        lines.extend(["", f"## {item['path']} · {item['status']}", "", item.get("summary", "尚未运行")])
+        lines.extend(["", f"## {item['path']} · {item['status']}", "", item.get("summary", tr('not run yet'))])
         for error in item.get("errors", []):
-            lines.extend(["", "未完成：" + error])
+            lines.extend(["", tr('Incomplete: ') + error])
         for finding in item["findings"]:
-            lines.extend(["", f"问题（材料 L{finding['material_line']}，Principles L{finding['principle_line']}）：",
-                          finding["reason"], "", "材料原文：" + finding["material_quote"],
-                          "Principles 原文：" + finding["principle_quote"]])
+            lines.extend(["", tr('Finding (material L{v0}, Principles L{v1}):', v0=(finding['material_line']), v1=(finding['principle_line'])),
+                          finding["reason"], "", tr('Original material: ') + finding["material_quote"],
+                          tr('Original Principles text: ') + finding["principle_quote"]])
         by_id = {record["unit_id"]: record for record in item["coverage"]}
         for unit in item["coverage_plan"]:
             record = by_id.get(unit["unit_id"])
-            lines.extend(["", f"行段 {unit['start_line']}–{unit['end_line']}：" + ("已核对" if record else "未确认覆盖")])
+            lines.extend(["", tr('Line range {v0}–{v1}:', v0=(unit['start_line']), v1=(unit['end_line'])) + (tr('checked') if record else tr('coverage unconfirmed'))])
             if record:
-                lines.extend([record["reason"], f"材料 L{record['material_line']}：{record['material_quote']}",
-                              f"Principles L{record['principle_line']}：{record['principle_quote']}"])
+                lines.extend([record["reason"], tr('Material L{v0}: {v1}', v0=(record['material_line']), v1=(record['material_quote'])),
+                              f"Principles L{record['principle_line']}: {record['principle_quote']}"])
     (directory / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -242,7 +249,7 @@ def check_materials(repo, config_path, state, kind):
     engine = Path(__file__).resolve().parents[1]
     directory = state / "material-checks" / kind / ("run-" + str(time.time_ns()))
     report = {"kind": kind, "status": "incomplete", "snapshot_id": "unresolved", "interrupted": False,
-              "materials": [], "summary": "编写质量检查尚未完成"}
+              "materials": [], "summary": tr('Material-quality checking has not completed')}
     active, started = None, None
     try:
         documents = read_inputs(repo, kind)
@@ -250,12 +257,12 @@ def check_materials(repo, config_path, state, kind):
         config_bytes = config_path.read_bytes() if config_path.exists() else None
         config = json.loads(config_bytes) if config_bytes is not None else {}
         if not isinstance(config, dict):
-            raise MaterialIncomplete("模型配置必须是 JSON 对象")
+            raise MaterialIncomplete(tr('Model configuration must be a JSON object'))
         principles = engine_bytes[PRINCIPLES].decode("utf-8")
         prompt = engine_bytes["prompts/material-check.md"].decode("utf-8")
         engine_model = engine_bytes["README.md"].decode("utf-8")
         if not principles.strip() or not prompt.strip() or not engine_model.strip():
-            raise MaterialIncomplete("审核模型、Principles 或编写质量提示词为空")
+            raise MaterialIncomplete(tr('Review model, Principles, or material-quality prompt is empty'))
         frozen = {"repository": str(repo), "kind": kind, "documents": documents,
                   "engine_model": engine_model, "principles": principles,
                   "prompt": prompt, "engine_digest": engine_digest(engine_bytes),
@@ -270,13 +277,13 @@ def check_materials(repo, config_path, state, kind):
                                         "coverage": [], "findings": [], "errors": []})
         save_json(directory / "input.json", frozen)
         save_report(directory, report)
-        print(f"{kind} 编写质量：{len(documents)} 份完整材料；依据同一份 Principles", flush=True)
+        print(tr('{v0} writing quality: {v1} complete materials; checked against the same Principles', v0=(kind), v1=(len(documents))), flush=True)
         model = CodexModel(config.get("codex_bin", "codex"), config.get("model"), config.get("timeout", 300))
         for index, active in enumerate(report["materials"], 1):
             started = time.monotonic()
             active["status"] = "running"
             save_report(directory, report)
-            print(f"  [{index}/{len(documents)}] {active['path']} [运行中]", flush=True)
+            print(tr('  [{v0}/{v1}] {v2} [running]', v0=(index), v1=(len(documents)), v2=(active['path'])), flush=True)
             material = {**active, "text": documents[active["path"]]}
             packet = {"snapshot_id": snapshot, "material_id": active["material_id"], "kind": kind,
                       "engine_model": frozen["engine_model"], "principles": numbered(principles),
@@ -291,30 +298,30 @@ def check_materials(repo, config_path, state, kind):
                           status="incomplete" if errors else "failed" if findings else "passed",
                           elapsed_seconds=round(time.monotonic() - started, 3))
             save_report(directory, report)
-            print(f"    {active['status']} · {len(findings)} 个已保留发现 ({active['elapsed_seconds']:.1f}s)", flush=True)
+            print(tr('    {v0} · retained findings: {v1} ({v2:.1f}s)', v0=(active['status']), v1=(len(findings)), v2=(active['elapsed_seconds'])), flush=True)
             if errors:
                 raise MaterialIncomplete("；".join(errors))
             active, started = None, None
         if read_inputs(repo, kind) != documents or read_engine(engine) != engine_bytes:
-            raise MaterialIncomplete("检查期间受检材料或源引擎发生变化")
+            raise MaterialIncomplete(tr('Materials or source engine changed during the check'))
         if (config_path.read_bytes() if config_path.exists() else None) != config_bytes:
-            raise MaterialIncomplete("检查期间模型配置发生变化")
+            raise MaterialIncomplete(tr('Model configuration changed during the check'))
         report["status"] = "failed" if any(item["findings"] for item in report["materials"]) else "passed"
-        report["summary"] = ("全部完整材料的编写质量检查通过。" if report["status"] == "passed"
-                             else "完整材料存在已引用 Principles 及材料原文的编写质量问题。")
+        report["summary"] = (tr('All complete materials passed the writing-quality check.') if report["status"] == "passed"
+                             else tr('Complete materials have writing-quality findings supported by original Principles and material quotations.'))
     except (MaterialIncomplete, ModelFailure, InstallError, OSError, UnicodeError, ValueError,
             TypeError, KeyError, KeyboardInterrupt) as error:
         report["interrupted"] = isinstance(error, KeyboardInterrupt)
-        message = "用户中断编写质量检查" if isinstance(error, KeyboardInterrupt) else str(error)
+        message = tr('Material-quality checking was interrupted by the user') if isinstance(error, KeyboardInterrupt) else str(error)
         report["status"], report["summary"] = "incomplete", message
         if active is not None:
             active["status"] = "incomplete"
             if message not in active["errors"]:
                 active["errors"].append(message)
             active["elapsed_seconds"] = round(time.monotonic() - started, 3)
-        print("编写质量检查未完成：" + message, flush=True)
+        print(tr('Material-quality check did not complete: ') + message, flush=True)
     save_report(directory, report)
     save_json(state / f"latest-quality-{kind}.json",
               {"run": str(directory), "snapshot_id": report["snapshot_id"], "status": report["status"], "kind": kind})
-    print(f"{kind} 编写质量：{report['status']}；已保留发现 {report['finding_count']}；报告 {directory / 'report.md'}", flush=True)
+    print(tr('{v0} writing quality: {v1}; retained findings {v2}; report {v3}', v0=(kind), v1=(report['status']), v2=(report['finding_count']), v3=(directory / 'report.md')), flush=True)
     return {"passed": 0, "failed": 1, "incomplete": 2}[report["status"]]

@@ -1,8 +1,15 @@
 """按工作树材料编排质量检查与固定案例回归，保存各阶段的真实结果。"""
 
+# 动态安装会按文件路径加载本模块；只补同版 runner 搜索路径，不依赖宿主技术栈。
+import sys
+from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from i18n import tr
+
+
 import hashlib
 import json
-from pathlib import Path
 import subprocess
 import time
 
@@ -34,7 +41,7 @@ def target_identity(repo):
     for argument in ("--show-toplevel", "--git-common-dir"):
         result = subprocess.run(["git", "-C", str(repo), "rev-parse", argument], capture_output=True, text=True)
         if result.returncode:
-            raise MaintenanceIncomplete("Git 无法确认维护目标：" + result.stderr.strip())
+            raise MaintenanceIncomplete(tr('Git could not identify the maintenance target: ') + result.stderr.strip())
         path = Path(result.stdout.strip())
         values.append(str((path if path.is_absolute() else Path(repo) / path).resolve()))
     return {"worktree_root": values[0], "git_common_dir": values[1]}
@@ -52,7 +59,7 @@ def freeze_inputs(repo, config_path):
     config_bytes = config_path.read_bytes() if config_path.exists() else None
     config = json.loads(config_bytes) if config_bytes is not None else {}
     if not isinstance(config, dict):
-        raise MaintenanceIncomplete("模型配置必须是 JSON 对象")
+        raise MaintenanceIncomplete(tr('Model configuration must be a JSON object'))
     return {"target_repository": target_identity(repo), "documents": documents,
             "material_sha256": {name: hashlib.sha256(raw).hexdigest() for name, raw in materials.items()},
             "engine_digest": engine_digest(engine),
@@ -70,7 +77,7 @@ def validate_child_input(frozen, stage, child, snapshot):
     """
     actual = hashlib.sha256(json.dumps(child, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     if actual != snapshot:
-        raise MaintenanceIncomplete("子检查实际输入摘要与其结果标识不一致")
+        raise MaintenanceIncomplete(tr('Child-check input digest differs from its result identifier'))
     common = {"repository": frozen["target_repository"]["worktree_root"],
               "config_sha256": frozen["config_sha256"], "model_config": frozen["model_config"]}
     if stage in {"rules-quality", "fixtures-quality"}:
@@ -93,23 +100,23 @@ def validate_child_input(frozen, stage, child, snapshot):
                     "prompt_sha256": engine["prompts/rules-check.md"]}
     changed = [key for key, value in expected.items() if child.get(key) != value]
     if changed:
-        raise MaintenanceIncomplete("子检查实际输入与本次共同输入不一致：" + "、".join(changed))
+        raise MaintenanceIncomplete(tr('Child-check inputs differ from the shared maintenance inputs: ') + "、".join(changed))
 
 
 def render(directory, report):
     """render() 汇总材料维护和精确子记录，不把组合结果称为代码审核结论。"""
-    labels = {"passed": "通过", "failed": "未通过", "incomplete": "未完成", "not_run": "未运行", "running": "运行中"}
-    lines = ["# Engine 材料维护：" + labels[report["status"]], "", report["summary"], "",
-             "目标工作树：" + report["target_repository"]["worktree_root"],
-             "维护输入：`" + report["snapshot_id"] + "`", ""]
+    labels = {"passed": tr('passed'), "failed": tr('failed'), "incomplete": tr('incomplete'), "not_run": tr('not run'), "running": tr('running')}
+    lines = [tr('# Engine material maintenance: ') + labels[report["status"]], "", report["summary"], "",
+             tr('Target worktree: ') + report["target_repository"]["worktree_root"],
+             tr('Maintenance input: `') + report["snapshot_id"] + "`", ""]
     for stage in report["stages"]:
         lines.append("- " + stage["stage"] + "：" + labels[stage["status"]])
         if stage.get("run"):
-            lines.append("  完整子记录：" + stage["run"])
+            lines.append(tr('  Full child records: ') + stage["run"])
         if stage.get("error"):
-            lines.append("  未完成原因：" + stage["error"])
-    lines += ["", "本次只组织工作树材料检查，不形成 HEAD 或暂存区的代码审核通过，也不改写规则、fixtures 或固定预期。",
-              "维护记录：" + str(directory), ""]
+            lines.append(tr('  Incomplete reason: ') + stage["error"])
+    lines += ["", tr('This run only checks working-tree materials; it does not approve HEAD or the index and does not rewrite rules, fixtures, or fixed expectations.'),
+              tr('Maintenance records: ') + str(directory), ""]
     (directory / "report.md").write_text("\n".join(lines))
     print("\n".join(lines), flush=True)
 
@@ -125,13 +132,13 @@ def maintain(repo, config_path, state):
     directory.mkdir(parents=True, exist_ok=False)
     report = {"status": "incomplete", "snapshot_id": "unresolved", "target_repository": target_identity(repo),
               "stages": [{"stage": name, "status": "not_run"} for name in STAGES], "current_stage": "",
-              "summary": "材料维护尚未完成。", "input_errors": [], "interrupted": False}
+              "summary": tr('Material maintenance has not completed.'), "input_errors": [], "interrupted": False}
     frozen = None
     try:
         frozen = freeze_inputs(repo, config_path)
         report["snapshot_id"] = hashlib.sha256(json.dumps(frozen, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     except (MaintenanceIncomplete, CheckIncomplete, InstallError, OSError, UnicodeError, ValueError, TypeError) as error:
-        report["input_errors"].append("共同输入未能冻结：" + str(error))
+        report["input_errors"].append(tr('Shared inputs could not be frozen: ') + str(error))
     save(directory / "input.json", {"snapshot_id": report["snapshot_id"], "target_repository": report["target_repository"],
                                     "frozen": frozen, "input_errors": list(report["input_errors"])})
     save(directory / "result.json", report)
@@ -142,25 +149,25 @@ def maintain(repo, config_path, state):
     for stage, (call, pointer_name) in zip(report["stages"], calls):
         stage["status"] = "running"
         save(directory / "result.json", report)
-        print("\nEngine 维护阶段：" + stage["stage"], flush=True)
+        print(tr('\nEngine maintenance stage: ') + stage["stage"], flush=True)
         try:
             code = call()
             if type(code) is not int or code not in EXIT_STATUS:
-                raise MaintenanceIncomplete("子检查没有返回约定的退出码")
+                raise MaintenanceIncomplete(tr('Child check did not return an agreed exit code'))
             pointer = json.loads((checks / pointer_name).read_text())
             child_run = Path(pointer["run"]).resolve()
             if not child_run.is_relative_to(checks.resolve()):
-                raise MaintenanceIncomplete("子记录不属于本次维护")
+                raise MaintenanceIncomplete(tr('Child record does not belong to this maintenance run'))
             result = json.loads((child_run / "result.json").read_text())
             if (pointer["status"] != EXIT_STATUS[code] or result["status"] != pointer["status"]
                     or result["snapshot_id"] != pointer["snapshot_id"]):
-                raise MaintenanceIncomplete("子检查退出码、指针与结果不一致")
+                raise MaintenanceIncomplete(tr('Child-check exit code, pointer, and result disagree'))
             stage.update(status=pointer["status"], child_status=pointer["status"], run=str(child_run),
                          snapshot_id=pointer["snapshot_id"], exit_code=code)
             if result.get("interrupted") is True:
                 report["interrupted"] = True
                 stage["interrupted"] = True
-                stage["error"] = "子检查收到用户中断，后续阶段未运行"
+                stage["error"] = tr('A child check was interrupted; later stages were not run')
                 save(directory / "result.json", report)
                 break
             if frozen is not None:
@@ -168,7 +175,7 @@ def maintain(repo, config_path, state):
                 validate_child_input(frozen, stage["stage"], child_input, pointer["snapshot_id"])
         except KeyboardInterrupt:
             report["interrupted"] = True
-            stage.update(status="incomplete", error="用户中断材料维护")
+            stage.update(status="incomplete", error=tr('Material maintenance was interrupted by the user'))
             save(directory / "result.json", report)
             break
         except (MaintenanceIncomplete, CheckIncomplete, InstallError, OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
@@ -176,16 +183,16 @@ def maintain(repo, config_path, state):
         save(directory / "result.json", report)
     try:
         if frozen is None or freeze_inputs(repo, config_path) != frozen:
-            raise MaintenanceIncomplete("组合期间目标、正文路径集合、材料、源引擎或配置发生变化，不能复用为同次材料维护通过")
+            raise MaintenanceIncomplete(tr('Target, material paths, contents, source engine, or configuration changed during maintenance; the results cannot be combined as one passing run'))
     except (MaintenanceIncomplete, CheckIncomplete, InstallError, OSError, UnicodeError, ValueError, TypeError) as error:
         report["input_errors"].append(str(error))
     statuses = {stage["status"] for stage in report["stages"]}
     report["status"] = ("incomplete" if report["input_errors"] or statuses - {"passed", "failed"}
                         else "failed" if "failed" in statuses else "passed")
     report["current_stage"] = next((stage["stage"] for stage in report["stages"] if stage["status"] != "passed"), "")
-    report["summary"] = {"passed": "两项编写质量检查与固定案例回归均通过，共同输入回读一致。",
-                         "failed": "材料检查存在未通过项；各阶段结果完整保留，正式资料未修改。",
-                         "incomplete": "材料维护未完成；已完成阶段与未运行项分别保留，不能据此宣称整体通过。"}[report["status"]]
+    report["summary"] = {"passed": tr('Both material-quality checks and fixed-case regression passed; shared inputs match on read-back.'),
+                         "failed": tr('Some material checks failed; all stage results were retained and formal materials were not changed.'),
+                         "incomplete": tr('Material maintenance is incomplete; completed and unrun stages were retained separately; the overall run has not passed.')}[report["status"]]
     if report["input_errors"]:
         report["summary"] += " " + "；".join(report["input_errors"])
     save(directory / "result.json", report)
@@ -202,26 +209,26 @@ def respond_maintenance(repo, state, text, stage=None):
     记录保留目标、维护及子检查标识和原始结果摘要，避免把回应套给其他工作树或新检查。
     """
     if not isinstance(text, str) or not text.strip():
-        raise MaintenanceIncomplete("维护回应不能为空")
+        raise MaintenanceIncomplete(tr('Maintenance response cannot be empty'))
     pointer = json.loads((Path(state) / "latest-maintenance.json").read_text())
     identity = target_identity(Path(repo).resolve())
     if pointer["target_repository"] != identity:
-        raise MaintenanceIncomplete("最新维护属于另一个工作树，未保存跨目标回应")
+        raise MaintenanceIncomplete(tr('Latest maintenance belongs to another worktree; no cross-target response was saved'))
     directory = Path(pointer["run"]).resolve()
     if not directory.is_relative_to((Path(state) / "maintenance").resolve()):
-        raise MaintenanceIncomplete("最新维护指针不属于本仓库维护记录")
+        raise MaintenanceIncomplete(tr('Latest maintenance pointer is outside this repository maintenance records'))
     report = json.loads((directory / "result.json").read_text())
     if (report["target_repository"] != identity or report["snapshot_id"] != pointer["snapshot_id"]
             or report["status"] != pointer["status"]):
-        raise MaintenanceIncomplete("最新维护指针和目标结果不一致")
+        raise MaintenanceIncomplete(tr('Latest maintenance pointer and target result disagree'))
     selected = stage or report["current_stage"]
     current = next((item for item in report["stages"] if item["stage"] == selected), None)
     if current is None or current["status"] not in {"failed", "incomplete"}:
-        raise MaintenanceIncomplete("所选维护阶段没有可对应的失败或未完成问题；共同输入变化须重新运行维护")
+        raise MaintenanceIncomplete(tr('Selected stage has no failed or incomplete issue to respond to; rerun maintenance after shared-input changes'))
     path = directory / "responses.json"
     responses = json.loads(path.read_text()) if path.exists() else []
     if not isinstance(responses, list):
-        raise MaintenanceIncomplete("维护回应记录不是列表")
+        raise MaintenanceIncomplete(tr('Maintenance response record is not a list'))
     child_reference = None
     if current.get("run"):
         child_path = Path(current["run"]) / "result.json"
@@ -229,12 +236,12 @@ def respond_maintenance(repo, state, text, stage=None):
         child_result = json.loads(child_bytes)
         if (child_result["snapshot_id"] != current["snapshot_id"]
                 or child_result["status"] != current.get("child_status", current["status"])):
-            raise MaintenanceIncomplete("维护阶段标识与其原始结果不一致，未保存回应")
+            raise MaintenanceIncomplete(tr('Maintenance stage identifier differs from its original result; response was not saved'))
         child_reference = {"path": str(child_path), "snapshot_id": child_result["snapshot_id"],
                            "status": child_result["status"], "sha256": hashlib.sha256(child_bytes).hexdigest()}
     responses.append({"target_repository": identity, "run": str(directory), "snapshot_id": report["snapshot_id"],
                       "stage": selected, "stage_record": current, "stage_result_ref": child_reference,
                       "human_text": text, "time": time.time()})
     save(path, responses)
-    print("已原样保存维护回应：" + selected + "；未更改检查结果、规则或固定预期。\n维护记录：" + str(directory))
+    print(tr('Maintenance response saved verbatim: ') + selected + tr('; check results, rules, and fixed expectations are unchanged.\nMaintenance records: ') + str(directory))
     return 0
