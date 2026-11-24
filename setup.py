@@ -18,6 +18,11 @@ import sys
 import tempfile
 
 
+# 普通宿主用户只维护自己的项目；首次安装从原厂 HTTPS 获取版本，避免要求他们另养源码工作树。
+# 维护者及需要本地同步的用户仍可用 --source 明确选入自己的 Git 仓库，既有安装继续沿用其已选来源。
+DEFAULT_SOURCE = "https://github.com/yzhang37/code-clair.git"
+
+
 class SetupError(Exception):
     """SetupError 表示交付条件不足，不代表目标项目代码有问题。"""
 
@@ -100,13 +105,29 @@ def snapshot(cache: Path, commit: str) -> dict[str, tuple[bytes, int]]:
 
 
 def source_cache(state: Path, source: str) -> Path:
-    """source_cache() 在 Git 控制目录维护下载副本；获取失败不会替换宿主正在使用的文件。"""
-    cache = state / "source"
-    safe_parents(cache / "HEAD")
+    """source_cache() 按来源隔离下载副本，显式换源失败时仍保留原来源和可运行部署。
+
+    旧版单一 source 缓存只在原始 origin 与所选来源一致时复用；不修改它的 remote 来冒充新来源。
+    比较原始配置而非 Git 重写后的传输地址，使用户的 HTTPS 代理或 insteadOf 设置不改变登记来源。
+    """
+    legacy = state / "source"
+    safe_parents(legacy / "HEAD")
+    if legacy.exists():
+        if git(legacy, "rev-parse", "--is-bare-repository").strip() != b"true":
+            raise SetupError("旧原厂缓存不是 bare Git 仓库：" + str(legacy))
+        legacy_source = git(legacy, "config", "--get", "remote.origin.url").decode().strip()
+    else:
+        legacy_source = None
+    if legacy_source == source:
+        cache = legacy
+    else:
+        cache = state / "sources" / hashlib.sha256(source.encode("utf-8")).hexdigest()
+        safe_parents(cache / "HEAD")
+        cache.parent.mkdir(parents=True, exist_ok=True)
     if cache.exists():
         if git(cache, "rev-parse", "--is-bare-repository").strip() != b"true":
             raise SetupError("原厂缓存不是 bare Git 仓库：" + str(cache))
-        if git(cache, "remote", "get-url", "origin").decode().strip() != source:
+        if git(cache, "config", "--get", "remote.origin.url").decode().strip() != source:
             raise SetupError("原厂来源与已有缓存不同，未切换安装来源。")
         git(cache, "fetch", "--quiet", "--prune", "origin")
     else:
@@ -142,7 +163,8 @@ def legacy_files(sidecar: Path) -> dict[str, tuple[bytes, int]]:
     Python 缓存和 Finder 元数据不是原厂文件，不删除也不当作可覆盖文件。
     """
     files = {}
-    for base in (sidecar / "engine", sidecar / "initial", sidecar / "README.md", sidecar / "setup.py"):
+    for base in (sidecar / "engine", sidecar / "initial", sidecar / "README.md", sidecar / "setup.py",
+                 sidecar / "Makefile"):
         if not os.path.lexists(base):
             continue
         safe_parents(base / "placeholder" if base.is_dir() else base)
@@ -161,13 +183,23 @@ def adopt_legacy(cache: Path, commit: str, existing: dict) -> tuple[dict, bytes 
     """adopt_legacy() 仅接管与原厂某个历史版本逐文件一致的旧程序，保留可证明的所有权边界。
 
     首次迁移最多核对最近 200 个祖先；无匹配便失败，不用 hook 标记授权覆盖任意本地改动。
+    已生成的 Makefile 还须与同一历史版本的生成器逐字节及权限匹配，不能仅凭管理标记认领。
     """
     if not existing:
         return {}, None
     ancestors = git(cache, "rev-list", "--max-count=200", commit).decode().splitlines()
     for ancestor in ancestors:
         previous = snapshot(cache, ancestor)
-        if all(previous.get(name) == value for name, value in existing.items()):
+        if all(previous.get(name) == value for name, value in existing.items() if name != "Makefile"):
+            if "Makefile" in existing:
+                if "engine/runner/make_integration.py" not in previous:
+                    continue
+                with tempfile.TemporaryDirectory(prefix=".legacy-", dir=cache.parent) as temporary:
+                    root = Path(temporary)
+                    materialize(root, previous)
+                    make = load_module("clarity_legacy_make", root / "engine/runner/make_integration.py")
+                    if existing["Makefile"] != (make.rendered_sidecar_makefile(), 0o644):
+                        continue
             listing = git(cache, "ls-tree", ancestor, "--", "Makefile")
             legacy_makefile = git(cache, "show", ancestor + ":Makefile") if listing else None
             return existing, legacy_makefile
@@ -352,13 +384,12 @@ def install(args: argparse.Namespace) -> dict:
         manifest = json.loads(previous_record[0]) if previous_record else None
         if manifest and (manifest.get("version") != 1 or manifest.get("worktree_root") != str(repo)):
             raise SetupError("安装记录版本不支持或已绑定另一工作树，未替换共享安装。")
-        if args.command == "update" and manifest is None:
-            raise SetupError("尚无独立安装记录；已有旧 sidecar 请先执行 install 以核对迁移。")
-        source = args.source or (manifest["source"] if manifest else str(Path(__file__).resolve().parent))
+        legacy = legacy_files(sidecar) if manifest is None else None
+        if args.command == "update" and manifest is None and not legacy:
+            raise SetupError("尚未安装 sidecar；请先执行 install。")
+        source = args.source or (manifest["source"] if manifest else DEFAULT_SOURCE)
         if Path(source).expanduser().exists():
             source = str(Path(source).expanduser().resolve())
-        if manifest and source != manifest["source"]:
-            raise SetupError("更新不能隐式更换原厂来源。")
         ref = args.ref or (manifest["ref"] if manifest else "HEAD")
         cache = source_cache(state, source)
         commit = git(cache, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").decode().strip()
@@ -371,7 +402,7 @@ def install(args: argparse.Namespace) -> dict:
             owned = installed_files(sidecar, manifest)
             legacy_makefile = None
         else:
-            owned, legacy_makefile = adopt_legacy(cache, commit, legacy_files(sidecar))
+            owned, legacy_makefile = adopt_legacy(cache, commit, legacy)
         with tempfile.TemporaryDirectory(prefix=".prepare-", dir=state) as temporary:
             staged = Path(temporary)
             materialize(staged, files)
@@ -413,6 +444,7 @@ def install(args: argparse.Namespace) -> dict:
                     hook_records[name] = fingerprint(value)
             record = {"version": 1, "worktree_root": str(repo), "source": source, "ref": ref,
                       "commit": commit, "previous_commit": manifest["commit"] if manifest else None,
+                      "previous_source": manifest["source"] if manifest else None,
                       "installed_at": datetime.now(timezone.utc).isoformat(), "host_makefile": make_name,
                       "files": {name: fingerprint(value) for name, value in sorted(files.items())},
                       "hooks": hook_records}
@@ -428,7 +460,7 @@ def main(argv: list[str] | None = None) -> int:
     for command in ("install", "update"):
         child = commands.add_parser(command)
         child.add_argument("--repo", default=".", help="目标宿主 Git 仓库，默认当前目录。")
-        child.add_argument("--source", help="原厂 Git 路径或地址；更新默认沿用已登记来源。")
+        child.add_argument("--source", help="原厂 Git 地址或本地路径；首次默认 GitHub HTTPS，后续沿用已选来源；显式提供可换源。")
         child.add_argument("--ref", help="原厂 Git 分支、tag 或 commit；默认沿用已登记选择，首次为 HEAD。")
     args = parser.parse_args(argv)
     try:
