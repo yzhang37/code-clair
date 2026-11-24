@@ -25,7 +25,7 @@ code-clair/                  host-project/
                                 └── current/
 ```
 
-宿主中的 `.clarity/` 由宿主 Git 跟踪，不是嵌套 Git 仓库或 submodule。原厂下载副本、版本记录和审核运行状态位于 Git common dir 的 `clarity/` 中，普通仓库通常是 `.git/clarity/`。
+宿主中的 `.clarity/` 可以由宿主 Git 跟踪，不是嵌套 Git 仓库或 submodule；安装器不会自动暂存或提交宿主文件。原厂下载副本、版本记录和审核运行状态位于 Git common dir 的 `clarity/` 中，普通仓库通常是 `.git/clarity/`。
 
 ## 安装与更新
 
