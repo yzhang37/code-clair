@@ -582,7 +582,7 @@ def install(args: argparse.Namespace) -> dict:
             names = {entry.name for entry in repo.iterdir()}
             effective = next((name for name in ("GNUmakefile", "makefile", "Makefile") if name in names), "Makefile")
             original_make = read_file(repo / effective)
-            managed_make = original_make is not None and make.BEGIN_MARKER in original_make[0]
+            managed_make = args.command == "update" and original_make is not None and make.BEGIN_MARKER in original_make[0]
             if promote or make_name or managed_make or legacy_makefile is not None:
                 if make_name and effective != make_name:
                     raise SetupError("宿主生效的 Makefile 已改变，须先核对原入口。")

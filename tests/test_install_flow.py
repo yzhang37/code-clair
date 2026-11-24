@@ -91,6 +91,16 @@ class InstallFlowTests(unittest.TestCase):
         self.assertEqual(self.git(self.host, "check-ignore", ".clarity/setup.py"), ".clarity/setup.py")
         self.assertFalse(self.read_manifest(self.host)["track_git"])
 
+    def test_first_install_default_no_does_not_rearrange_a_preexisting_make_loader(self):
+        self.prepare_business_changes()
+        path = self.host / "Makefile"
+        original = b"# Clarity sidecar begin\ninclude .clarity/Makefile\n# Clarity sidecar end\n" + path.read_bytes()
+        path.write_bytes(original)
+        index = (self.host / ".git/index").read_bytes()
+        self.launch(self.host, "n\n")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual((self.host / ".git/index").read_bytes(), index)
+
     def test_yes_stages_only_sidecar_without_business_or_local_cache(self):
         self.prepare_business_changes()
         self.launch(self.host, "y\n")
