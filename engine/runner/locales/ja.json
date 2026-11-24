@@ -234,7 +234,6 @@
     "No regular cases directory": "通常の cases ディレクトリがありません",
     "No regular fixtures directory: ": "通常の fixtures ディレクトリがありません：",
     "No sidecar is installed; run install first.": "sidecar がインストールされていません。先に install を実行してください。",
-    "No structurally valid Clarity installation exists here; use the first-install entry.": "ここには必要な構造を満たす Clarity インストールがありません。初回インストール用の入口を使用してください。",
     "No valid target-repository basis files were found; create project .clarity materials or select them with --basis.": "対象リポジトリに有効な判定基準ファイルがありません。プロジェクトの .clarity 資料を作成するか、--basis で選択してください。",
     "Non-UTF-8 files need an explicitly supported review method: ": "UTF-8 以外のファイルには、明示的にサポートされたレビュー方法が必要です：",
     "Not a manageable regular file: ": "管理可能な通常ファイルではありません：",
@@ -246,7 +245,6 @@
     "Owned commit hook removed; rules, cases, and review records were retained.": "管理対象のコミット hook を削除しました。ルール、case、レビュー記録は保持しました。",
     "Owned pre-commit hook removed: ": "管理対象の pre-commit hook を削除しました：",
     "Passed: the complete current snapshot was reviewed": "合格：現在の全スナップショットをレビューしました",
-    "Project current was preserved; initial is copied only when current is missing on install. Review activation is unchanged.": "プロジェクトの current は保持しました。install 時に current が存在しない場合だけ initial をコピーします。レビューの有効化状態は変更しません。",
     "Rationale check belongs to different inputs": "理由の確認が別の入力に対応しています",
     "Rationale check has an invalid case quotation": "理由の確認で case の引用が無効です",
     "Rationale check has an invalid incomplete-reason type": "理由の確認の未完了理由の型が無効です",
@@ -379,6 +377,10 @@
     "Local review materials changed during review; rerun with the complete new input.": "レビュー中にローカル資料が変更されました。新しい入力全体で再実行してください。",
     "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "ローカルのレビュールールは別の作業ツリーに属しているため、採用済みの版をここでは再利用できません。",
     "Saved local review rules are missing or invalid.": "保存済みのローカルレビュールールが見つからないか、無効です。",
-    "Start a code review with: make review": "コードレビューを開始：make review"
+    "Start a code review with: make review": "コードレビューを開始：make review",
+    "Existing current was preserved. A new sidecar uses release current; a missing current in an existing sidecar is restored from initial.": "既存の current は保持しました。新しい sidecar ではリリース版の current を使用し、既存の sidecar に current がない場合は initial から復元します。",
+    "No .clarity directory exists here; use the first-install entry.": "ここには .clarity ディレクトリがありません。初回インストール用の入口を使用してください。",
+    "Review materials were recreated; run make review to adopt the current local materials before committing.": "レビュー資料を再作成しました。コミットする前に make review を実行して、現在のローカル資料を採用してください。",
+    "Selected release has no initial project rules in current/rules.md.": "選択したリリースの current/rules.md には初期プロジェクトルールがありません。"
   }
 }

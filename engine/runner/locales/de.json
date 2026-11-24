@@ -234,7 +234,6 @@
     "No regular cases directory": "Kein reguläres Fallverzeichnis",
     "No regular fixtures directory: ": "Kein reguläres Fixture-Verzeichnis: ",
     "No sidecar is installed; run install first.": "Kein Sidecar installiert; zuerst install ausführen.",
-    "No structurally valid Clarity installation exists here; use the first-install entry.": "Hier ist keine strukturell gültige Clarity-Installation vorhanden; verwenden Sie den Einstieg für die Erstinstallation.",
     "No valid target-repository basis files were found; create project .clarity materials or select them with --basis.": "Keine gültigen Grundlagendateien des Ziel-Repositorys gefunden; erstellen Sie .clarity-Materialien für das Projekt oder wählen Sie sie mit --basis aus.",
     "Non-UTF-8 files need an explicitly supported review method: ": "Nicht-UTF-8-Dateien benötigen eine ausdrücklich unterstützte Prüfmethode: ",
     "Not a manageable regular file: ": "Keine verwaltbare reguläre Datei: ",
@@ -246,7 +245,6 @@
     "Owned commit hook removed; rules, cases, and review records were retained.": "Programmeigener Commit-Hook entfernt; Regeln, Fälle und Prüfprotokolle bleiben erhalten.",
     "Owned pre-commit hook removed: ": "Programmeigener pre-commit-Hook entfernt: ",
     "Passed: the complete current snapshot was reviewed": "Bestanden: Der vollständige aktuelle Snapshot wurde geprüft",
-    "Project current was preserved; initial is copied only when current is missing on install. Review activation is unchanged.": "current des Projekts wurde beibehalten; initial wird nur kopiert, wenn current bei der Installation fehlt. Die Aktivierung der Prüfung bleibt unverändert.",
     "Rationale check belongs to different inputs": "Begründungsprüfung gehört zu anderen Eingaben",
     "Rationale check has an invalid case quotation": "Begründungsprüfung enthält ein ungültiges Fallzitat",
     "Rationale check has an invalid incomplete-reason type": "Begründungsprüfung hat einen ungültigen Typ für den Grund des unvollständigen Status",
@@ -379,6 +377,10 @@
     "Local review materials changed during review; rerun with the complete new input.": "Die lokalen Prüfmaterialien wurden während der Prüfung geändert; starten Sie mit den vollständigen neuen Eingaben erneut.",
     "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "Die lokalen Prüfregeln gehören zu einem anderen Arbeitsverzeichnis; die übernommene Version kann hier nicht wiederverwendet werden.",
     "Saved local review rules are missing or invalid.": "Die gespeicherten lokalen Prüfregeln fehlen oder sind ungültig.",
-    "Start a code review with: make review": "Codeprüfung starten: make review"
+    "Start a code review with: make review": "Codeprüfung starten: make review",
+    "Existing current was preserved. A new sidecar uses release current; a missing current in an existing sidecar is restored from initial.": "Das vorhandene current wurde beibehalten. Ein neuer Sidecar verwendet current aus der veröffentlichten Version; fehlt current in einem vorhandenen Sidecar, wird es aus initial wiederhergestellt.",
+    "No .clarity directory exists here; use the first-install entry.": "Hier ist kein .clarity-Verzeichnis vorhanden; verwenden Sie den Einstieg für die Erstinstallation.",
+    "Review materials were recreated; run make review to adopt the current local materials before committing.": "Die Prüfmaterialien wurden neu erstellt; führen Sie vor dem Commit make review aus, um die aktuellen lokalen Materialien zu übernehmen.",
+    "Selected release has no initial project rules in current/rules.md.": "Die ausgewählte Version enthält keine anfänglichen Projektregeln in current/rules.md."
   }
 }

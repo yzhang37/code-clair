@@ -234,7 +234,6 @@
     "No regular cases directory": "Aucun répertoire ordinaire de cas",
     "No regular fixtures directory: ": "Aucun répertoire ordinaire de fixtures : ",
     "No sidecar is installed; run install first.": "Aucun sidecar n’est installé ; exécutez d’abord install.",
-    "No structurally valid Clarity installation exists here; use the first-install entry.": "Aucune installation Clarity de structure valide n’existe ici ; utilisez le point d’accès de première installation.",
     "No valid target-repository basis files were found; create project .clarity materials or select them with --basis.": "Aucun fichier de base valide n’a été trouvé dans le dépôt cible ; créez les documents .clarity du projet ou sélectionnez-les avec --basis.",
     "Non-UTF-8 files need an explicitly supported review method: ": "Les fichiers non UTF-8 nécessitent une méthode de revue explicitement prise en charge : ",
     "Not a manageable regular file: ": "Ce n’est pas un fichier ordinaire pouvant être géré : ",
@@ -246,7 +245,6 @@
     "Owned commit hook removed; rules, cases, and review records were retained.": "Le hook de commit géré a été supprimé ; les règles, les cas et les enregistrements de revue ont été conservés.",
     "Owned pre-commit hook removed: ": "Hook pre-commit géré supprimé : ",
     "Passed: the complete current snapshot was reviewed": "Réussi : l’instantané actuel complet a été examiné",
-    "Project current was preserved; initial is copied only when current is missing on install. Review activation is unchanged.": "Le current du projet a été conservé ; initial est copié uniquement si current est absent lors de l’installation. L’activation de la revue est inchangée.",
     "Rationale check belongs to different inputs": "La vérification de la justification correspond à d’autres entrées",
     "Rationale check has an invalid case quotation": "La vérification de la justification contient une citation de cas invalide",
     "Rationale check has an invalid incomplete-reason type": "Le motif de non-achèvement de la vérification de la justification est d’un type invalide",
@@ -379,6 +377,10 @@
     "Local review materials changed during review; rerun with the complete new input.": "Les documents locaux ont changé pendant la revue ; relancez-la avec les nouvelles entrées complètes.",
     "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "Les règles locales appartiennent à un autre arbre de travail ; la version adoptée ne peut pas être réutilisée ici.",
     "Saved local review rules are missing or invalid.": "Les règles locales enregistrées sont absentes ou invalides.",
-    "Start a code review with: make review": "Lancer une revue de code : make review"
+    "Start a code review with: make review": "Lancer une revue de code : make review",
+    "Existing current was preserved. A new sidecar uses release current; a missing current in an existing sidecar is restored from initial.": "Le current existant a été conservé. Un nouveau sidecar utilise le current de la version publiée ; si current est absent d’un sidecar existant, il est restauré depuis initial.",
+    "No .clarity directory exists here; use the first-install entry.": "Aucun répertoire .clarity n’existe ici ; utilisez le point d’accès de première installation.",
+    "Review materials were recreated; run make review to adopt the current local materials before committing.": "Les documents de revue ont été recréés ; exécutez make review pour adopter les documents locaux actuels avant de créer un commit.",
+    "Selected release has no initial project rules in current/rules.md.": "La version sélectionnée ne contient pas de règles initiales du projet dans current/rules.md."
   }
 }

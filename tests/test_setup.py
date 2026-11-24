@@ -90,25 +90,107 @@ class SidecarSetupTests(unittest.TestCase):
                 files[relative] = path.read_bytes()
         return files
 
-    def test_first_install_uses_factory_templates_and_records_git_origin(self):
+    def directory_state(self, directory):
+        """directory_state() 记录目录、文件原文及权限，使空目录和缺失文件也参与保留核对。"""
+        return {str(path.relative_to(directory)): (path.is_dir(), path.stat().st_mode & 0o777,
+                                                   None if path.is_dir() else path.read_bytes())
+                for path in directory.rglob("*")}
+
+    def test_first_install_carries_release_current_and_records_git_origin(self):
         self.install()
         sidecar = self.host / ".clarity"
         self.assertTrue((sidecar / "setup.py").is_file())
         self.assertTrue((sidecar / "engine/runner/review.py").is_file())
-        self.assertEqual((sidecar / "current/rules.md").read_bytes(),
-                         (self.source / "initial/rules.md").read_bytes())
-        self.assertEqual((sidecar / "current/cases/case.md").read_bytes(),
-                         (self.source / "initial/cases/case.md").read_bytes())
-        self.assertFalse((sidecar / "current/cases/0001. multilingual-todo.md").exists())
+        for directory in ("engine", "initial", "current"):
+            self.assertEqual(self.directory_state(sidecar / directory),
+                             self.directory_state(self.source / directory))
         self.assertIn(b".clarity/engine/runner/review.py", (sidecar / "Makefile").read_bytes())
         self.assertIn(b"include .clarity/Makefile", (self.host / "Makefile").read_bytes())
         installation = self.manifest()
         self.assertEqual(installation["commit"], self.git(self.source, "rev-parse", "HEAD"))
         self.assertIn(str(self.source), json.dumps(installation, ensure_ascii=False))
         self.assertTrue(installation["files"])
+        self.assertFalse(any(name.startswith("current/") for name in installation["files"]))
         self.assertFalse((self.host / ".git/clarity/config.json").exists())
         self.assertFalse((self.host / ".git/hooks/commit-msg").exists())
         self.assertFalse((self.host / ".git/hooks/pre-commit").exists())
+
+    def test_first_install_seeds_current_from_the_same_committed_release_as_factory_files(self):
+        marker = self.source / "current/release-marker.txt"
+        marker.write_bytes("已提交发行资料\r\n".encode("utf-8"))
+        marker.chmod(0o755)
+        release = self.commit("release with current seed marker")
+        expected = {directory: self.directory_state(self.source / directory)
+                    for directory in ("engine", "initial", "current")}
+        marker.write_bytes(b"uncommitted upstream current must not be installed\n")
+        (self.source / "current/untracked-note.txt").write_bytes(b"untracked upstream file\n")
+        initial = self.source / "initial/rules.md"
+        initial.write_bytes(b"uncommitted upstream initial must not be installed\n")
+        workflow = self.source / "engine/workflow.md"
+        workflow.write_bytes(b"uncommitted upstream engine must not be installed\n")
+        self.install()
+        self.assertEqual(self.manifest()["commit"], release)
+        for directory, state in expected.items():
+            self.assertEqual(self.directory_state(self.host / ".clarity" / directory), state)
+
+    def test_existing_empty_or_partial_current_is_not_filled_by_install_reinstall_or_update(self):
+        for kind in ("empty", "partial"):
+            with self.subTest(kind=kind):
+                self.host = self.new_host("existing-current-" + kind)
+                current = self.host / ".clarity/current"
+                current.mkdir(parents=True)
+                current.chmod(0o750)
+                if kind == "partial":
+                    (current / "rules.md").write_bytes(b"")
+                    (current / "rules.md").chmod(0o640)
+                    (current / "user-empty-directory").mkdir()
+                    (current / "user-note.txt").write_bytes(b"unfinished local material\r\n")
+                expected = self.directory_state(current)
+                for operation in (self.install, self.install, self.update):
+                    operation()
+                    self.assertEqual(self.directory_state(current), expected)
+                    self.assertEqual(current.stat().st_mode & 0o777, 0o750)
+
+    def test_missing_engine_and_initial_files_are_restored_without_filling_current(self):
+        self.install()
+        sidecar = self.host / ".clarity"
+        current = sidecar / "current"
+        (current / "rules.md").write_bytes(b"")
+        expected_current = self.directory_state(current)
+        expected_factory = {directory: self.directory_state(sidecar / directory)
+                            for directory in ("engine", "initial")}
+        (sidecar / "engine/README.md").unlink()
+        (sidecar / "initial/rules.md").unlink()
+        self.update()
+        for directory, state in expected_factory.items():
+            self.assertEqual(self.directory_state(sidecar / directory), state)
+        self.assertEqual(self.directory_state(current), expected_current)
+
+    def test_only_current_remaining_can_be_reinstalled_or_updated_without_merging_seed(self):
+        self.install()
+        sidecar = self.host / ".clarity"
+        current = sidecar / "current"
+        (current / "rules.md").write_bytes(b"local rules remain after manual program deletion\n")
+        (current / "empty-local-directory").mkdir()
+        expected = self.directory_state(current)
+        for command in ("install", "update"):
+            with self.subTest(command=command):
+                for path in sidecar.iterdir():
+                    if path == current:
+                        continue
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                arguments = [sys.executable, str(self.source / "setup.py"), command,
+                             "--repo", str(self.host), "--source", str(self.source)]
+                if command == "install":
+                    arguments.extend(["--track", "yes"])
+                self.run_command(arguments)
+                self.assertEqual(self.directory_state(current), expected)
+                for directory in ("engine", "initial"):
+                    self.assertEqual(self.directory_state(sidecar / directory),
+                                     self.directory_state(self.source / directory))
 
     def test_reinstall_preserves_current_and_two_hosts_keep_separate_materials(self):
         self.install()
@@ -120,7 +202,7 @@ class SidecarSetupTests(unittest.TestCase):
         second = self.new_host("second-host")
         self.install(host=second)
         self.assertEqual((second / ".clarity/current/rules.md").read_bytes(),
-                         (self.source / "initial/rules.md").read_bytes())
+                         (self.source / "current/rules.md").read_bytes())
         self.assertEqual(current.read_bytes(), b"First host's own rules.\n")
 
     def test_update_adds_and_removes_factory_files_without_changing_current(self):
@@ -130,15 +212,19 @@ class SidecarSetupTests(unittest.TestCase):
         self.install()
         current = self.host / ".clarity/current/rules.md"
         current.write_bytes(b"Host-owned rules survive every update.\n")
+        expected_current = self.directory_state(current.parent)
         obsolete.unlink()
         (self.source / "engine/new-file.txt").write_bytes(b"new factory file\n")
         (self.source / "initial/rules.md").write_bytes(b"New factory template.\n")
+        (self.source / "current/rules.md").write_bytes(b"New upstream seed must not replace installed materials.\n")
+        (self.source / "current/new-upstream-note.txt").write_bytes(b"not merged into existing current\n")
         latest = self.commit("new factory version")
         self.update()
         self.assertFalse((self.host / ".clarity/engine/obsolete.txt").exists())
         self.assertEqual((self.host / ".clarity/engine/new-file.txt").read_bytes(), b"new factory file\n")
         self.assertEqual((self.host / ".clarity/initial/rules.md").read_bytes(), b"New factory template.\n")
         self.assertEqual(current.read_bytes(), b"Host-owned rules survive every update.\n")
+        self.assertEqual(self.directory_state(current.parent), expected_current)
         self.assertEqual(self.manifest()["commit"], latest)
 
     def test_update_rejects_locally_edited_factory_files_without_partial_deployment(self):
@@ -181,7 +267,7 @@ class SidecarSetupTests(unittest.TestCase):
         self.assertFalse((self.host / ".clarity").exists())
         self.assertFalse((self.host / ".git/clarity/installation.json").exists())
 
-    def test_update_refreshes_existing_runtime_without_readopting_rules_or_resetting_settings(self):
+    def test_update_and_reinstall_refresh_runtime_without_readopting_rules_or_resetting_settings(self):
         self.git(self.host, "config", "core.hooksPath", ".custom-hooks")
         self.install()
         rule = self.host / ".clarity/current/rules.md"
@@ -198,8 +284,11 @@ class SidecarSetupTests(unittest.TestCase):
         original_hook = hook.read_bytes()
         self.assertFalse((self.host / ".git/hooks/pre-commit").exists())
         rule.write_bytes(b"Changed host rules must remain candidates after updating software.\n")
+        current_state = self.directory_state(rule.parent)
         workflow = self.source / "engine/workflow.md"
         workflow.write_bytes(workflow.read_bytes() + b"\nOffline factory version marker.\n")
+        (self.source / "current/rules.md").write_bytes(b"New upstream seed is not a new host adoption.\n")
+        (self.source / "current/new-upstream-note.txt").write_bytes(b"do not merge on update or reinstall\n")
         self.commit("runtime engine update")
         self.update()
         actual = json.loads(config_path.read_text())
@@ -210,6 +299,10 @@ class SidecarSetupTests(unittest.TestCase):
         self.assertEqual(hook.read_bytes(), original_hook)
         self.assertFalse((self.host / ".git/hooks/pre-commit").exists())
         self.assertEqual(rule.read_bytes(), b"Changed host rules must remain candidates after updating software.\n")
+        self.assertEqual(self.directory_state(rule.parent), current_state)
+        self.install()
+        self.assertEqual(json.loads(config_path.read_text()), actual)
+        self.assertEqual(self.directory_state(rule.parent), current_state)
 
     def test_legacy_sidecar_is_adopted_from_matching_history_without_resetting_project_state(self):
         specification = importlib.util.spec_from_file_location(

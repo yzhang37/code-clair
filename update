@@ -2,7 +2,8 @@
 set -eu
 
 # update 只从已有 .clarity 转交升级；安装在哪个目录，就升级那个目录，不要求它是 Git 根目录。
-# 文件部署、来源选择和失败恢复仍由同目录 setup.py 负责，本层不初始化 Git 或 current。
+# 文件部署、来源选择和失败恢复仍由同目录 setup.py 负责，本层不初始化 Git 或直接写 current。
+# setup.py 保留已有 current；整个目录缺失时由它从同版 initial 原样恢复，底稿是否可审核留给后续审核核对。
 if ! script_dir=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd); then
     printf '%s\n' 'Clarity update could not locate the existing installation directory.' >&2
     exit 2

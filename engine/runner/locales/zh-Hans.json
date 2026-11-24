@@ -32,7 +32,6 @@
     "Existing pre-commit has local changes; it was not overwritten: ": "已有 pre-commit 有本地改动，未覆盖：",
     "A review, maintenance, or installation is running, or an old lock needs inspection: ": "已有审核、维护或安装在运行，或旧锁待核对：",
     "Existing commit hook has local changes or no verified source; it was not overwritten: ": "已有提交 hook 有本地改动或缺少来源，未覆盖：",
-    "No structurally valid Clarity installation exists here; use the first-install entry.": "当前目录没有符合结构的 Clarity 安装，请先运行首次安装入口。",
     "Recovery did not complete; original-file backups were retained at: ": "恢复未完成；保留原文备份：",
     "Selected version lacks required installation files: ": "所选版本缺少独立安装所需文件：",
     "A new factory path is occupied by a local file: ": "新原厂路径已被本地文件占用：",
@@ -44,7 +43,6 @@
     "Existing runtime engine and configuration digest differ; nothing was overwritten automatically.": "现有运行引擎与配置摘要不一致，未自动覆盖。",
     "Existing runtime engine has no configuration; it was not overwritten: ": "现有运行引擎没有配置，未覆盖：",
     "Enter one of the displayed choices, or press Enter for the default.": "请按提示输入选项，或按回车采用默认值。",
-    "Project current was preserved; initial is copied only when current is missing on install. Review activation is unchanged.": "项目 current 已保留；首次缺失时才从 initial 创建。提交审核启用状态沿用原安装。",
     "\nEngine maintenance stage: ": "\nEngine 维护阶段：",
     "Git could not identify the maintenance target: ": "Git 无法确认维护目标：",
     "Child-check inputs differ from the shared maintenance inputs: ": "子检查实际输入与本次共同输入不一致：",
@@ -379,6 +377,10 @@
     "Local review materials changed during review; rerun with the complete new input.": "审核期间本机资料发生变化；请使用完整的新输入重新运行。",
     "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "本机审核规则属于另一工作树，不能在此复用已采用的版本。",
     "Saved local review rules are missing or invalid.": "已保存的本机审核规则缺失或无效。",
-    "Start a code review with: make review": "开始代码审核：make review"
+    "Start a code review with: make review": "开始代码审核：make review",
+    "Existing current was preserved. A new sidecar uses release current; a missing current in an existing sidecar is restored from initial.": "已有 current 已保留。新 sidecar 使用发行版本中的 current；已有 sidecar 缺少 current 时，从 initial 恢复。",
+    "No .clarity directory exists here; use the first-install entry.": "此处不存在 .clarity 目录；请使用首次安装入口。",
+    "Review materials were recreated; run make review to adopt the current local materials before committing.": "审核资料已重建；请在提交前运行 make review，采用当前本机资料。",
+    "Selected release has no initial project rules in current/rules.md.": "所选发行版本的 current/rules.md 中没有初始项目规则。"
   }
 }

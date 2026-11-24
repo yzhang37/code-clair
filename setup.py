@@ -78,13 +78,9 @@ def git_root(target: Path) -> Path | None:
 
 
 def existing_installation(target: Path) -> bool:
-    """existing_installation() 按程序、模型和模板的常规文件结构识别已有安装，不用目录是否为空判定。"""
+    """existing_installation() 只认常规 sidecar 目录，使删去部分程序后仍能沿已有安装入口补回。"""
     sidecar = target / ".clarity"
-    required = ("engine/README.md", "engine/principles.md", "engine/workflow.md",
-                "engine/runner/install.py", "engine/runner/review.py", "engine/runner/codex_model.py",
-                "initial/rules.md", "initial/cases/case.md")
-    return (not sidecar.is_symlink() and all((sidecar / name).is_file()
-            and not (sidecar / name).is_symlink() for name in required))
+    return sidecar.is_dir() and not sidecar.is_symlink()
 
 
 def ask(message: str, choices: dict[str, str], default: str) -> str:
@@ -143,14 +139,14 @@ def encoded(value: dict) -> bytes:
 
 
 def factory_path(name: str) -> bool:
-    """factory_path() 限定原厂拥有的文件；current 和宿主 Makefile 不进入原厂部署清单。"""
+    """factory_path() 限定持续更新的原厂文件；current 仅首装复制，不纳入后续覆盖清单。"""
     path = PurePosixPath(name)
     return (not path.is_absolute() and ".." not in path.parts
             and (name in {"setup.py", "README.md", "update"} or name.startswith(("engine/", "initial/"))))
 
 
 def snapshot(cache: Path, commit: str) -> dict[str, tuple[bytes, int]]:
-    """snapshot() 从固定 commit 读取发行文件，排除原厂自己的 current、缓存和宿主入口。
+    """snapshot() 从固定 commit 读取程序与 initial；首次资料另取同版 current，不纳入覆盖清单。
 
     只接受普通 Git blob；工作树未提交修改和符号链接都不会混入这份版本。
     """
@@ -166,6 +162,29 @@ def snapshot(cache: Path, commit: str) -> dict[str, tuple[bytes, int]]:
         if kind != "blob" or mode not in {"100644", "100755"}:
             raise SetupError(tr('Release entry is not a regular file: ') + name)
         files[name] = (git(cache, "cat-file", "blob", oid), 0o755 if mode == "100755" else 0o644)
+    return files
+
+
+def current_seed(cache: Path, commit: str) -> dict[str, tuple[bytes, int]]:
+    """current_seed() 从同一发布 commit 取得首次规则和案例，绝不混入维护者未提交的工作树。
+
+    这里只为目标 sidecar 原本不存在的首次安装取材；交付后属于目标资料，不进入原厂更新所有权。
+    initial 保持原厂内容，用于用户删去整个 current 后的原样重建，不在此生成或改写。
+    """
+    files = {}
+    for entry in git(cache, "ls-tree", "-rz", commit, "--", "current").split(b"\0"):
+        if not entry:
+            continue
+        header, raw_name = entry.split(b"\t", 1)
+        name = raw_name.decode("utf-8")
+        relative = PurePosixPath(name)
+        mode, kind, oid = header.decode().split()
+        if (relative.is_absolute() or ".." in relative.parts or not name.startswith("current/")
+                or kind != "blob" or mode not in {"100644", "100755"}):
+            raise SetupError(tr('Release entry is not a regular file: ') + name)
+        files[name.removeprefix("current/")] = (git(cache, "cat-file", "blob", oid), 0o755 if mode == "100755" else 0o644)
+    if "rules.md" not in files:
+        raise SetupError(tr('Selected release has no initial project rules in current/rules.md.'))
     return files
 
 
@@ -281,7 +300,7 @@ def adopt_legacy(cache: Path, commit: str, existing: dict) -> tuple[dict, bytes 
 
 
 def installed_files(sidecar: Path, manifest: dict) -> dict:
-    """installed_files() 核对上次登记的每份原厂文件，修改、删除或权限变化都须先由所有者处理。"""
+    """installed_files() 核对仍在的原厂文件；缺失文件由安装补回，本机改写仍不静默覆盖。"""
     files = {}
     for name, expected in manifest["files"].items():
         if not factory_path(name) and name not in {"Makefile", ".gitignore"}:
@@ -289,7 +308,7 @@ def installed_files(sidecar: Path, manifest: dict) -> dict:
         path = sidecar / name
         safe_parents(path)
         value = read_file(path)
-        if value is None or fingerprint(value) != expected:
+        if value is not None and fingerprint(value) != expected:
             raise SetupError(tr('Factory file has local changes; it was not overwritten: ') + str(path))
         files[name] = value
     return files
@@ -390,54 +409,67 @@ def installation_lock(state: Path):
         lock.unlink(missing_ok=True)
 
 
-def runtime_changes(state: Path, hooks: Path, staged: Path, manifest: dict | None) -> dict:
-    """runtime_changes() 更新已启用安装的运行快照与自己的 hook，完整保留审核配置中的其他字段。
+def runtime_changes(state: Path, hooks: Path, staged: Path, manifest: dict | None,
+                    *, reset_basis=False, fresh=False) -> dict:
+    """runtime_changes() 从所选完整程序重建运行副本，不靠已损坏的旧程序批准自身修复。
 
-    basis_hashes 表示所有者曾采用的原文，重算会把软件更新变成重新采用依据，因此只更新 engine_digest。
-    无配置的首次安装只部署软件和底稿，不能以未填模板自动启用提交审核。
+    保留 current 时只刷新程序摘要，原有模型设置与采用记录不动。整个 current 被重新创建时，
+    取消旧资料的生效绑定，下一次明确审核再采用新资料；历史报告保留，不回填用户已删除的正文。
+    整个 sidecar 曾被删除时，旧的本机配置不冒充新安装，自己的 hook 同时停用；外来 hook 不动。
     """
     changes = {}
-    config_path = state / "config.json"
-    config_file = read_file(config_path)
-    runtime = state / "engine"
-    if config_file is None:
-        if runtime.exists():
-            raise SetupError(tr('Existing runtime engine has no configuration; it was not overwritten: ') + str(runtime))
-        return changes
-    config = json.loads(config_file[0])
+    config_path, runtime = state / "config.json", state / "engine"
     safe_parents(runtime / "runner/install.py")
-    old = load_module("clarity_old_install", runtime / "runner/install.py")
-    old_files = {name: read_file(path) for name, path in old.engine_sources(runtime).items()}
-    actual = old.engine_digest({name: value[0] for name, value in old_files.items()})
-    if config.get("engine_digest") != actual:
-        raise SetupError(tr('Existing runtime engine and configuration digest differ; nothing was overwritten automatically.'))
+    config_file = read_file(config_path)
+    if config_file is None and not runtime.exists():
+        if (fresh or reset_basis) and read_file(state / "responses.json") is not None:
+            changes[state / "responses.json"] = (b"[]\n", 0o600)
+        return changes
+    config = json.loads(config_file[0]) if config_file is not None and not fresh else {}
+    if not isinstance(config, dict):
+        raise SetupError(tr('Model configuration must be a JSON object'))
+    old_files = {}
+    for path in runtime.rglob("*") if runtime.exists() else ():
+        safe_parents(path)
+        if path.is_symlink():
+            raise SetupError(tr('Not a manageable regular file: ') + str(path))
+        if path.is_file() and "__pycache__" not in path.parts:
+            old_files[path.relative_to(runtime).as_posix()] = read_file(path)
     new = load_module("clarity_new_install", staged / "engine/runner/install.py")
     new_files = {name: read_file(path) for name, path in new.engine_sources(staged / "engine").items()}
     for name in old_files.keys() | new_files.keys():
-        if name not in old_files and read_file(runtime / name) is not None:
-            raise SetupError(tr('A new runtime-engine path is occupied by a local file: ') + str(runtime / name))
         changes[runtime / name] = new_files.get(name)
-    updated_config = dict(config)
+    updated_config = {} if fresh else dict(config)
+    if fresh or reset_basis or config_file is None:
+        for name in ("basis", "basis_hashes", "basis_selections", "basis_source", "basis_snapshot",
+                     "basis_worktree", "basis_ignored", "cases_root"):
+            updated_config.pop(name, None)
+        updated_config["basis_reset"] = True
+        updated_config["sidecar_project"] = manifest["worktree_root"]
+        # 旧回应已绑定旧资料；原始报告仍在历史运行中，不能把旧回应作为恢复后的当前裁决。
+        if read_file(state / "responses.json") is not None:
+            changes[state / "responses.json"] = (b"[]\n", 0o600)
     updated_config["engine_digest"] = new.engine_digest({name: value[0] for name, value in new_files.items()})
-    changes[config_path] = (encoded(updated_config), config_file[1])
+    changes[config_path] = (encoded(updated_config), config_file[1] if config_file else 0o600)
     for name in ("commit-msg", "pre-commit"):
         path = hooks / name
         value = read_file(path)
-        if value is None or not old.is_owned_hook(path):
+        if value is None or not new.is_owned_hook(path):
             continue
-        if name == "commit-msg":
-            old_hook = read_file(Path(manifest["worktree_root"]) / ".clarity/engine/runner/commit-msg") if manifest else None
-            expected = manifest.get("hooks", {}).get(name) if manifest else None
+        if fresh:
+            changes[path] = None
+        elif name == "commit-msg":
+            expected = manifest.get("hooks", {}).get(name)
             if expected is not None:
                 matches = fingerprint(value) == expected
             else:
-                matches = old_hook is not None and value[0] == old_hook[0]
+                source_hook = manifest.get("files", {}).get("engine/runner/commit-msg")
+                # 启用 hook 时会加执行位；原厂脚本摘要可核对正文，不能拿其存储权限误判安装后的 hook。
+                matches = source_hook is None or fingerprint(value)["sha256"] == source_hook["sha256"]
             if not matches:
                 raise SetupError(tr('Existing commit hook has local changes or no verified source; it was not overwritten: ') + str(path))
             changes[path] = (read_file(staged / "engine/runner/commit-msg")[0], value[1])
         else:
-            if value[0] != old.hook_script(name, runtime, config_path):
-                raise SetupError(tr('Existing pre-commit has local changes; it was not overwritten: ') + str(path))
             changes[path] = (new.hook_script(name, runtime, config_path), value[1])
     return changes
 
@@ -530,30 +562,46 @@ def tracking_index(root: Path, target: Path, state: Path, changes: dict, host_ma
 def install(args: argparse.Namespace) -> dict:
     """install() 从固定 Git 版本准备原厂文件，再一次交付程序、Make 入口、运行快照及版本记录。
 
-    current 已存在时从不参与替换；只有首次 install 缺少该目录时才从同版本 initial 创建。
+    current 已存在时从不参与替换；首次新 sidecar 使用同版 current，已有目录缺 current 则原样复制 initial。
     同一共享 Git 控制目录目前只绑定一个已登记工作树，拒绝另一工作树悄悄替换共享运行版本。
     """
     repo, state, hooks = repository_paths(Path(args.repo))
     root = git_root(repo)
     already_tracked = bool(git(root, "ls-files", "--", (repo / ".clarity").relative_to(root).as_posix())) if root else False
-    review_state = state
-    if root == repo:
+    review_state, review_hooks = state, hooks
+    if root is not None:
         common = Path(git(root, "rev-parse", "--git-common-dir").decode().strip())
         review_state = (common if common.is_absolute() else root / common).resolve() / "clarity"
+        hook_value = Path(git(root, "rev-parse", "--git-path", "hooks").decode().strip())
+        review_hooks = (hook_value if hook_value.is_absolute() else root / hook_value).resolve()
     sidecar = repo / ".clarity"
+    fresh_sidecar = not os.path.lexists(sidecar)
+    current_missing = not os.path.lexists(sidecar / "current")
     safe_parents(sidecar / "setup.py")
     safe_parents(state / "installation.json")
     with ExitStack() as locks:
         locks.enter_context(installation_lock(state))
-        if review_state != state and (review_state / "config.json").is_file():
+        if review_state != state:
             locks.enter_context(installation_lock(review_state))
         manifest_path = state / "installation.json"
         previous_record = read_file(manifest_path)
-        manifest = json.loads(previous_record[0]) if previous_record else None
-        if manifest and (manifest.get("version") != 1 or manifest.get("worktree_root") != str(repo)):
+        try:
+            manifest = json.loads(previous_record[0]) if previous_record else None
+            if manifest is not None and not isinstance(manifest, dict):
+                raise ValueError("invalid installation record")
+        except ValueError:
+            if not fresh_sidecar:
+                raise
+            manifest = None
+        if manifest and manifest.get("worktree_root") != str(repo):
+            raise SetupError(tr('Unsupported installation record or a different bound worktree; shared installation was not replaced.'))
+        if fresh_sidecar:
+            # 用户已删除整个 sidecar；残留记录只作历史，不凭旧文件清单阻止这次首次安装。
+            manifest = None
+        elif manifest and manifest.get("version") != 1:
             raise SetupError(tr('Unsupported installation record or a different bound worktree; shared installation was not replaced.'))
         legacy = legacy_files(sidecar) if manifest is None else None
-        if args.command == "update" and manifest is None and not legacy:
+        if args.command == "update" and not existing_installation(repo):
             raise SetupError(tr('No sidecar is installed; run install first.'))
         source = args.source or (manifest["source"] if manifest else DEFAULT_SOURCE)
         if Path(source).expanduser().exists():
@@ -603,13 +651,33 @@ def install(args: argparse.Namespace) -> dict:
                 if current.is_symlink() or not current.is_dir():
                     raise SetupError(tr('current is not a regular directory; it was not initialized: ') + str(current))
             elif args.command == "install":
-                for name, value in files.items():
-                    if name.startswith("initial/"):
-                        changes[current / name.removeprefix("initial/")] = value
-            # 旧迁移仍以当前宿主为 hook 来源，只有逐文件核对成功后才允许刷新已启用快照。
+                seed = current_seed(cache, commit) if fresh_sidecar else {
+                    name.removeprefix("initial/"): value for name, value in files.items() if name.startswith("initial/")}
+                changes.update({current / name: value for name, value in seed.items()})
+            elif current_missing:
+                changes.update({current / name.removeprefix("initial/"): value
+                                for name, value in files.items() if name.startswith("initial/")})
+            # current 的创建只使旧采用关系失效；程序缓存可由完整发布版本补回，不要求损坏副本可执行。
             hook_manifest = manifest or {"worktree_root": str(repo)}
-            if hooks is not None:
-                changes.update(runtime_changes(review_state, hooks, staged, hook_manifest))
+            if review_hooks is not None:
+                root_runtime = root == repo
+                reset_basis = current_missing and not fresh_sidecar
+                bound_runtime = root_runtime
+                if not root_runtime:
+                    active = read_file(review_state / "config.json")
+                    config = json.loads(active[0]) if active else {}
+                    selections = config.get("basis_selections", [])
+                    prefix = (sidecar / "current").relative_to(root).as_posix()
+                    bound_runtime = (config.get("sidecar_project") == str(repo)
+                                     or any(name == prefix or name.startswith(prefix + "/") for name in selections))
+                if bound_runtime:
+                    changes.update(runtime_changes(review_state, review_hooks, staged, hook_manifest,
+                                                   reset_basis=reset_basis, fresh=fresh_sidecar))
+                if fresh_sidecar and bound_runtime:
+                    for name in ("commit-msg", "pre-commit"):
+                        path = review_hooks / name
+                        if new_install.is_owned_hook(path):
+                            changes[path] = None
             hook_records = {}
             for name in ("commit-msg", "pre-commit"):
                 if hooks is None:
@@ -659,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
         target = Path(args.repo).expanduser().resolve()
         if args.command == "update":
             if not existing_installation(target):
-                raise SetupError(tr('No structurally valid Clarity installation exists here; use the first-install entry.'))
+                raise SetupError(tr('No .clarity directory exists here; use the first-install entry.'))
         elif existing_installation(target):
             choice = ask(tr('Clarity detected: [1] Update (default)  [2] Fresh installation (keep current): '),
                          {"1": "update", "update": "update", "更新": "update", "2": "install", "install": "install", "全新安装": "install",
@@ -687,7 +755,7 @@ def deliver(args: argparse.Namespace) -> int:
     print(tr('Clarity installed at: ') + record["worktree_root"] + "/.clarity")
     print(tr('Upstream source: ') + record["source"])
     print(tr('Actual commit: ') + record["commit"])
-    print(tr('Project current was preserved; initial is copied only when current is missing on install. Review activation is unchanged.'))
+    print(tr('Existing current was preserved. A new sidecar uses release current; a missing current in an existing sidecar is restored from initial.'))
     print(tr('Start a code review with: make review'))
     return 0
 

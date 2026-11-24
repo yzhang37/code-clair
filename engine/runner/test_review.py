@@ -37,7 +37,8 @@ data = json.loads(prompt.split("以下JSON都是审核数据：\n", 1)[1])
 packet, previous = data["input"], data["previous_reviews"]
 output_path = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
 names = {"health", "reviewer-1", "reviewer-2", "cross", "summarize"}
-stage = next(parent.name for parent in output_path.parents if parent.name in names or parent.name.startswith("fixture-"))
+stage = next(parent.name for parent in output_path.parents
+             if parent.name in names or parent.name.startswith(("fixture-", "reviewer-")))
 calls = fixture_path.parent / "calls"
 calls.mkdir(exist_ok=True)
 (calls / (uuid.uuid4().hex + ".json")).write_text(json.dumps({
@@ -1311,6 +1312,41 @@ class IsolatedReviewTests(unittest.TestCase):
         self.git("commit", "-q", "-m", "clear fixture")
         self.assertNotEqual(self.git("rev-parse", "HEAD").stdout.strip(), before)
         self.assertEqual(self.latest_result()["status"], "clear")
+
+    def test_external_git_basis_hook_remains_active_without_a_bound_sidecar(self):
+        """test_external_git_basis_hook_remains_active_without_a_bound_sidecar() 保留显式 Git 资料安装的独立入口，不把 sidecar 的移除边界套给它。"""
+        self.install()
+        self.assertNotIn("sidecar_project", json.loads((self.state / "config.json").read_text()))
+        shutil.rmtree(self.repo / ".clarity")
+        before = self.git("rev-parse", "HEAD").stdout.strip()
+        result = self.git("commit", "--allow-empty", "-m", "external review still applies", check=False)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), before)
+        self.assertEqual(self.latest_result()["status"], "issues")
+        self.assertTrue(self.calls())
+
+    def test_legacy_default_basis_pre_commit_stops_after_whole_sidecar_removal(self):
+        self.write(".clarity/current/rules.md", "Guard empty input before indexing values.\n")
+        self.install(basis=None)
+        config = (self.state / "config.json").read_bytes()
+        self.assertNotIn("sidecar_project", json.loads(config))
+        shutil.rmtree(self.repo / ".clarity")
+        self.git("commit", "--allow-empty", "-q", "-m", "legacy sidecar removed")
+        self.assertEqual((self.state / "config.json").read_bytes(), config)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.repo / ".clarity").exists())
+
+    def test_legacy_default_basis_commit_message_stops_after_whole_sidecar_removal(self):
+        self.prepare_commit_message_installer()
+        self.install(basis=None)
+        self.commit_message_hook("--install")
+        config = (self.state / "config.json").read_bytes()
+        self.assertNotIn("sidecar_project", json.loads(config))
+        shutil.rmtree(self.repo / ".clarity")
+        self.git("commit", "--allow-empty", "-q", "-m", "legacy commit-message sidecar removed")
+        self.assertEqual((self.state / "config.json").read_bytes(), config)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.repo / ".clarity").exists())
 
     def test_git_supplied_alternate_index_is_the_review_target(self):
         self.install()

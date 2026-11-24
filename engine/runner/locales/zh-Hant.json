@@ -234,7 +234,6 @@
     "No regular cases directory": "沒有常規 cases 目錄",
     "No regular fixtures directory: ": "沒有常規 fixtures 目錄：",
     "No sidecar is installed; run install first.": "尚未安裝 sidecar；請先執行 install。",
-    "No structurally valid Clarity installation exists here; use the first-install entry.": "當前目錄沒有符合結構的 Clarity 安裝，請先運行首次安裝入口。",
     "No valid target-repository basis files were found; create project .clarity materials or select them with --basis.": "未找到目標倉庫的有效依據文件；請建立自己的 .clarity 資料或用 --basis 明確選入。",
     "Non-UTF-8 files need an explicitly supported review method: ": "非 UTF-8 文件需要另行確定審核方式：",
     "Not a manageable regular file: ": "不是可管理的常規文件：",
@@ -246,7 +245,6 @@
     "Owned commit hook removed; rules, cases, and review records were retained.": "已移除本程序的提交 hook；規則、案例和審核記錄保留。",
     "Owned pre-commit hook removed: ": "已卸載本安裝器擁有的 pre-commit hook：",
     "Passed: the complete current snapshot was reviewed": "通過：當前完整快照已完成審核",
-    "Project current was preserved; initial is copied only when current is missing on install. Review activation is unchanged.": "項目 current 已保留；首次缺失時才從 initial 創建。提交審核啓用狀態沿用原安裝。",
     "Rationale check belongs to different inputs": "理由核對對應另一份輸入",
     "Rationale check has an invalid case quotation": "理由核對的案例引用無效",
     "Rationale check has an invalid incomplete-reason type": "理由核對的未完成說明類型無效",
@@ -379,6 +377,10 @@
     "Local review materials changed during review; rerun with the complete new input.": "審核期間本機資料發生變化；請使用完整的新輸入重新執行。",
     "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "本機審核規則屬於另一工作樹，不能在此重用已採用的版本。",
     "Saved local review rules are missing or invalid.": "已儲存的本機審核規則遺失或無效。",
-    "Start a code review with: make review": "開始程式碼審核：make review"
+    "Start a code review with: make review": "開始程式碼審核：make review",
+    "Existing current was preserved. A new sidecar uses release current; a missing current in an existing sidecar is restored from initial.": "既有 current 已保留。新的 sidecar 使用發行版本中的 current；既有 sidecar 缺少 current 時，從 initial 還原。",
+    "No .clarity directory exists here; use the first-install entry.": "此處不存在 .clarity 目錄；請使用首次安裝入口。",
+    "Review materials were recreated; run make review to adopt the current local materials before committing.": "審核資料已重建；請在提交前執行 make review，採用目前的本機資料。",
+    "Selected release has no initial project rules in current/rules.md.": "所選發行版本的 current/rules.md 中沒有初始專案規則。"
   }
 }

@@ -77,6 +77,31 @@ PY
     exit 0
 fi
 
+# 用户移除 sidecar 程序后，Git 控制目录中的旧运行快照不再继续接管提交。
+project="$repo"
+if [ -f "$state/config.json" ]; then
+    project=$(python3 - "$state/config.json" "$repo" <<'PY'
+import json
+import sys
+from pathlib import Path
+try:
+    config = json.loads(Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    config = {'sidecar_project': sys.argv[2]}
+if not isinstance(config, dict):
+    config = {'sidecar_project': sys.argv[2]}
+project = config.get('sidecar_project')
+if project is None:
+    paths = config.get('basis_selections', config.get('basis', []))
+    project = sys.argv[2] if any(path.startswith('.clarity/current') for path in paths) else ''
+print(project)
+PY
+    ) || exit 2
+fi
+if [ -n "$project" ]; then
+    [ -f "$project/.clarity/engine/runner/review.py" ] || exit 0
+fi
+
 message=${1:?Git did not provide the commit-message file}
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/clarity-hook.XXXXXX") || exit 2
 trap 'rm -rf "$temporary"' EXIT HUP INT TERM

@@ -250,35 +250,42 @@ def local_basis(repo: Path, selections: list[str], ignored=None) -> dict[str, di
 
 
 def prepare_review(repo: Path, project: Path | None = None) -> None:
-    """prepare_review() 仅为第一次手动审核建立缺失配置和运行快照，不安装提交 hook。
+    """prepare_review() 在明确审核时准备缺失或已失效的资料采用记录，不安装提交 hook。
 
-    调用方须持有 running.lock；已有配置不重建，避免重置模型参数或把本轮候选重新采用。
-    Git 尚无所选资料时，保存首次明确使用的本机原文；之后的改写只能作为候选接受核对。
-    未填规则不能成为审核依据，用户须先表达项目标准，安装器不代为编造规则。
+    调用方须持有 running.lock；完整配置原样保留，避免把本轮候选重新采用。
+    整个 current 重建后只清除旧采用关系并保留模型偏好，本次明确审核才采用当前本机原文。
+    Git 的历史资料不覆盖此次采用；后续改写仍作为候选核对，资料能否使用由实际审核判断。
     """
     common = Path(git_output(repo, "rev-parse", "--git-common-dir"))
     state = (common if common.is_absolute() else repo / common).resolve() / "clarity"
-    if (state / "config.json").exists():
+    config_path = state / "config.json"
+    previous = json.loads(config_path.read_text()) if config_path.exists() else {}
+    if not isinstance(previous, dict):
+        raise InstallError(tr('Model configuration must be a JSON object'))
+    if not previous.get("basis_reset") and (previous.get("basis_selections") or previous.get("basis")):
         return
-    project = project or repo
+    project = (project or repo).resolve()
     selections = [(project / name).relative_to(repo).as_posix() for name in DEFAULT_BASIS_SELECTIONS]
     rules = project / ".clarity/current/rules.md"
-    initial = Path(__file__).resolve().parents[2] / "initial/rules.md"
-    case_template = initial.parent / "cases/case.md"
+    case_template = project / ".clarity/initial/cases/case.md"
     ignored = ({selections[1] + "/case.md": hashlib.sha256(case_template.read_bytes()).hexdigest()}
                if case_template.is_file() else {})
     materials = local_basis(repo, selections, ignored)
-    if (not rules.is_file() or not materials.get(selections[0], {}).get("text", "").strip()
-            or (initial.is_file() and rules.read_bytes() == initial.read_bytes())):
+    if not rules.is_file() or not materials.get(selections[0], {}).get("text", "").strip():
         raise InstallError(tr('First review needs project rules. Fill .clarity/current/rules.md, then run make review again.'))
-    head = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "HEAD", "--",
-                           *selections], capture_output=True)
-    local = head.returncode != 0 or not head.stdout.strip()
-    args = argparse.Namespace(repo=str(repo), basis=selections, codex_bin=None, model=None, reviewers=2, timeout=600)
-    install(args, with_hook=False, adopted_local=materials if local else None, ignored_local=ignored)
+    # 重建资料不是重置审核偏好；旧采用字段不能随偏好一起带回，否则会重新支配刚恢复的 current。
+    preserved = {name: value for name, value in previous.items()
+                 if name not in {"basis", "basis_hashes", "basis_selections", "basis_source", "basis_snapshot",
+                                 "basis_worktree", "basis_ignored", "cases_root", "basis_reset"}}
+    preserved["sidecar_project"] = str(project)
+    args = argparse.Namespace(repo=str(repo), basis=selections, codex_bin=previous.get("codex_bin"),
+                              model=previous.get("model"), reviewers=previous.get("reviewers", 2),
+                              timeout=previous.get("timeout", 600))
+    install(args, with_hook=False, adopted_local=materials, ignored_local=ignored, preserved_config=preserved)
 
 
-def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ignored_local=None) -> None:
+def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ignored_local=None,
+            preserved_config=None) -> None:
     """install() 核对完整输入后保存外部引擎及配置，仅显式启用时写入 pre-commit。
 
     引擎放在 Git common dir 中，与候选 tracked 内容分离；不修改资料、Git 配置或业务代码。
@@ -296,9 +303,9 @@ def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ign
     clarity_dir = common_dir / "clarity"
     engine_dir = clarity_dir / "engine"
     config_path = clarity_dir / "config.json"
-    if engine_dir.exists() and (not config_path.is_file() or engine_dir.is_symlink()):
+    if engine_dir.is_symlink() or (with_hook and engine_dir.exists() and not config_path.is_file()):
         raise InstallError(tr('Existing engine has no installer configuration or is a symbolic link; overwrite refused: ') + str(engine_dir))
-    config = {
+    config = {**(preserved_config or {}),
         "version": 1,
         "basis": adopted_basis,
         # 绑定安装时显式采用的原文字节，运行器据此区分首次资料与同次新增候选资料。

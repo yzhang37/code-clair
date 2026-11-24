@@ -24,6 +24,7 @@ class SetupSourceTests(unittest.TestCase):
     commit = setup_fixture.SidecarSetupTests.commit
     manifest = setup_fixture.SidecarSetupTests.manifest
     installed_bytes = setup_fixture.SidecarSetupTests.installed_bytes
+    directory_state = setup_fixture.SidecarSetupTests.directory_state
 
     def setUp(self):
         setup_fixture.SidecarSetupTests.setUp(self)
@@ -47,6 +48,8 @@ class SetupSourceTests(unittest.TestCase):
     def test_default_https_is_recorded_and_reused_without_treating_git_rewrite_as_a_source_change(self):
         self.install()
         self.assertEqual(self.manifest()["source"], DEFAULT_SOURCE)
+        self.assertEqual(self.directory_state(self.host / ".clarity/current"),
+                         self.directory_state(self.source / "current"))
         current = self.host / ".clarity/current/rules.md"
         current.write_bytes(b"Project-owned rules stay local.\n")
         workflow = self.source / "engine/workflow.md"
@@ -57,6 +60,30 @@ class SetupSourceTests(unittest.TestCase):
         self.assertEqual(self.manifest()["commit"], latest)
         self.assertEqual((self.host / ".clarity/engine/workflow.md").read_bytes(), workflow.read_bytes())
         self.assertEqual(current.read_bytes(), b"Project-owned rules stay local.\n")
+
+    def test_first_install_uses_current_from_the_selected_local_source_commit(self):
+        local = self.root / "alternate-first-install-factory"
+        self.run_command(["git", "clone", "--quiet", str(self.source), str(local)], cwd=self.root)
+        self.git(local, "config", "user.name", "Offline Alternate Factory")
+        self.git(local, "config", "user.email", "alternate-fixture@example.invalid")
+        self.git(local, "config", "commit.gpgsign", "false")
+        marker = local / "current/selected-source.txt"
+        marker.write_bytes("已选本地发行版本\r\n".encode("utf-8"))
+        (local / "initial/source-marker.txt").write_bytes(b"selected source factory initial\n")
+        workflow = local / "engine/workflow.md"
+        workflow.write_bytes(workflow.read_bytes() + b"\nSelected alternate factory release.\n")
+        self.git(local, "add", "current", "initial", "engine")
+        self.git(local, "commit", "-q", "-m", "selected source with distinct current")
+        release = self.git(local, "rev-parse", "HEAD")
+        expected = {directory: self.directory_state(local / directory)
+                    for directory in ("engine", "initial", "current")}
+        marker.write_bytes(b"dirty local source is not the selected release\n")
+        self.install(source=local)
+        self.assertEqual(self.manifest()["source"], str(local))
+        self.assertEqual(self.manifest()["commit"], release)
+        for directory, state in expected.items():
+            self.assertEqual(self.directory_state(self.host / ".clarity" / directory), state)
+        self.assertFalse(any(name.startswith("current/") for name in self.manifest()["files"]))
 
     def test_cloned_host_bootstraps_missing_local_state_and_preserves_its_tracked_current(self):
         self.install()
@@ -98,6 +125,7 @@ class SetupSourceTests(unittest.TestCase):
         default_commit = self.manifest()["commit"]
         current = self.host / ".clarity/current/rules.md"
         current.write_bytes(b"Host materials remain the same across factory source choices.\n")
+        current_state = self.directory_state(current.parent)
         local = self.root / "alternate-factory"
         self.run_command(["git", "clone", "--quiet", str(self.source), str(local)], cwd=self.root)
         self.git(local, "config", "user.name", "Offline Alternate Factory")
@@ -105,19 +133,28 @@ class SetupSourceTests(unittest.TestCase):
         self.git(local, "config", "commit.gpgsign", "false")
         workflow = local / "engine/workflow.md"
         workflow.write_bytes(workflow.read_bytes() + b"\nAlternate local source version.\n")
-        self.git(local, "add", "engine/workflow.md")
+        (local / "initial/source-marker.txt").write_bytes(b"alternate factory initial\n")
+        (local / "current/rules.md").write_bytes(b"Alternate upstream seed must not replace host rules.\n")
+        (local / "current/source-note.txt").write_bytes(b"do not merge source current\n")
+        self.git(local, "add", "engine/workflow.md", "initial", "current")
         self.git(local, "commit", "-q", "-m", "alternate factory version")
         local_commit = self.git(local, "rev-parse", "HEAD")
         self.update(source=local)
         self.assertEqual(self.manifest()["source"], str(local))
         self.assertEqual(self.manifest()["commit"], local_commit)
         self.assertEqual((self.host / ".clarity/engine/workflow.md").read_bytes(), workflow.read_bytes())
+        self.assertEqual(self.directory_state(self.host / ".clarity/initial"),
+                         self.directory_state(local / "initial"))
+        self.assertEqual(self.directory_state(current.parent), current_state)
         self.update(source=DEFAULT_SOURCE)
         self.assertEqual(self.manifest()["source"], DEFAULT_SOURCE)
         self.assertEqual(self.manifest()["commit"], default_commit)
         self.assertEqual((self.host / ".clarity/engine/workflow.md").read_bytes(),
                          (self.source / "engine/workflow.md").read_bytes())
         self.assertEqual(current.read_bytes(), b"Host materials remain the same across factory source choices.\n")
+        self.assertEqual(self.directory_state(self.host / ".clarity/initial"),
+                         self.directory_state(self.source / "initial"))
+        self.assertEqual(self.directory_state(current.parent), current_state)
 
     def test_failed_explicit_switch_keeps_old_origin_current_configuration_and_runtime(self):
         self.install(source=self.source)

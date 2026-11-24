@@ -39,6 +39,18 @@ class InstallFlowTests(unittest.TestCase):
             path = target / ".clarity/.local/installation.json"
         return json.loads(path.read_text())
 
+    def committed_files(self, directory, revision="HEAD"):
+        """committed_files() 只从指定 Git 发布读取原文，用于区分发布资料与未提交的原厂修改。"""
+        paths = self.git(self.source, "ls-tree", "-r", "--name-only", revision, "--", directory).splitlines()
+        return {str(Path(path).relative_to(directory)): subprocess.check_output(
+                    ["git", "-C", str(self.source), "show", revision + ":" + path],
+                    env=self.environment)
+                for path in paths}
+
+    def file_bytes(self, directory):
+        return {str(path.relative_to(directory)): path.read_bytes()
+                for path in directory.rglob("*") if path.is_file()}
+
     def prepare_business_changes(self):
         """prepare_business_changes() 使同一业务文件同时有已暂存和未暂存内容，检验安装不会夹带它们。"""
         business = self.host / "business.txt"
@@ -62,8 +74,8 @@ class InstallFlowTests(unittest.TestCase):
         self.assertFalse((target / ".git").exists())
         self.assertIn("include .clarity/Makefile", (target / "Makefile").read_text())
         self.assertEqual({p.name for p in target.iterdir()}, {".clarity", "Makefile"})
-        self.assertEqual((target / ".clarity/current/rules.md").read_bytes(),
-                         (target / ".clarity/initial/rules.md").read_bytes())
+        self.assertEqual(self.file_bytes(target / ".clarity/current"), self.committed_files("current"))
+        self.assertEqual(self.file_bytes(target / ".clarity/initial"), self.committed_files("initial"))
         rule = target / ".clarity/current/rules.md"
         rule.write_text("synthetic local rules\n")
         self.run_command(["sh", str(target / ".clarity/update")], cwd=target)
@@ -91,6 +103,29 @@ class InstallFlowTests(unittest.TestCase):
         self.assertEqual(self.git(self.host, "ls-files", "--", ".clarity"), "")
         self.assertEqual(self.git(self.host, "check-ignore", ".clarity/setup.py"), ".clarity/setup.py")
         self.assertFalse(self.read_manifest(self.host)["track_git"])
+
+    def test_mature_git_without_makefile_default_no_has_review_entries_and_preserves_staging(self):
+        business = self.host / "business.txt"
+        business.write_bytes(b"committed business\n")
+        self.git(self.host, "add", "business.txt")
+        self.git(self.host, "commit", "-q", "-m", "mature project without Makefile")
+        business.write_bytes(b"staged business\n")
+        self.git(self.host, "add", "business.txt")
+        business.write_bytes(b"unstaged business\n")
+        index = (self.host / ".git/index").read_bytes()
+        result = self.launch(self.host, "\n")
+        self.assertIn("[y/N]", result.stdout)
+        self.assertEqual((self.host / ".git/index").read_bytes(), index)
+        self.assertEqual(self.git(self.host, "show", ":business.txt"), "staged business")
+        self.assertEqual(business.read_bytes(), b"unstaged business\n")
+        self.assertEqual(self.git(self.host, "ls-files", "--", ".clarity", "Makefile"), "")
+        self.assertIn("include .clarity/Makefile", (self.host / "Makefile").read_text())
+        for target in ("review", "review-staged", "review-install"):
+            self.assertIn(".clarity/engine/runner/", self.run_command(["make", "-n", target]).stdout)
+        self.assertEqual(self.file_bytes(self.host / ".clarity/current"), self.committed_files("current"))
+        self.assertFalse((self.host / ".git/clarity/config.json").exists())
+        self.assertFalse((self.host / ".git/hooks/commit-msg").exists())
+        self.assertFalse((self.host / ".git/hooks/pre-commit").exists())
 
     def test_first_install_default_no_retains_host_build_and_one_make_loader(self):
         self.prepare_business_changes()
@@ -250,6 +285,22 @@ class InstallFlowTests(unittest.TestCase):
         self.assertEqual((self.host / "Makefile").read_bytes(), parent_make)
         self.run_command(["sh", str(child / ".clarity/update")], cwd=self.host)
         self.assertFalse((self.host / ".clarity").exists())
+
+    def test_utf8_nested_target_gets_its_own_loader_without_changing_parent_build(self):
+        self.prepare_business_changes()
+        child = self.host / "团队 空间" / "服务"
+        child.mkdir(parents=True)
+        parent_make = (self.host / "Makefile").read_bytes()
+        index = (self.host / ".git/index").read_bytes()
+        self.launch(child, "\n")
+        self.assertFalse((self.host / ".clarity").exists())
+        self.assertFalse((child / ".git").exists())
+        self.assertEqual((self.host / "Makefile").read_bytes(), parent_make)
+        self.assertEqual((self.host / ".git/index").read_bytes(), index)
+        self.assertEqual(self.read_manifest(child)["worktree_root"], str(child))
+        self.assertEqual(self.file_bytes(child / ".clarity/current"), self.committed_files("current"))
+        self.assertIn("include .clarity/Makefile", (child / "Makefile").read_text())
+        self.assertIn(".clarity/engine/runner/review.py", self.run_command(["make", "-n", "review"], cwd=child).stdout)
 
     def test_external_bootstrap_needs_no_installer_or_git_repository_in_target(self):
         target = self.root / "bootstrap-target"

@@ -5,8 +5,8 @@ This is the upstream source repository for Clarity. Its root contains `engine/`,
 | Location | Responsibility | During installation or update |
 | --- | --- | --- |
 | [engine/](engine/) | Review model, the single Principles source, workflow, role prompts, and programs | Deployed from the selected upstream Git commit |
-| [initial/](initial/) | Unfilled rule and case templates | Updated alongside the programs |
-| [current/](current/) | This project's own rules and fixed cases: its Registry | Never distributed from upstream; created from initial when missing during installation, with existing content preserved |
+| [initial/](initial/) | Factory recovery materials, including rule and case templates | Deployed unchanged from the selected upstream Git commit, alongside `engine/` |
+| [current/](current/) | Rules and fixed cases: the project's Registry | Copied from the selected release on first installation; existing host content is preserved |
 | [setup.py](setup.py) | Software installation, updates, source records, and Make integration | Deployed so the host can update itself later |
 | [Makefile](Makefile) | Upstream offline test entry | Not copied to the host; the installer generates the host's review entries |
 
@@ -39,13 +39,23 @@ The installation target is always `.clarity/` in the current directory. That dir
 
 The entry follows this sequence:
 
-1. Check whether the current directory already contains a structurally valid `.clarity` installation.
-2. If installed, ask whether to update, the default, or perform a fresh installation.
+1. Check whether the current directory already contains a `.clarity` directory, including an installation with missing program files.
+2. If present, ask whether to update, the default, or reinstall while keeping existing data.
 3. If update is selected, upgrade directly, retain the existing Git tracking choice, and do not ask about tracking again.
 4. For a fresh installation outside Git, install the files without managing Git.
 5. For a fresh installation inside Git, ask whether to add `.clarity` to Git tracking; the default is **no**.
 
-A fresh installation reinstalls the programs and asks about tracking again; it is not a factory reset. Existing `current/` content remains. Only a missing `current/` is created from the same release's `initial/`; upstream's own rules and cases are not distributed to the host.
+Installation and reinstallation use the selected committed release for both `engine/` and `initial/`, without generating or rewriting their contents. The source of the host's `current/` depends on what exists before installation:
+
+| Host state | Treatment of `current/` |
+| --- | --- |
+| No `.clarity/` directory | Copy the selected release's `current/`, including its existing rules and cases |
+| `.clarity/current/` already exists | Preserve every existing file and the directory's contents, including an empty or incomplete directory |
+| `.clarity/` exists but the entire `current/` directory is missing | Copy the same release's `initial/` verbatim into `current/`; this also applies to updates |
+
+Reinstallation restores missing factory programs and `initial/` while keeping existing `current/`; it asks about Git tracking again. If you manually delete everything in `.clarity/` except `current/`, run the installation command above again to restore the software. If you manually delete the whole `.clarity/` directory, that command performs a first installation with the selected release's `current/`. Missing individual user files are not filled into an existing `current/`, and its content is not merged or repaired automatically.
+
+Recovery copies `initial/` as it is. Its contents may still be templates requiring owner input before review; successful software restoration does not mean that those materials are ready for code review.
 
 Installation and updates generate the host Make entries regardless of the tracking choice. Choosing **no** excludes an untracked sidecar through the local Git `info/exclude`, leaves the index unchanged, and does not change the shared `.gitignore`. Choosing **yes** stages the programs, templates, current materials, and generated Make entries without committing. Existing staging of business files is preserved. Only the added integration is staged for the host Makefile, without including its other working-tree changes. Answering no does not automatically remove already tracked files from Git.
 
@@ -55,7 +65,7 @@ After installation, update directly:
 ./.clarity/update
 ```
 
-Updates replace the programs, templates, and any existing runtime snapshot while preserving `current/`, configuration, adopted-rule hashes, saved local basis text, and review state. They do not ask about Git tracking again. Directories without Git can also update.
+Updates replace the factory programs, `initial/`, and any existing runtime snapshot. While `current/` exists, updates and reinstallation retain its contents, model and timeout preferences, and adopted review basis. When the whole `current/` directory has to be restored, old adopted text is retired so it cannot override the restored materials; the next explicit review prepares their basis. Updates do not ask about Git tracking again. Directories without Git can also update.
 
 The first installation defaults to HTTPS from `https://github.com/yzhang37/code-clair.git`. Later updates reuse the selected source. To synchronize from a local repository, run in the installation directory:
 
@@ -81,13 +91,13 @@ The underlying `setup.py install` and `setup.py update` commands remain availabl
 
 At a Git root, Clarity continues using `clarity/` in the Git common directory to preserve existing review configuration and records. Outside Git, or when installed in a repository subdirectory, local state lives in `.clarity/.local/`. If the user later creates a Git repository, that state remains in use. The generated `.clarity/.gitignore` excludes local state and Python caches. Download caches are isolated by source, and a failed source switch leaves the selected source unchanged.
 
-Records include the current and previous sources, actual commits, deployed-file hashes and permissions, Git tracking choice, and Make entry. Updates refuse locally modified upstream files or new paths occupied by local files. When a tracked sidecar is cloned without its local records, updating first matches its files against upstream history, checking at most the latest 200 ancestors. The Makefile and ignore file generated by that version are checked too; a directory name alone does not establish ownership.
+Records include the current and previous sources, actual commits, deployed-file hashes and permissions, Git tracking choice, and Make entry. Missing factory files can be restored, while locally modified factory files and new paths occupied by local files remain protected against overwrite. When a tracked sidecar is cloned without its local records, updating first matches its remaining factory files against upstream history, checking at most the latest 200 ancestors. The Makefile and ignore file generated by that version are checked too; recognizing an existing directory does not grant ownership of arbitrary local files. Retained local installation records do not require manual cleanup merely because factory files or the whole sidecar were deleted.
 
 Installation and updates provide targets in `.clarity/Makefile` and an include entry in the effective host Makefile, creating a host Makefile when needed. This also applies when tracking is declined or the directory has no Git repository. Existing Makefile content and the default build target are preserved. Conflicting targets owned by others and locally modified managed blocks are not overwritten.
 
 The complete release is prepared before deployment, and a write failure restores the original files. When tracking is chosen, the Git index is also read back and restored within the same transaction. Installation, existing code review, and combined maintenance use the corresponding exclusive locks. Locks and backups left by forced termination or failed rollback require inspection and are not deleted based on age. Cross-file atomic switching during power loss is not guaranteed.
 
-Software installation does not automatically enable commit review or initialize Git. Code review requires Git snapshots and tracked code. A new review configuration can save the host's local rules separately from those code snapshots, as described below; this does not add `.clarity/current/` to Git. `reset` and automatic merging of local program edits are not implemented.
+Software installation does not automatically enable commit review or initialize Git. Code review requires Git snapshots and tracked code. A new review configuration can save the host's local rules separately from those code snapshots, as described below; this does not add `.clarity/current/` to Git. Clarity's own activated hook does not keep blocking commits after the whole sidecar has been removed; hooks owned by other tools are left untouched.
 
 ## UI language
 
@@ -103,15 +113,15 @@ Localization applies only to interface labels, help, errors, and progress. Rule 
 
 ## Running reviews in a host
 
-Review requires a Git repository with tracked code, Python 3.10+, and a working standalone Codex CLI. After installation, fill `.clarity/current/rules.md` with the host's own code standards, then run from the host directory:
+Review requires a Git repository with tracked code, Python 3.10+, and a working standalone Codex CLI. First installation includes the selected release's existing rules and cases. Check that `.clarity/current/rules.md` expresses the standards you want to use, then run from the host directory:
 
 ```sh
 make review
 ```
 
-The installer prepares the files and Make entries; the owner supplies the actual project rules. Missing, blank, or unchanged rule templates are rejected with a message to fill the rules and run again. The unchanged case template is not a formal fixture in a new local-basis configuration. Code review can proceed without fixtures, recording `no_coverage`; this does not establish that the rules passed fixture validation.
+The installer copies release materials and prepares Make entries. It does not rewrite the rules for the host or certify their quality. Missing or blank rules are rejected when preparing review, with a message to fill the rules and run again. Rules are not rejected merely because they match `initial/`; their quality and usability are checked by the actual review. Software installation and recovery impose no review-readiness requirement on `initial/`. The unchanged case template is not a formal fixture in a new local-basis configuration. Code review can proceed without fixtures, recording `no_coverage`; this does not establish that the rules passed fixture validation.
 
-On the first `make review` or `make review-staged`, missing configuration and the runtime engine snapshot are prepared automatically, without installing a Git hook. Existing configuration is retained. When HEAD contains none of the selected basis materials, the new configuration saves the selected local text as its adopted basis. Later local edits are candidates checked against that saved text; running review again does not adopt them automatically. The saved basis is bound to the worktree, its contents are hashed, and the current local inputs are read again before a result is accepted. Older configurations retain their Git-based basis selection. Software updates preserve the configuration and adopted text.
+On the first `make review` or `make review-staged`, missing configuration and the runtime engine snapshot are prepared automatically, without installing a Git hook. Complete existing configuration is retained while `current/` is preserved. A new configuration, or one rebuilt after restoring the whole `current/`, saves the active local materials as its adopted basis, including when HEAD contains older materials. Later local edits are candidates checked against that saved text; running review again does not adopt them automatically. The saved basis is bound to the worktree, its contents are hashed, and the current local inputs are read again before a result is accepted. Complete existing Git-based configurations retain their Git basis semantics. Restoring an entirely missing `current/` retires the prior adoption, as described above.
 
 Daily host entries:
 

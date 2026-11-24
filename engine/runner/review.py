@@ -540,6 +540,8 @@ def review(repo, target, baseline, config, state, config_path=None):
     案例仍作为待审文件完整覆盖，但不进入代码审核的规则引用集合。
     后续代码阶段只接收同版验收的匹配状态，完整逐例记录单独保存。
     """
+    if config.get("basis_reset"):
+        raise Incomplete(tr('Review materials were recreated; run make review to adopt the current local materials before committing.'))
     engine_bytes = {p: path.read_bytes() for p, path in engine_sources(ENGINE).items()}
     actual_engine = engine_digest(engine_bytes)
     texts = {p: data.decode("utf-8") for p, data in engine_bytes.items() if p.endswith(".md")}
@@ -791,6 +793,23 @@ def main():
     state.mkdir(parents=True, exist_ok=True)
     try:
         config_path = Path(args.config) if args.config else state / "config.json"
+        # hook 不复活被用户删除的 sidecar；高级外置安装没有此绑定，继续使用原有 Git 资料路径。
+        if args.command == "hook":
+            try:
+                installed_config = json.loads(config_path.read_text())
+                if not isinstance(installed_config, dict):
+                    raise ValueError(tr('Model configuration must be a JSON object'))
+            except (OSError, ValueError):
+                if not (repo / ".clarity").is_dir():
+                    return 0
+                raise
+            installed_project = installed_config.get("sidecar_project")
+            if installed_project is None and any(path.startswith(".clarity/current") for path in
+                                                 installed_config.get("basis_selections", installed_config.get("basis", []))):
+                if not (repo / ".clarity").is_dir():
+                    return 0
+            if installed_project and not (Path(installed_project) / ".clarity/engine/runner/review.py").is_file():
+                return 0
         with run_lock(state):
             if args.command == "review" and not args.config:
                 prepare_review(repo, project)

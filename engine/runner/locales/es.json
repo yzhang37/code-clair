@@ -234,7 +234,6 @@
     "No regular cases directory": "No hay un directorio regular de casos",
     "No regular fixtures directory: ": "No hay un directorio regular de fixtures: ",
     "No sidecar is installed; run install first.": "No hay ningún sidecar instalado; ejecuta primero install.",
-    "No structurally valid Clarity installation exists here; use the first-install entry.": "Aquí no existe ninguna instalación de Clarity con una estructura válida; usa el punto de acceso de primera instalación.",
     "No valid target-repository basis files were found; create project .clarity materials or select them with --basis.": "No se encontraron archivos de base válidos en el repositorio de destino; crea los materiales .clarity del proyecto o selecciónalos con --basis.",
     "Non-UTF-8 files need an explicitly supported review method: ": "Los archivos que no son UTF-8 necesitan un método de revisión admitido explícitamente: ",
     "Not a manageable regular file: ": "No es un archivo regular que se pueda gestionar: ",
@@ -246,7 +245,6 @@
     "Owned commit hook removed; rules, cases, and review records were retained.": "Se eliminó el hook de commit propio; se conservaron las reglas, los casos y los registros de revisión.",
     "Owned pre-commit hook removed: ": "Hook pre-commit propio eliminado: ",
     "Passed: the complete current snapshot was reviewed": "Superado: se revisó la instantánea actual completa",
-    "Project current was preserved; initial is copied only when current is missing on install. Review activation is unchanged.": "Se conservó el current del proyecto; initial solo se copia si current no existe al instalar. La activación de la revisión no ha cambiado.",
     "Rationale check belongs to different inputs": "La comprobación de la justificación corresponde a otras entradas",
     "Rationale check has an invalid case quotation": "La comprobación de la justificación tiene una cita de caso no válida",
     "Rationale check has an invalid incomplete-reason type": "El motivo de la falta de finalización de la comprobación de la justificación tiene un tipo no válido",
@@ -379,6 +377,10 @@
     "Local review materials changed during review; rerun with the complete new input.": "Los materiales locales cambiaron durante la revisión; vuelva a ejecutarla con las entradas nuevas completas.",
     "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "Las reglas locales pertenecen a otro árbol de trabajo; no se puede reutilizar aquí la versión adoptada.",
     "Saved local review rules are missing or invalid.": "Las reglas locales guardadas faltan o no son válidas.",
-    "Start a code review with: make review": "Iniciar una revisión de código: make review"
+    "Start a code review with: make review": "Iniciar una revisión de código: make review",
+    "Existing current was preserved. A new sidecar uses release current; a missing current in an existing sidecar is restored from initial.": "Se conservó el current existente. Un sidecar nuevo usa el current de la versión publicada; si falta current en un sidecar existente, se restaura desde initial.",
+    "No .clarity directory exists here; use the first-install entry.": "Aquí no existe ningún directorio .clarity; usa el punto de acceso de primera instalación.",
+    "Review materials were recreated; run make review to adopt the current local materials before committing.": "Se recrearon los materiales de revisión; ejecuta make review para adoptar los materiales locales actuales antes de hacer un commit.",
+    "Selected release has no initial project rules in current/rules.md.": "La versión seleccionada no contiene reglas iniciales del proyecto en current/rules.md."
   }
 }
