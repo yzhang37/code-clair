@@ -372,6 +372,13 @@
     "independent code review, cross-check, and summary": "独立したコードレビュー、反証確認、集約",
     "cross-check and summary": "反証確認と集約",
     "summary": "集約",
-    "final feedback and input consistency check": "最終フィードバックと入力の整合性確認"
+    "final feedback and input consistency check": "最終フィードバックと入力の整合性確認",
+    "Code review requires a Git repository with tracked code. Installation does not initialize Git.": "コードレビューには、追跡対象のコードを含む Git リポジトリが必要です。インストールでは Git を初期化しません。",
+    "First review needs project rules. Fill .clarity/current/rules.md, then run make review again.": "初回レビューにはプロジェクトのルールが必要です。.clarity/current/rules.md を記入し、make review を再実行してください。",
+    "Local review materials are binary or exceed 1.5 MB.": "ローカルのレビュー資料がバイナリであるか、1.5 MB を超えています。",
+    "Local review materials changed during review; rerun with the complete new input.": "レビュー中にローカル資料が変更されました。新しい入力全体で再実行してください。",
+    "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "ローカルのレビュールールは別の作業ツリーに属しているため、採用済みの版をここでは再利用できません。",
+    "Saved local review rules are missing or invalid.": "保存済みのローカルレビュールールが見つからないか、無効です。",
+    "Start a code review with: make review": "コードレビューを開始：make review"
   }
 }

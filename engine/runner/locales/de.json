@@ -372,6 +372,13 @@
     "independent code review, cross-check, and summary": "unabhängige Codeprüfung, Gegenprüfung und Zusammenfassung",
     "cross-check and summary": "Gegenprüfung und Zusammenfassung",
     "summary": "Zusammenfassung",
-    "final feedback and input consistency check": "abschließende Rückmeldung und Prüfung der Eingabekonsistenz"
+    "final feedback and input consistency check": "abschließende Rückmeldung und Prüfung der Eingabekonsistenz",
+    "Code review requires a Git repository with tracked code. Installation does not initialize Git.": "Die Codeprüfung benötigt ein Git-Repository mit versioniertem Code. Die Installation initialisiert Git nicht.",
+    "First review needs project rules. Fill .clarity/current/rules.md, then run make review again.": "Die erste Prüfung benötigt Projektregeln. Füllen Sie .clarity/current/rules.md aus und führen Sie make review erneut aus.",
+    "Local review materials are binary or exceed 1.5 MB.": "Die lokalen Prüfmaterialien sind binär oder überschreiten 1.5 MB.",
+    "Local review materials changed during review; rerun with the complete new input.": "Die lokalen Prüfmaterialien wurden während der Prüfung geändert; starten Sie mit den vollständigen neuen Eingaben erneut.",
+    "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "Die lokalen Prüfregeln gehören zu einem anderen Arbeitsverzeichnis; die übernommene Version kann hier nicht wiederverwendet werden.",
+    "Saved local review rules are missing or invalid.": "Die gespeicherten lokalen Prüfregeln fehlen oder sind ungültig.",
+    "Start a code review with: make review": "Codeprüfung starten: make review"
   }
 }

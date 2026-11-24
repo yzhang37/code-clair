@@ -54,14 +54,14 @@ class InstallFlowTests(unittest.TestCase):
         self.git(self.host, "add", "Makefile")
         makefile.write_text(makefile.read_text() + "UNSTAGED_BUSINESS = yes\n")
 
-    def test_no_git_installs_and_upgrades_without_creating_git_or_project_makefile(self):
+    def test_no_git_installs_make_entry_and_upgrades_without_creating_git(self):
         target = self.root / "not-a-git-project"
         target.mkdir()
         first = self.launch(target)
         self.assertNotIn("Git 跟踪", first.stdout)
         self.assertFalse((target / ".git").exists())
-        self.assertFalse((target / "Makefile").exists())
-        self.assertEqual({p.name for p in target.iterdir()}, {".clarity"})
+        self.assertIn("include .clarity/Makefile", (target / "Makefile").read_text())
+        self.assertEqual({p.name for p in target.iterdir()}, {".clarity", "Makefile"})
         self.assertEqual((target / ".clarity/current/rules.md").read_bytes(),
                          (target / ".clarity/initial/rules.md").read_bytes())
         rule = target / ".clarity/current/rules.md"
@@ -84,21 +84,25 @@ class InstallFlowTests(unittest.TestCase):
         result = self.launch(self.host, "\n")
         self.assertIn("[y/N]", result.stdout)
         self.assertEqual((self.host / ".git/index").read_bytes(), index)
-        self.assertEqual((self.host / "Makefile").read_bytes(), makefile)
+        self.assertTrue((self.host / "Makefile").read_bytes().startswith(makefile))
+        self.assertEqual(self.run_command(["make", "-n"]).stdout.strip(), "echo existing-build")
         self.assertEqual((self.host / "business.txt").read_text(), "unstaged business edit\n")
         self.assertEqual(self.git(self.host, "show", ":business.txt"), "staged business edit")
         self.assertEqual(self.git(self.host, "ls-files", "--", ".clarity"), "")
         self.assertEqual(self.git(self.host, "check-ignore", ".clarity/setup.py"), ".clarity/setup.py")
         self.assertFalse(self.read_manifest(self.host)["track_git"])
 
-    def test_first_install_default_no_does_not_rearrange_a_preexisting_make_loader(self):
+    def test_first_install_default_no_retains_host_build_and_one_make_loader(self):
         self.prepare_business_changes()
         path = self.host / "Makefile"
         original = b"# Clarity sidecar begin\ninclude .clarity/Makefile\n# Clarity sidecar end\n" + path.read_bytes()
         path.write_bytes(original)
         index = (self.host / ".git/index").read_bytes()
         self.launch(self.host, "n\n")
-        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(path.read_bytes().count(b"include .clarity/Makefile"), 1)
+        self.assertIn(b"STAGED_BUSINESS = yes", path.read_bytes())
+        self.assertIn(b"UNSTAGED_BUSINESS = yes", path.read_bytes())
+        self.assertEqual(self.run_command(["make", "-n"]).stdout.strip(), "echo existing-build")
         self.assertEqual((self.host / ".git/index").read_bytes(), index)
 
     def test_yes_stages_only_sidecar_without_business_or_local_cache(self):
@@ -268,7 +272,7 @@ class InstallFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((target / ".clarity/update").is_file())
         self.assertFalse((target / ".git").exists())
-        self.assertEqual({p.name for p in target.iterdir()}, {".clarity"})
+        self.assertEqual({p.name for p in target.iterdir()}, {".clarity", "Makefile"})
 
 
 if __name__ == "__main__":

@@ -372,6 +372,13 @@
     "independent code review, cross-check, and summary": "独立代码首审、交叉反证及汇总",
     "cross-check and summary": "交叉反证及汇总",
     "summary": "汇总",
-    "final feedback and input consistency check": "最终反馈与输入一致性核对"
+    "final feedback and input consistency check": "最终反馈与输入一致性核对",
+    "Code review requires a Git repository with tracked code. Installation does not initialize Git.": "代码审核需要已有 Git 仓库及已跟踪代码；安装不会初始化 Git。",
+    "First review needs project rules. Fill .clarity/current/rules.md, then run make review again.": "首次审核需要项目规则。请填写 .clarity/current/rules.md，再运行 make review。",
+    "Local review materials are binary or exceed 1.5 MB.": "本机审核资料为二进制或超过 1.5 MB。",
+    "Local review materials changed during review; rerun with the complete new input.": "审核期间本机资料发生变化；请使用完整的新输入重新运行。",
+    "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "本机审核规则属于另一工作树，不能在此复用已采用的版本。",
+    "Saved local review rules are missing or invalid.": "已保存的本机审核规则缺失或无效。",
+    "Start a code review with: make review": "开始代码审核：make review"
   }
 }

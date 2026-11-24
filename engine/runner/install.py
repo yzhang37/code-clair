@@ -204,17 +204,94 @@ def replace_file(path: Path, content: bytes, mode: int) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def install(args: argparse.Namespace) -> None:
-    """install() 先核对完整输入和 hook 所有权，再保存外部引擎、配置与 pre-commit 入口。
+def local_basis(repo: Path, selections: list[str], ignored=None) -> dict[str, dict]:
+    """local_basis() 冻结明确选择的本机资料，不把未跟踪业务代码混入 Git 审核对象。
+
+    路径成员、原文与模式共同构成快照；删除与清空留给新旧配对表达，链接及二进制不作普通正文。
+    尚未改写的案例底稿不是正式 fixture，忽略它不表示已取得案例覆盖；填写后便进入候选集合。
+    扫描与散列随选中路径及其正文总量增长，单次冻结的正文上限与审核输入容量一致。
+    """
+    result, size = {}, 0
+    template = Path(__file__).resolve().parents[2] / "initial/cases/case.md"
+    untouched_case = template.read_bytes() if template.is_file() else None
+    if ignored is None:
+        ignored = ({".clarity/current/cases/case.md": hashlib.sha256(untouched_case).hexdigest()}
+                   if untouched_case is not None else {})
+    for selection in selections:
+        relative = Path(selection)
+        if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
+            raise InstallError(tr('Basis must be an explicit relative path inside the repository: ') + selection)
+        selected = repo / relative
+        paths = [selected]
+        if selected.is_dir() and not selected.is_symlink():
+            paths.extend(sorted(selected.rglob("*")))
+        for path in paths:
+            for parent in (path, *path.parents):
+                if parent == repo:
+                    break
+                if parent.is_symlink():
+                    raise InstallError(tr('Basis path cannot be a symbolic link: ') + str(parent))
+            if not path.exists() or path.is_dir() or path.name == ".gitkeep":
+                continue
+            if not path.is_file():
+                raise InstallError(tr('Installation dependency is missing or is not a regular file: ') + str(path))
+            name = path.relative_to(repo).as_posix()
+            if name == ENGINE_BASIS_ROOT or name.startswith(ENGINE_BASIS_ROOT + "/"):
+                raise InstallError(tr('Engine materials cannot be used as product rules: ') + name)
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() == ignored.get(name):
+                continue
+            size += len(raw)
+            if size > 1_500_000 or b"\0" in raw:
+                raise InstallError(tr('Local review materials are binary or exceed 1.5 MB.'))
+            result[name] = {"text": raw.decode("utf-8"), "oid": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                            "mode": "100755" if path.stat().st_mode & 0o111 else "100644"}
+    return dict(sorted(result.items()))
+
+
+def prepare_review(repo: Path, project: Path | None = None) -> None:
+    """prepare_review() 仅为第一次手动审核建立缺失配置和运行快照，不安装提交 hook。
+
+    调用方须持有 running.lock；已有配置不重建，避免重置模型参数或把本轮候选重新采用。
+    Git 尚无所选资料时，保存首次明确使用的本机原文；之后的改写只能作为候选接受核对。
+    未填规则不能成为审核依据，用户须先表达项目标准，安装器不代为编造规则。
+    """
+    common = Path(git_output(repo, "rev-parse", "--git-common-dir"))
+    state = (common if common.is_absolute() else repo / common).resolve() / "clarity"
+    if (state / "config.json").exists():
+        return
+    project = project or repo
+    selections = [(project / name).relative_to(repo).as_posix() for name in DEFAULT_BASIS_SELECTIONS]
+    rules = project / ".clarity/current/rules.md"
+    initial = Path(__file__).resolve().parents[2] / "initial/rules.md"
+    case_template = initial.parent / "cases/case.md"
+    ignored = ({selections[1] + "/case.md": hashlib.sha256(case_template.read_bytes()).hexdigest()}
+               if case_template.is_file() else {})
+    materials = local_basis(repo, selections, ignored)
+    if (not rules.is_file() or not materials.get(selections[0], {}).get("text", "").strip()
+            or (initial.is_file() and rules.read_bytes() == initial.read_bytes())):
+        raise InstallError(tr('First review needs project rules. Fill .clarity/current/rules.md, then run make review again.'))
+    head = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "HEAD", "--",
+                           *selections], capture_output=True)
+    local = head.returncode != 0 or not head.stdout.strip()
+    args = argparse.Namespace(repo=str(repo), basis=selections, codex_bin=None, model=None, reviewers=2, timeout=600)
+    install(args, with_hook=False, adopted_local=materials if local else None, ignored_local=ignored)
+
+
+def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ignored_local=None) -> None:
+    """install() 核对完整输入后保存外部引擎及配置，仅显式启用时写入 pre-commit。
 
     引擎放在 Git common dir 中，与候选 tracked 内容分离；不修改资料、Git 配置或业务代码。
     写入失败时恢复此前引擎、配置与已写 hook；本地拥有者仍可卸载或绕过此入口。
     """
     repo, common_dir, hooks_dir = repository_paths(Path(args.repo))
-    check_hook_ownership(hooks_dir)
+    if with_hook:
+        check_hook_ownership(hooks_dir)
     source_root = Path(__file__).resolve().parent.parent
     files = {name: path.read_bytes() for name, path in engine_sources(source_root).items()}
-    adopted_basis = basis_files(repo, args.basis)
+    # 首次手动审核允许尚无案例目录；仍在配置保留完整选择边界，以便后续新增案例作为候选进入。
+    requested = args.basis if with_hook else [name for name in args.basis if (repo / name).exists()]
+    adopted_basis = basis_files(repo, requested)
     executable = codex_executable(args.codex_bin)
     clarity_dir = common_dir / "clarity"
     engine_dir = clarity_dir / "engine"
@@ -238,12 +315,21 @@ def install(args: argparse.Namespace) -> None:
         "timeout": args.timeout,
         "engine_digest": engine_digest(files),
     }
+    if adopted_local is not None:
+        config.update(basis_source="local", basis_snapshot=adopted_local,
+                      basis_worktree=str(repo), basis=sorted(adopted_local))
+        config["basis_hashes"] = {name: hashlib.sha256(entry["text"].encode()).hexdigest()
+                                  for name, entry in adopted_local.items()}
+        config["basis_ignored"] = ignored_local or {}
+    if not with_hook:
+        config["cases_root"] = args.basis[1].rstrip("/") + "/"
     config_bytes = (json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     original_hooks = {name: ((hooks_dir / name).read_bytes(), stat.S_IMODE((hooks_dir / name).stat().st_mode))
-                      for name in HOOK_NAMES if (hooks_dir / name).exists()}
+                      for name in HOOK_NAMES if with_hook and (hooks_dir / name).exists()}
     original_config = config_path.read_bytes() if config_path.exists() else None
     clarity_dir.mkdir(parents=True, exist_ok=True)
-    hooks_dir.mkdir(parents=True, exist_ok=True)
+    if with_hook:
+        hooks_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".install-", dir=clarity_dir) as temporary_name:
         temporary = Path(temporary_name)
         staged_engine = temporary / "engine"
@@ -257,14 +343,15 @@ def install(args: argparse.Namespace) -> None:
         written_hooks: list[str] = []
         try:
             # 再检查一次以缩短首次检查和替换间的窗口，但不声称能锁住其他本机写入者。
-            check_hook_ownership(hooks_dir)
+            if with_hook:
+                check_hook_ownership(hooks_dir)
             if engine_dir.exists():
                 os.replace(engine_dir, previous_engine)
                 moved_previous = True
             os.replace(staged_engine, engine_dir)
             installed_engine = True
             replace_file(config_path, config_bytes, 0o600)
-            for name in HOOK_NAMES:
+            for name in HOOK_NAMES if with_hook else ():
                 replace_file(hooks_dir / name, hook_script(name, engine_dir, config_path), 0o755)
                 written_hooks.append(name)
         except BaseException:
@@ -284,7 +371,8 @@ def install(args: argparse.Namespace) -> None:
             if moved_previous:
                 os.replace(previous_engine, engine_dir)
             raise
-    print(tr('Local review pre-commit hook installed: ') + str(hooks_dir / "pre-commit"))
+    if with_hook:
+        print(tr('Local review pre-commit hook installed: ') + str(hooks_dir / "pre-commit"))
     print(tr('Shared engine and configuration: ') + str(clarity_dir))
     print(tr('Review scope: all current tracked content; installation did not run a model review.'))
 

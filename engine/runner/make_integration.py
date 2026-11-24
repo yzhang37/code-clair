@@ -20,7 +20,9 @@ REVIEW_TARGETS = (
 )
 BEGIN_MARKER = b"# Clarity sidecar begin"
 END_MARKER = b"# Clarity sidecar end"
-INCLUDE_BLOCK = BEGIN_MARKER + b"\ninclude .clarity/Makefile\n" + END_MARKER + b"\n"
+# 入口可留在已跟踪的宿主 Makefile；同事未安装本机 sidecar 时，仍须能够运行原有构建。
+INCLUDE_BLOCK = BEGIN_MARKER + b"\n-include .clarity/Makefile\n" + END_MARKER + b"\n"
+LEGACY_INCLUDE_BLOCK = BEGIN_MARKER + b"\ninclude .clarity/Makefile\n" + END_MARKER + b"\n"
 
 
 def rendered_sidecar_makefile() -> bytes:
@@ -80,7 +82,7 @@ def _remove_managed_block(existing: bytes) -> bytes:
         return existing
     if len(markers) != 2 or markers[0][0] != BEGIN_MARKER or markers[1][0] != END_MARKER:
         raise ValueError(tr('Clarity Makefile managed block is missing, duplicated, or out of order.'))
-    if existing[markers[0][1]:markers[1][2]] != INCLUDE_BLOCK:
+    if existing[markers[0][1]:markers[1][2]] not in (INCLUDE_BLOCK, LEGACY_INCLUDE_BLOCK):
         raise ValueError(tr('Clarity Makefile managed block has local changes; it was not overwritten.'))
     return existing[:markers[0][1]] + existing[markers[1][2]:]
 

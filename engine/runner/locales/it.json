@@ -372,6 +372,13 @@
     "independent code review, cross-check, and summary": "revisione indipendente del codice, controverifica e riepilogo",
     "cross-check and summary": "controverifica e riepilogo",
     "summary": "riepilogo",
-    "final feedback and input consistency check": "riscontro finale e verifica della coerenza degli input"
+    "final feedback and input consistency check": "riscontro finale e verifica della coerenza degli input",
+    "Code review requires a Git repository with tracked code. Installation does not initialize Git.": "La revisione del codice richiede un repository Git con codice tracciato. L’installazione non inizializza Git.",
+    "First review needs project rules. Fill .clarity/current/rules.md, then run make review again.": "La prima revisione richiede le regole del progetto. Compilare .clarity/current/rules.md, quindi eseguire di nuovo make review.",
+    "Local review materials are binary or exceed 1.5 MB.": "I materiali locali di revisione sono binari o superano 1.5 MB.",
+    "Local review materials changed during review; rerun with the complete new input.": "I materiali locali sono cambiati durante la revisione; ripetere con i nuovi input completi.",
+    "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "Le regole locali appartengono a un’altra copia di lavoro; la versione adottata non può essere riutilizzata qui.",
+    "Saved local review rules are missing or invalid.": "Le regole locali salvate sono mancanti o non valide.",
+    "Start a code review with: make review": "Avviare una revisione del codice: make review"
   }
 }

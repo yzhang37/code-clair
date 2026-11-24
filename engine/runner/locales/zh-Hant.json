@@ -372,6 +372,13 @@
     "independent code review, cross-check, and summary": "獨立程式碼初審、交叉反證及彙總",
     "cross-check and summary": "交叉反證及彙總",
     "summary": "彙總",
-    "final feedback and input consistency check": "最終回饋與輸入一致性核對"
+    "final feedback and input consistency check": "最終回饋與輸入一致性核對",
+    "Code review requires a Git repository with tracked code. Installation does not initialize Git.": "程式碼審核需要已有 Git 儲存庫及已追蹤程式碼；安裝不會初始化 Git。",
+    "First review needs project rules. Fill .clarity/current/rules.md, then run make review again.": "首次審核需要專案規則。請填寫 .clarity/current/rules.md，再執行 make review。",
+    "Local review materials are binary or exceed 1.5 MB.": "本機審核資料為二進位或超過 1.5 MB。",
+    "Local review materials changed during review; rerun with the complete new input.": "審核期間本機資料發生變化；請使用完整的新輸入重新執行。",
+    "Local review rules belong to another worktree; the saved adoption cannot be reused here.": "本機審核規則屬於另一工作樹，不能在此重用已採用的版本。",
+    "Saved local review rules are missing or invalid.": "已儲存的本機審核規則遺失或無效。",
+    "Start a code review with: make review": "開始程式碼審核：make review"
   }
 }

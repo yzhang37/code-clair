@@ -591,14 +591,13 @@ def install(args: argparse.Namespace) -> dict:
             names = {entry.name for entry in repo.iterdir()}
             effective = next((name for name in ("GNUmakefile", "makefile", "Makefile") if name in names), "Makefile")
             original_make = read_file(repo / effective)
-            managed_make = args.command == "update" and original_make is not None and make.BEGIN_MARKER in original_make[0]
-            if promote or make_name or managed_make or legacy_makefile is not None:
-                if make_name and effective != make_name:
-                    raise SetupError(tr('The effective host Makefile has changed; check the original entry first.'))
-                make_name = effective
-                host_make = repo / make_name
-                changes[host_make] = (make.host_makefile(original_make[0] if original_make else None, legacy_makefile),
-                                      original_make[1] if original_make else 0o644)
+            # 审核入口与 Git 归属分开：默认不跟踪仍须可直接运行 make review；只有 promote 才改索引。
+            if make_name and effective != make_name:
+                raise SetupError(tr('The effective host Makefile has changed; check the original entry first.'))
+            make_name = effective
+            host_make = repo / make_name
+            changes[host_make] = (make.host_makefile(original_make[0] if original_make else None, legacy_makefile),
+                                  original_make[1] if original_make else 0o644)
             current = sidecar / "current"
             if os.path.lexists(current):
                 if current.is_symlink() or not current.is_dir():
@@ -689,6 +688,7 @@ def deliver(args: argparse.Namespace) -> int:
     print(tr('Upstream source: ') + record["source"])
     print(tr('Actual commit: ') + record["commit"])
     print(tr('Project current was preserved; initial is copied only when current is missing on install. Review activation is unchanged.'))
+    print(tr('Start a code review with: make review'))
     return 0
 
 

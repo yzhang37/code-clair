@@ -50,7 +50,24 @@ if [ "${1:-}" = --install ]; then
         ui 'Another program owns the existing commit-msg hook; it was not overwritten.' >&2
         exit 2
     fi
-    python3 .clarity/engine/runner/install.py --repo . --timeout 600 >/dev/null || exit 2
+    # 首次准备与手动审核共用锁；已有配置原样保留，启用 hook 不重新采用规则或重置模型参数。
+    python3 - "$repo" <<'PY' || exit 2
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path('.clarity/engine/runner').resolve()))
+from install import prepare_review, InstallError
+from review import control_dir, run_lock, Incomplete
+repo = Path(sys.argv[1])
+state = control_dir(repo)
+state.mkdir(parents=True, exist_ok=True)
+try:
+    with run_lock(state):
+        prepare_review(repo)
+except (InstallError, Incomplete, OSError, ValueError) as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(2)
+PY
+    mkdir -p "$hooks" || exit 2
     cp .clarity/engine/runner/commit-msg "$hooks/commit-msg" || exit 2
     chmod +x "$hooks/commit-msg" || exit 2
     if is_owned_hook "$hooks/pre-commit"; then

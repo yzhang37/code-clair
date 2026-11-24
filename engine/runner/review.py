@@ -20,7 +20,7 @@ import subprocess
 import time
 
 from codex_model import CodexModel, ModelFailure
-from install import engine_sources, engine_digest, ENGINE_BASIS_ROOT, InstallError
+from install import engine_sources, engine_digest, ENGINE_BASIS_ROOT, InstallError, local_basis, prepare_review
 
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -60,12 +60,14 @@ def control_dir(repo):
     return (value if value.is_absolute() else repo / value).resolve() / "clarity"
 
 
-def repository_identity(repo, basis):
+def repository_identity(repo, basis, local=False):
     """repository_identity() 向目标 Git 确认仓库身份和资料归属，不以审核器所在目录推测目标。"""
     root = Path(git(repo, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+    origin = ("所有文件键及依据路径均相对于此目标仓库根目录；代码来自固定 Git 目标树和基线树。正式依据是首次手动审核明确采用并保存于配置的本机原文，候选依据来自本次冻结的本机资料；本机资料的 sha256 标识不是 Git 对象。"
+              if local else "所有文件键及依据路径均相对于此目标仓库根目录；正式与候选依据由调用器从该仓库的固定目标树和基线树按显式选择取得，正式版本按基线或已采用原文哈希确定。")
     return {"worktree_root": str(root), "git_common_dir": str(control_dir(root).parent),
             "relative_path_base": "worktree_root", "selected_basis_paths": sorted(basis),
-            "basis_origin": "所有文件键及依据路径均相对于此目标仓库根目录；正式与候选依据由调用器从该仓库的固定目标树和基线树按显式选择取得，正式版本按基线或已采用原文哈希确定。"}
+            "basis_origin": origin}
 
 
 def tree_id(repo, target):
@@ -439,7 +441,7 @@ def run_fixture(model, directory, name, snapshot, path, document, rules, view, r
 
 
 def check_fixtures(model, directory, snapshot, adopted, candidates, responses, texts, repository, pending_findings=None,
-                   proposed_rules=None):
+                   proposed_rules=None, cases_root=CURRENT_CASES):
     """check_fixtures() 用固定案例预期约束既有和候选规则，不让候选借核对通过自行生效。
 
     候选规则还须满足旧案例；改写案例时同时保留旧预期核对，避免改答案掩盖回归。
@@ -447,7 +449,7 @@ def check_fixtures(model, directory, snapshot, adopted, candidates, responses, t
     没有案例时保留 no_coverage，使只选规则的审核可继续而不声称已做规则回归。
     每个已验证案例的不匹配立即保留，后续案例失败不能抹去已取得的待核实发现。
     """
-    is_case = lambda path: path.startswith(CURRENT_CASES)
+    is_case = lambda path: path.startswith(cases_root)
     rules = {p: f for p, f in adopted.items() if not is_case(p)}
     cases = {p: f for p, f in adopted.items() if is_case(p)}
     proposed = (proposed_rules if proposed_rules is not None else
@@ -547,17 +549,35 @@ def review(repo, target, baseline, config, state, config_path=None):
     current, before = read_tree(repo, current_tree), read_tree(repo, baseline_tree)
     if not current:
         raise Incomplete(tr('Review target has no tracked text; it cannot pass automatically'))
-    pairs = basis_pairs(before, current, config)
+    local_materials = None
+    if config.get("basis_source") == "local":
+        if config.get("basis_worktree") != str(repo.resolve()):
+            raise Incomplete(tr('Local review rules belong to another worktree; the saved adoption cannot be reused here.'))
+        adopted = config.get("basis_snapshot")
+        if not isinstance(adopted, dict) or not adopted:
+            raise Incomplete(tr('Saved local review rules are missing or invalid.'))
+        for name, entry in adopted.items():
+            if (not isinstance(entry, dict) or not isinstance(entry.get("text"), str)
+                    or entry.get("mode") not in {"100644", "100755"}
+                    or entry.get("oid") != "sha256:" + hashlib.sha256(entry["text"].encode()).hexdigest()):
+                raise Incomplete(tr('Saved local review rules are missing or invalid.'))
+        local_materials = local_basis(repo, config["basis_selections"], config.get("basis_ignored", {}))
+        pairs = basis_pairs(adopted, local_materials, config)
+    else:
+        pairs = basis_pairs(before, current, config)
     basis = list(pairs)
     rules, candidate_rules, changes = basis_materials(pairs, config)
     if not rules:
         raise Incomplete(tr('Only new candidate rules are available; the owner must adopt them explicitly before they can govern the same change'))
-    code_rules = {p: f for p, f in rules.items() if not p.startswith(CURRENT_CASES)}
+    cases_root = config.get("cases_root", CURRENT_CASES)
+    code_rules = {p: f for p, f in rules.items() if not p.startswith(cases_root)}
     responses_file = state / "responses.json"
     responses = json.loads(responses_file.read_text()) if responses_file.exists() else []
-    repository = repository_identity(repo, basis)
+    repository = repository_identity(repo, basis, local_materials is not None)
     identity = {"tree": current_tree, "baseline": baseline_tree, "config": config,
                 "workflow": digest(texts), "responses": responses, "target_repository": repository}
+    if local_materials is not None:
+        identity["local_materials"] = local_materials
     snapshot = digest(identity)
     directory = state / "runs" / snapshot
     directory.mkdir(parents=True, exist_ok=True)
@@ -587,11 +607,11 @@ def review(repo, target, baseline, config, state, config_path=None):
                          "engine_model": packet["engine_model"],
                          "principles": {p: numbered(f["text"]) for p, f in principles.items()},
                          "adopted_rules": packet["adopted_rules"],
-                         "fixtures": {p: numbered(f["text"]) for p, f in rules.items() if p.startswith(CURRENT_CASES)},
+                         "fixtures": {p: numbered(f["text"]) for p, f in rules.items() if p.startswith(cases_root)},
                          "candidate_rule_changes": {p: numbered(f["text"]) for p, f in candidate_rules.items()
-                                                    if not p.startswith(CURRENT_CASES)},
+                                                    if not p.startswith(cases_root)},
                          "candidate_fixture_changes": {p: numbered(f["text"]) for p, f in candidate_rules.items()
-                                                       if p.startswith(CURRENT_CASES)},
+                                                       if p.startswith(cases_root)},
                          "basis_changes": changes,
                          "source_context": {str(Path(p).parent / "README.md"): numbered(current[str(Path(p).parent / "README.md")]["text"])
                                             for p in rules if str(Path(p).parent / "README.md") in current},
@@ -612,9 +632,9 @@ def review(repo, target, baseline, config, state, config_path=None):
                 raise Incomplete(tr('Selected material is empty; it cannot serve as a valid basis or be silently skipped: ') + "、".join(empty_current))
             incomplete_scope = tr('fixture compatibility checks and subsequent code review')
             proposed_rules = {path: new for path, (_, new) in pairs.items()
-                              if new is not None and not path.startswith(CURRENT_CASES)}
+                              if new is not None and not path.startswith(cases_root)}
             fixtures = check_fixtures(model, directory, snapshot, rules, candidate_rules, responses, texts, repository,
-                                      pending_findings, proposed_rules=proposed_rules)
+                                      pending_findings, proposed_rules=proposed_rules, cases_root=cases_root)
             if fixtures["findings"]:
                 result = {"snapshot_id": snapshot, "status": "unhealthy", "covered_paths": list(rules),
                           "findings": fixtures["findings"], "resolved": [],
@@ -686,8 +706,10 @@ def review(repo, target, baseline, config, state, config_path=None):
             raise Incomplete(tr('Target snapshot changed during review; an old verdict cannot approve new content'))
         if tree_id(repo, baseline) != baseline_tree:
             raise Incomplete(tr('Comparison baseline changed during review; finding provenance must be checked again'))
-        if repository_identity(repo, basis) != repository:
+        if repository_identity(repo, basis, local_materials is not None) != repository:
             raise Incomplete(tr('Target repository identity changed during review; results cannot be reused across repositories'))
+        if local_materials is not None and local_basis(repo, config["basis_selections"], config.get("basis_ignored", {})) != local_materials:
+            raise Incomplete(tr('Local review materials changed during review; rerun with the complete new input.'))
         if engine_digest({p: path.read_bytes() for p, path in engine_sources(ENGINE).items()}) != actual_engine:
             raise Incomplete(tr('Shared engine changed during review; stage results from different versions cannot be mixed'))
         if config_path and json.loads(config_path.read_text()) != config:
@@ -760,12 +782,19 @@ def main():
         except (Incomplete, ModelFailure, InstallError, OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
             print(tr('Material check or maintenance did not complete: ') + str(error), file=sys.stderr)
             return 2
+    root = git(repo, "rev-parse", "--show-toplevel", optional=True)
+    if root is None:
+        print(tr('Code review requires a Git repository with tracked code. Installation does not initialize Git.'), file=sys.stderr)
+        return 2
+    project, repo = repo, Path(root.decode().strip()).resolve()
     state = control_dir(repo)
     state.mkdir(parents=True, exist_ok=True)
     try:
         config_path = Path(args.config) if args.config else state / "config.json"
-        config = json.loads(config_path.read_text())
         with run_lock(state):
+            if args.command == "review" and not args.config:
+                prepare_review(repo, project)
+            config = json.loads(config_path.read_text())
             if args.command == "respond":
                 latest = json.loads((state / "latest.json").read_text())
                 directory = Path(latest["run"]).resolve()
@@ -773,7 +802,7 @@ def main():
                     raise Incomplete(tr('Latest code-review pointer is outside this repository review records'))
                 result = json.loads((directory / "result.json").read_text())
                 source = json.loads((directory / "input.json").read_text())
-                identity = repository_identity(repo, source["basis"])
+                identity = repository_identity(repo, source["basis"], config.get("basis_source") == "local")
                 if (source["target_repository"] != identity or latest.get("target_repository", identity) != identity
                         or result["snapshot_id"] != latest["snapshot_id"] or result["status"] != latest["status"]):
                     raise Incomplete(tr('Latest code review belongs to another worktree or its pointer and result disagree; response was not saved'))

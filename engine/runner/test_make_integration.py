@@ -31,6 +31,20 @@ class MakeIntegrationTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout, "HOST_DEFAULT")
 
+    def test_host_build_still_runs_when_local_sidecar_is_not_installed(self):
+        original = b"all:\n\t@printf 'HOST_WITHOUT_LOCAL_SIDECAR'\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Makefile").write_bytes(host_makefile(original))
+            result = self.make(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "HOST_WITHOUT_LOCAL_SIDECAR")
+
+    def test_previous_required_include_migrates_without_changing_host_build(self):
+        previous = b"# Clarity sidecar begin\ninclude .clarity/Makefile\n# Clarity sidecar end\n"
+        host = b"all:\n\t@true\n"
+        self.assertEqual(host_makefile(host + previous), host_makefile(host))
+
     def test_unterminated_user_line_gets_one_boundary(self):
         original = b"# Owner's note"
         generated = host_makefile(original)
