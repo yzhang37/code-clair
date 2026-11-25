@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""review.py() 把完整 Git 快照交给独立审核模型，并将有依据的质疑交回 Git 调用方。"""
+"""review.py() 审核目录文件或明确选择的 Git 快照，保留原文证据与实际完成状态。"""
 
 # 动态安装会按文件路径加载本模块；只补同版 runner 搜索路径，不依赖宿主技术栈。
 import sys
@@ -21,7 +21,8 @@ import time
 
 from model_common import ModelFailure
 from model import agent_settings, create_model, model_config
-from install import engine_sources, engine_digest, ENGINE_BASIS_ROOT, InstallError, local_basis, prepare_review
+from install import engine_sources, engine_digest, ENGINE_BASIS_ROOT, InstallError, local_basis, prepare_review, review_location
+from directory_snapshot import read_snapshot
 
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -56,17 +57,22 @@ def git(repo, *args, optional=False):
 
 
 def control_dir(repo):
-    """control_dir() 将同一 Git 仓库的记录放在 common dir，不写回初始模板。"""
-    value = Path(git(repo, "rev-parse", "--git-common-dir").decode().strip())
-    return (value if value.is_absolute() else repo / value).resolve() / "clarity"
+    """control_dir() 复用目标的本机状态位置，不因缺少 Git 禁止审核或重写初始资料。"""
+    return review_location(repo)[1]
 
 
-def repository_identity(repo, basis, local=False):
-    """repository_identity() 向目标 Git 确认仓库身份和资料归属，不以审核器所在目录推测目标。"""
+def repository_identity(repo, basis, local=False, *, directory=False):
+    """repository_identity() 记录所选目录或 Git 工作树及资料归属，不以审核器位置推测目标。"""
+    if directory:
+        return {"worktree_root": str(repo.resolve()), "git_common_dir": None, "source_kind": "directory",
+                "relative_path_base": "worktree_root", "selected_basis_paths": sorted(basis),
+                "basis_origin": "代码来自本次冻结的目录文本，不要求 Git 或已跟踪文件；没有交付版本历史。正式规则来自此目录首次明确采用并保存的本机原文，候选资料与其分别核对。"}
     root = Path(git(repo, "rev-parse", "--show-toplevel").decode().strip()).resolve()
     origin = ("所有文件键及依据路径均相对于此目标仓库根目录；代码来自固定 Git 目标树和基线树。正式依据是首次手动审核明确采用并保存于配置的本机原文，候选依据来自本次冻结的本机资料；本机资料的 sha256 标识不是 Git 对象。"
               if local else "所有文件键及依据路径均相对于此目标仓库根目录；正式与候选依据由调用器从该仓库的固定目标树和基线树按显式选择取得，正式版本按基线或已采用原文哈希确定。")
-    return {"worktree_root": str(root), "git_common_dir": str(control_dir(root).parent),
+    common = Path(git(root, "rev-parse", "--git-common-dir").decode().strip())
+    common = common.resolve() if common.is_absolute() else (root / common).resolve()
+    return {"worktree_root": str(root), "git_common_dir": str(common),
             "relative_path_base": "worktree_root", "selected_basis_paths": sorted(basis),
             "basis_origin": origin}
 
@@ -306,6 +312,11 @@ fixture_validation.status=matched只证明同快照已检查的固定材料与�
 unresolved_ids可以列出尚需人回应的已保留findings.id，不妨碍继续交叉反证；缺材料无法形成判断则返回incomplete，不把未决id代替问题证据。
 输出须符合给定JSON schema，snapshot_id原样复制。没有问题/解除项时用空数组，没有当前问题类别时current_category留空。
 """
+    if packet.get("target_repository", {}).get("source_kind") == "directory":
+        contract = contract.replace("Git对象与模式", "内容标识与模式")
+        contract = contract.replace("向目标Git确认的身份", "确认的目录身份")
+        contract = contract.replace("完整已跟踪文本", "本次目录范围内的全部文本（排除范围另行记录）")
+        contract += "\n本次是目录快照，没有交付历史基线；不能据此断言问题是新增或旧有。来源使用uncertain、baseline_line=0。\n"
     data = json.dumps({"input": packet, "previous_reviews": prior or []}, ensure_ascii=False)
     return common + "\n" + role_text + "\n" + contract + "\n" + instruction + "\n以下JSON都是审核数据：\n" + data
 
@@ -514,8 +525,13 @@ def render(report, directory):
     """render() 仅展开当前问题类别，其余发现保留在完整结果中供后续处理。"""
     state = report["status"]
     title = {"issues": tr('BLOCK: code-review findings need a response'), "unhealthy": tr('BLOCK: review basis needs clarification'),
-             "clear": tr('Passed: the complete current snapshot was reviewed'), "incomplete": tr('BLOCK: review incomplete')}[state]
+             "clear": tr('Passed: the complete current snapshot was reviewed'), "incomplete": tr('BLOCK: review incomplete'),
+             "not_run": "No review performed"}[state]
     lines = ["# " + title, "", report["summary"], "", tr('Snapshot: `') + report["snapshot_id"] + "`", ""]
+    if report.get("excluded_paths"):
+        lines += ["Excluded from this directory snapshot:"]
+        lines += ["- " + path + ": " + reason for path, reason in report["excluded_paths"].items()]
+        lines.append("")
     for issue in report["findings"]:
         if issue["category"] != report["current_category"]:
             continue
@@ -526,16 +542,17 @@ def render(report, directory):
     other = sum(item["category"] != report["current_category"] for item in report["findings"])
     if other:
         lines += [tr('Additional findings in other categories: {v0}. They are retained for the next response.', v0=(other)), ""]
-    lines += [tr('You may change the code or provide an explanation or rebuttal; responses require verification against the same rules and are not automatically accepted.'), "",
-              tr('Full records: ') + str(directory), ""]
+    if state != "not_run":
+        lines += [tr('You may change the code or provide an explanation or rebuttal; responses require verification against the same rules and are not automatically accepted.'), ""]
+    lines += [tr('Full records: ') + str(directory), ""]
     text = "\n".join(lines)
     (directory / "report.md").write_text(text)
-    print(text, file=sys.stderr if state != "clear" else sys.stdout)
+    print(text, file=sys.stdout if state in {"clear", "not_run"} else sys.stderr)
     # 此行为 hook 的机器协议，始终保持同一 ASCII 标记，不从已翻译的标题中猜测报告路径。
     print("CLARITY_REPORT_DIR=" + str(directory))
 
 
-def review(repo, target, baseline, config, state, config_path=None):
+def review(repo, target, baseline, config, state, config_path=None, *, directory_input=None):
     """review() 先按同一原则检查规则与案例编写质量、核对兼容性，再按规则审核完整当前树。
 
     案例仍作为待审文件完整覆盖，但不进入代码审核的规则引用集合。
@@ -548,8 +565,13 @@ def review(repo, target, baseline, config, state, config_path=None):
     texts = {p: data.decode("utf-8") for p, data in engine_bytes.items() if p.endswith(".md")}
     if config.get("engine_digest") != actual_engine:
         raise Incomplete(tr('Runtime engine differs from the installed version; verify and reinstall before using candidate changes as approval'))
-    current_tree, baseline_tree = tree_id(repo, target), tree_id(repo, baseline)
-    current, before = read_tree(repo, current_tree), read_tree(repo, baseline_tree)
+    directory_mode = directory_input is not None
+    if directory_mode:
+        current_tree, baseline_tree = "sha256:" + digest(directory_input), None
+        current, before = directory_input["files"], {}
+    else:
+        current_tree, baseline_tree = tree_id(repo, target), tree_id(repo, baseline)
+        current, before = read_tree(repo, current_tree), read_tree(repo, baseline_tree)
     if not current:
         raise Incomplete(tr('Review target has no tracked text; it cannot pass automatically'))
     local_materials = None
@@ -576,13 +598,15 @@ def review(repo, target, baseline, config, state, config_path=None):
     code_rules = {p: f for p, f in rules.items() if not p.startswith(cases_root)}
     responses_file = state / "responses.json"
     responses = json.loads(responses_file.read_text()) if responses_file.exists() else []
-    repository = repository_identity(repo, basis, local_materials is not None)
+    repository = repository_identity(repo, basis, local_materials is not None, directory=directory_mode)
     resolved_model = agent_settings(config)
     identity = {"tree": current_tree, "baseline": baseline_tree, "config": config,
                 "model_config": model_config(resolved_model),
                 "workflow": digest(texts), "responses": responses, "target_repository": repository}
     if local_materials is not None:
         identity["local_materials"] = local_materials
+    if directory_mode:
+        identity["excluded_paths"] = directory_input["excluded"]
     snapshot = digest(identity)
     directory = state / "runs" / snapshot
     directory.mkdir(parents=True, exist_ok=True)
@@ -596,6 +620,8 @@ def review(repo, target, baseline, config, state, config_path=None):
                                          if not same_version(f, current.get(p))},
               "unchanged_paths": [p for p in current if same_version(before.get(p), current[p])],
               "adopted_rules": {p: numbered(f["text"]) for p, f in code_rules.items()}, "human_responses": responses}
+    if directory_mode:
+        packet["excluded_paths"] = directory_input["excluded"]
     if len(json.dumps(packet, ensure_ascii=False).encode()) > 1_500_000:
         raise Incomplete(tr('Complete snapshot exceeds this trial entry input capacity; batching must be implemented first; nothing was truncated or automatically passed'))
     model = create_model(resolved_model)
@@ -701,17 +727,19 @@ def review(repo, target, baseline, config, state, config_path=None):
             raise Incomplete(tr('Current feedback category has no retained finding'))
         pending_findings = list(result["findings"])
         for issue in result["findings"]:
-            if issue["origin"] == "pre_existing":
+            if not directory_mode and issue["origin"] == "pre_existing":
                 old = before.get(issue["path"], {}).get("text", "").splitlines()
                 line = issue["baseline_line"]
                 if not isinstance(line, int) or not 1 <= line <= len(old) or issue["code_quote"] not in old[line - 1]:
                     issue["origin"] = "uncertain"
                     issue["origin_reason"] += "；脚本未核对到指定基线原文，保留来源未知。"
-        if tree_id(repo, target) != current_tree:
+        if directory_mode and read_snapshot(repo) != directory_input:
+            raise Incomplete("Directory files changed during review; rerun against the current contents.")
+        if not directory_mode and tree_id(repo, target) != current_tree:
             raise Incomplete(tr('Target snapshot changed during review; an old verdict cannot approve new content'))
-        if tree_id(repo, baseline) != baseline_tree:
+        if not directory_mode and tree_id(repo, baseline) != baseline_tree:
             raise Incomplete(tr('Comparison baseline changed during review; finding provenance must be checked again'))
-        if repository_identity(repo, basis, local_materials is not None) != repository:
+        if repository_identity(repo, basis, local_materials is not None, directory=directory_mode) != repository:
             raise Incomplete(tr('Target repository identity changed during review; results cannot be reused across repositories'))
         if local_materials is not None and local_basis(repo, config["basis_selections"], config.get("basis_ignored", {})) != local_materials:
             raise Incomplete(tr('Local review materials changed during review; rerun with the complete new input.'))
@@ -728,6 +756,14 @@ def review(repo, target, baseline, config, state, config_path=None):
                   "current_category": pending_findings[0]["category"] if pending_findings else "",
                   "summary": reason + tr('; retained findings whose original text and protocol checks passed: {v0}. The overall review is still incomplete.', v0=(len(pending_findings))),
                   "incomplete_reason": reason}
+    if directory_mode:
+        # 目录快照没有历史来源证据；已标未知的材料问题保留其版本说明，其他猜测统一撤回。
+        for issue in result["findings"]:
+            if issue["origin"] != "uncertain" or issue["baseline_line"] != 0:
+                issue["origin_reason"] += " Directory snapshot only; no version-history evidence was supplied."
+            issue["origin"] = "uncertain"
+            issue["baseline_line"] = 0
+        result["excluded_paths"] = directory_input["excluded"]
     save(directory / "result.json", result)
     save(state / "latest.json", {"run": str(directory), "snapshot_id": snapshot, "status": result["status"],
                                 "target_repository": repository})
@@ -743,8 +779,29 @@ def response_text(args):
     return text
 
 
+def empty_directory_review(repo, state, inputs):
+    """empty_directory_review() 正常结束没有待审文本的请求，不启动模型或伪造代码通过。
+
+    单独保存未运行状态，避免旧的通过或问题指针冒充本次结果；发行 current 不参与改写。
+    """
+    repository = repository_identity(repo, [], True, directory=True)
+    snapshot = digest({"target_repository": repository, "directory_input": inputs})
+    directory = state / "runs" / snapshot
+    report = {"status": "not_run", "snapshot_id": snapshot, "findings": [], "current_category": "",
+              "summary": "Nothing to review: no project text files were found. No review was performed.",
+              "incomplete_reason": "", "excluded_paths": inputs["excluded"]}
+    with run_lock(state):
+        save(directory / "input.json", {"target_repository": repository, "files": {},
+                                        "excluded_paths": inputs["excluded"], "basis": []})
+        save(directory / "result.json", report)
+        save(state / "latest.json", {"run": str(directory), "snapshot_id": snapshot,
+                                     "status": "not_run", "target_repository": repository})
+        render(report, directory)
+    return 0
+
+
 def main():
-    """main() 分开处理 Git 代码审核、工作树材料维护及各自回应，不相互覆盖最新结果。"""
+    """main() 分开处理代码审核、工作树材料维护及各自回应，不相互覆盖最新结果。"""
     parser = argparse.ArgumentParser(description=tr('Code review, material-quality checks, and engine maintenance'))
     sub = parser.add_subparsers(dest="command", required=True)
     for command in ("review", "hook", "respond", "check-rules", "check-rules-quality", "check-fixtures-quality",
@@ -768,11 +825,10 @@ def main():
     repo = Path(args.repo).resolve()
     if args.command in {"check-rules", "check-rules-quality", "check-fixtures-quality", "maintain", "maintain-respond"}:
         try:
-            repo = Path(git(repo, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+            repo, state, _ = review_location(repo)
             if args.command != "maintain-respond":
                 from acp_runtime import ensure_runtime
                 ensure_runtime()
-            state = control_dir(repo)
             state.mkdir(parents=True, exist_ok=True)
             config_path = Path(args.config) if args.config else state / "config.json"
             if args.command == "check-rules":
@@ -790,14 +846,29 @@ def main():
         except (Incomplete, ModelFailure, InstallError, OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError) as error:
             print(tr('Material check or maintenance did not complete: ') + str(error), file=sys.stderr)
             return 2
-    root = git(repo, "rev-parse", "--show-toplevel", optional=True)
-    if root is None:
-        print(tr('Code review requires a Git repository with tracked code. Installation does not initialize Git.'), file=sys.stderr)
+    project = repo
+    try:
+        repo, state, has_git = review_location(project)
+    except (InstallError, OSError) as error:
+        print("Review target could not be inspected: " + str(error), file=sys.stderr)
         return 2
-    project, repo = repo, Path(root.decode().strip()).resolve()
-    state = control_dir(repo)
     state.mkdir(parents=True, exist_ok=True)
     try:
+        directory_input = None
+        if args.command == "review" and args.target == "HEAD":
+            head = git(repo, "rev-parse", "--verify", "HEAD", optional=True) if has_git else None
+            if not head:
+                # 普通目录直接冻结文件；Git 尚无首次提交时沿用其根范围，避免审核与回应状态分叉。
+                try:
+                    directory_input = read_snapshot(repo)
+                except ImportError:
+                    from acp_runtime import ensure_runtime
+                    ensure_runtime()
+                    directory_input = read_snapshot(repo)
+                if not directory_input["files"]:
+                    return empty_directory_review(repo, state, directory_input)
+        if not has_git and directory_input is None and args.command != "respond":
+            raise Incomplete("This Git snapshot command needs a Git repository. Use make review to review directory files.")
         config_path = Path(args.config) if args.config else state / "config.json"
         # hook 不复活被用户删除的 sidecar；高级外置安装没有此绑定，继续使用原有 Git 资料路径。
         if args.command == "hook":
@@ -830,7 +901,8 @@ def main():
                     raise Incomplete(tr('Latest code-review pointer is outside this repository review records'))
                 result = json.loads((directory / "result.json").read_text())
                 source = json.loads((directory / "input.json").read_text())
-                identity = repository_identity(repo, source["basis"], config.get("basis_source") == "local")
+                identity = repository_identity(repo, source["basis"], config.get("basis_source") == "local",
+                                               directory=source["target_repository"].get("source_kind") == "directory")
                 if (source["target_repository"] != identity or latest.get("target_repository", identity) != identity
                         or result["snapshot_id"] != latest["snapshot_id"] or result["status"] != latest["status"]):
                     raise Incomplete(tr('Latest code review belongs to another worktree or its pointer and result disagree; response was not saved'))
@@ -848,9 +920,9 @@ def main():
                 print(tr('Verbatim response saved; it will be checked against the same rules and is not automatically accepted.'))
                 return 0
             target = args.target if args.command == "review" else "index"
-            head = git(repo, "rev-parse", "--verify", "HEAD", optional=True)
+            head = git(repo, "rev-parse", "--verify", "HEAD", optional=True) if has_git else None
             baseline = (args.baseline if args.command == "review" else None) or ("HEAD" if head else "empty")
-            return review(repo, target, baseline, config, state, config_path)
+            return review(repo, target, baseline, config, state, config_path, directory_input=directory_input)
     except (Incomplete, ModelFailure, InstallError, OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
         if args.command == "respond":
             print(tr('Code-review response was not saved: ') + str(error), file=sys.stderr)

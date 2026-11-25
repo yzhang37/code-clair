@@ -637,17 +637,17 @@ ORIGINAL_CONTENT_SECRET
         self.assertEqual(len(self.latest_result()["samples"]), self.sample_count)
         self.assertFalse((subdirectory / ".clarity").exists())
 
-    def test_an_invalid_repo_is_incomplete_and_does_not_change_daily_review_state(self):
+    def test_a_missing_target_is_incomplete_and_does_not_change_daily_review_state(self):
         self.state.mkdir(parents=True)
         previous_daily = b'{"run":"untouched-daily-review"}\n'
         (self.state / "latest.json").write_bytes(previous_daily)
-        outside = self.root / "not-a-repository"
-        outside.mkdir()
+        outside = self.root / "missing-target"
         result = self.execute([sys.executable, str(RUNNER / "review.py"), "check-rules",
                                "--repo", str(outside), "--config", str(self.config_path)], check=False)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertNotIn("Traceback", result.stdout + result.stderr)
         self.assertEqual((self.state / "latest.json").read_bytes(), previous_daily)
+        self.assertFalse(outside.exists())
         self.assertFalse((outside / ".clarity").exists())
         self.assertFalse((outside / ".git").exists())
         self.assertEqual(self.calls(), [])

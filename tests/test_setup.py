@@ -310,8 +310,14 @@ class SidecarSetupTests(unittest.TestCase):
         make = importlib.util.module_from_spec(specification)
         specification.loader.exec_module(make)
         legacy_makefile = make.rendered_sidecar_makefile()
-        new_files = {}
-        for name in ("setup.py", "engine/runner/make_integration.py", "engine/runner/test_make_integration.py"):
+        installer = self.source / "engine/runner/install.py"
+        new_files = {"engine/runner/install.py": installer.read_bytes()}
+        directory_dependencies = b'"directory_snapshot.py", "make_integration.py", '
+        self.assertEqual(new_files["engine/runner/install.py"].count(directory_dependencies), 1)
+        # 旧布局尚无目录审核模块，其安装依赖清单也须匹配旧版，而不是跳过实际缺失检查。
+        installer.write_bytes(new_files["engine/runner/install.py"].replace(directory_dependencies, b"", 1))
+        for name in ("setup.py", "engine/runner/make_integration.py", "engine/runner/test_make_integration.py",
+                     "engine/runner/directory_snapshot.py", "engine/runner/test_directory_snapshot.py"):
             path = self.source / name
             if path.exists():
                 new_files[name] = path.read_bytes()
@@ -330,6 +336,9 @@ class SidecarSetupTests(unittest.TestCase):
                           "--repo", str(self.host), "--basis", ".clarity/current/rules.md",
                           "--codex-bin", sys.executable, "--model", "legacy-custom-model",
                           "--reviewers", "3", "--timeout", "41"])
+        for name in ("directory_snapshot.py", "make_integration.py"):
+            self.assertFalse((sidecar / "engine/runner" / name).exists())
+            self.assertFalse((self.host / ".git/clarity/engine/runner" / name).exists())
         hooks = self.host / ".git/hooks"
         shutil.copy2(sidecar / "engine/runner/commit-msg", hooks / "commit-msg")
         (hooks / "pre-commit").unlink()
@@ -356,6 +365,11 @@ class SidecarSetupTests(unittest.TestCase):
                          (sidecar / "engine/runner/commit-msg").read_bytes())
         self.assertFalse((hooks / "pre-commit").exists())
         self.assertTrue((sidecar / "setup.py").exists())
+        for name in ("directory_snapshot.py", "make_integration.py"):
+            self.assertEqual((sidecar / "engine/runner" / name).read_bytes(),
+                             (self.source / "engine/runner" / name).read_bytes())
+            self.assertEqual((self.host / ".git/clarity/engine/runner" / name).read_bytes(),
+                             (self.source / "engine/runner" / name).read_bytes())
         self.assertEqual(self.manifest()["commit"], latest)
         self.assertIn(b"include .clarity/Makefile", (self.host / "Makefile").read_bytes())
 

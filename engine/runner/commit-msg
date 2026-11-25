@@ -9,6 +9,9 @@ export PATH
 repo=$(git rev-parse --show-toplevel) || exit 2
 cd "$repo" || exit 2
 state=$(git rev-parse --git-common-dir)/clarity
+if [ -f "$repo/.clarity/.local/config.json" ]; then
+    state="$repo/.clarity/.local"
+fi
 ui_program="$state/engine/runner/i18n.py"
 if [ ! -f "$ui_program" ]; then
     ui_program="$repo/.clarity/engine/runner/i18n.py"

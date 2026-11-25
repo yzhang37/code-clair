@@ -13,7 +13,7 @@ import json
 import subprocess
 import time
 
-from install import InstallError, engine_digest, engine_sources
+from install import InstallError, engine_digest, engine_sources, review_location
 from material_check import check_materials
 from rules_check import CASES, RULES, CheckIncomplete, check_rules, digest, read_inputs
 from model import ADAPTER_FILES, agent_settings, model_config
@@ -37,7 +37,10 @@ def save(path, value):
 
 
 def target_identity(repo):
-    """target_identity() 询问 Git 的实际工作树和共同目录，阻止跨工作树套用回应。"""
+    """target_identity() 确认实际目录或 Git 工作树身份，阻止跨项目套用回应。"""
+    root, _, has_git = review_location(repo)
+    if not has_git:
+        return {"worktree_root": str(root), "git_common_dir": None}
     values = []
     for argument in ("--show-toplevel", "--git-common-dir"):
         result = subprocess.run(["git", "-C", str(repo), "rev-parse", argument], capture_output=True, text=True)

@@ -54,7 +54,7 @@ class ModelSettingsTests(unittest.TestCase):
     def test_incomplete_cached_runtime_stops_before_reexecuting_itself(self):
         with tempfile.TemporaryDirectory(prefix="clarity-cache-test-") as temporary:
             cache = Path(temporary)
-            key = f"acp-1.0.0-jsonschema-4.26.0-py{sys.version_info.major}.{sys.version_info.minor}"
+            key = f"acp-1.0.0-jsonschema-4.26.0-pathspec-1.1.1-py{sys.version_info.major}.{sys.version_info.minor}"
             cached_python = cache / "clarity" / key / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
             cached_python.parent.mkdir(parents=True)
             cached_python.write_text("incomplete cached environment")

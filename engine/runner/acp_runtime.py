@@ -12,7 +12,7 @@ import time
 import venv
 
 
-REQUIREMENTS = ("agent-client-protocol==1.0.0", "jsonschema==4.26.0")
+REQUIREMENTS = ("agent-client-protocol==1.0.0", "jsonschema==4.26.0", "pathspec==1.1.1")
 
 
 def ready():
@@ -40,7 +40,7 @@ def ensure_runtime():
         os.execv(str(python), [str(python), *sys.argv])
     cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "clarity"
     cache.mkdir(parents=True, exist_ok=True)
-    root = cache / f"acp-1.0.0-jsonschema-4.26.0-py{sys.version_info.major}.{sys.version_info.minor}"
+    root = cache / f"acp-1.0.0-jsonschema-4.26.0-pathspec-1.1.1-py{sys.version_info.major}.{sys.version_info.minor}"
     python = root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if python.absolute() == Path(sys.executable).absolute():
         raise RuntimeError("Cached ACP dependencies are incomplete. Remove " + str(root) + " and retry setup.")

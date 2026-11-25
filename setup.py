@@ -451,7 +451,7 @@ def runtime_changes(state: Path, hooks: Path, staged: Path, manifest: dict | Non
             changes[state / "responses.json"] = (b"[]\n", 0o600)
     updated_config["engine_digest"] = new.engine_digest({name: value[0] for name, value in new_files.items()})
     changes[config_path] = (encoded(updated_config), config_file[1] if config_file else 0o600)
-    for name in ("commit-msg", "pre-commit"):
+    for name in ("commit-msg", "pre-commit") if hooks is not None else ():
         path = hooks / name
         value = read_file(path)
         if value is None or not new.is_owned_hook(path):
@@ -571,7 +571,7 @@ def install(args: argparse.Namespace) -> dict:
     review_state, review_hooks = state, hooks
     if root is not None:
         common = Path(git(root, "rev-parse", "--git-common-dir").decode().strip())
-        review_state = (common if common.is_absolute() else root / common).resolve() / "clarity"
+        review_state = state if root == repo else (common if common.is_absolute() else root / common).resolve() / "clarity"
         hook_value = Path(git(root, "rev-parse", "--git-path", "hooks").decode().strip())
         review_hooks = (hook_value if hook_value.is_absolute() else root / hook_value).resolve()
     sidecar = repo / ".clarity"
@@ -659,7 +659,10 @@ def install(args: argparse.Namespace) -> dict:
                                 for name, value in files.items() if name.startswith("initial/")})
             # current 的创建只使旧采用关系失效；程序缓存可由完整发布版本补回，不要求损坏副本可执行。
             hook_manifest = manifest or {"worktree_root": str(repo)}
-            if review_hooks is not None:
+            if root is None:
+                changes.update(runtime_changes(state, None, staged, hook_manifest,
+                                               reset_basis=current_missing and not fresh_sidecar, fresh=fresh_sidecar))
+            elif review_hooks is not None:
                 root_runtime = root == repo
                 reset_basis = current_missing and not fresh_sidecar
                 bound_runtime = root_runtime

@@ -27,7 +27,8 @@ from model_common import ModelFailure
 HOOK_MARKER = "# clarity-review-hook v1"
 HOOK_NAMES = ("pre-commit",)
 ENGINE_RUNNERS = ("review.py", "model_common.py", "acp_model.py", "acp_runtime.py", "model.py", "pi_entry.py",
-                  "install.py", "rules_check.py", "rules_report.py", "material_check.py", "maintenance.py", "i18n.py")
+                  "directory_snapshot.py", "make_integration.py", "install.py", "rules_check.py", "rules_report.py",
+                  "material_check.py", "maintenance.py", "i18n.py")
 REQUIRED_PROMPTS = ("health.md", "fixtures.md", "review.md", "summarize.md", "learn.md", "rules-check.md",
                     "material-check.md")
 DEFAULT_BASIS_SELECTIONS = (".clarity/current/rules.md", ".clarity/current/cases")
@@ -64,6 +65,31 @@ def repository_paths(requested_repo: Path) -> tuple[Path, Path, Path]:
     common_dir = (repo / common_value).resolve() if not common_value.is_absolute() else common_value.resolve()
     hooks_dir = (repo / hooks_value).resolve() if not hooks_value.is_absolute() else hooks_value.resolve()
     return repo, common_dir, hooks_dir
+
+
+def review_location(requested: Path):
+    """review_location() 让普通目录使用 sidecar 本机状态，Git 只为 Git 快照提供控制目录。
+
+    没有 Git 程序或仓库不妨碍目录审核；其他 Git 故障保留原始原因，不误报成未初始化。
+    先在普通目录安装后再建立 Git 时，沿用已有本机状态，避免遗失模型偏好与采用资料。
+    """
+    project = requested.expanduser().resolve()
+    local = project / ".clarity/.local"
+    if not shutil.which("git"):
+        return project, local, False
+    result = subprocess.run(["git", "-C", str(project), "rev-parse", "--show-toplevel"],
+                            capture_output=True, env={**os.environ, "LC_ALL": "C"})
+    if result.returncode:
+        reason = result.stderr.decode(errors="replace").strip()
+        if "not a git repository" not in reason.lower():
+            raise InstallError(reason or "Git could not identify the selected directory.")
+        return project, local, False
+    repo = Path(result.stdout.decode().strip()).resolve()
+    common = Path(git_output(repo, "rev-parse", "--git-common-dir"))
+    state = (common if common.is_absolute() else repo / common).resolve() / "clarity"
+    if repo == project and any((local / name).is_file() for name in ("installation.json", "config.json")):
+        state = local
+    return repo, state, True
 
 
 def is_owned_hook(path: Path) -> bool:
@@ -250,8 +276,7 @@ def prepare_review(repo: Path, project: Path | None = None) -> None:
     整个 current 重建后只清除旧采用关系并保留模型偏好，本次明确审核才采用当前本机原文。
     Git 的历史资料不覆盖此次采用；后续改写仍作为候选核对，资料能否使用由实际审核判断。
     """
-    common = Path(git_output(repo, "rev-parse", "--git-common-dir"))
-    state = (common if common.is_absolute() else repo / common).resolve() / "clarity"
+    _, state, _ = review_location(repo)
     config_path = state / "config.json"
     previous = json.loads(config_path.read_text()) if config_path.exists() else {}
     if not isinstance(previous, dict):
@@ -284,10 +309,13 @@ def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ign
             preserved_config=None) -> None:
     """install() 核对完整输入后保存外部引擎及配置，仅显式启用时写入 pre-commit。
 
-    引擎放在 Git common dir 中，与候选 tracked 内容分离；不修改资料、Git 配置或业务代码。
+    引擎放在调用方选定的本机状态目录，独立于候选内容；不修改资料、Git 配置或业务代码。
     写入失败时恢复此前引擎、配置与已写 hook；本地拥有者仍可卸载或绕过此入口。
     """
-    repo, common_dir, hooks_dir = repository_paths(Path(args.repo))
+    repo, clarity_dir, has_git = review_location(Path(args.repo))
+    if with_hook and not has_git:
+        raise InstallError("Commit hooks require Git; use make review to review an ordinary directory.")
+    hooks_dir = repository_paths(repo)[2] if with_hook else None
     if with_hook:
         check_hook_ownership(hooks_dir)
     source_root = Path(__file__).resolve().parent.parent
@@ -301,7 +329,6 @@ def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ign
                                   if getattr(args, key, None) is not None}},
                               from_environment=not any((preserved_config or {}).get(key) for key in
                                                        ("agent", "agent_command", "agent_bin", "codex_bin")))
-    clarity_dir = common_dir / "clarity"
     engine_dir = clarity_dir / "engine"
     config_path = clarity_dir / "config.json"
     if engine_dir.is_symlink() or (with_hook and engine_dir.exists() and not config_path.is_file()):
@@ -383,7 +410,7 @@ def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ign
     if with_hook:
         print(tr('Local review pre-commit hook installed: ') + str(hooks_dir / "pre-commit"))
     print(tr('Shared engine and configuration: ') + str(clarity_dir))
-    print(tr('Review scope: all current tracked content; installation did not run a model review.'))
+    print("Review configuration prepared; no model review was run.")
 
 
 def uninstall(args: argparse.Namespace) -> None:

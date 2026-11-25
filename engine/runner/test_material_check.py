@@ -108,7 +108,7 @@ schema = Path(sys.argv[sys.argv.index("--output-schema") + 1])
 calls = fixture_path.parent / "calls"
 calls.mkdir(exist_ok=True)
 ordinal = len(list(calls.glob("*.json"))) + 1
-progress_files = sorted((Path(fixture["repo"]) / ".git/clarity/material-checks" / packet["kind"]).glob("run-*/result.json"))
+progress_files = sorted((Path(fixture.get("state", str(Path(fixture["repo"]) / ".git/clarity"))) / "material-checks" / packet["kind"]).glob("run-*/result.json"))
 progress = json.loads(progress_files[-1].read_text())
 (calls / f"{ordinal:04}.json").write_text(json.dumps({
     "packet": packet, "prompt": prompt, "schema": json.loads(schema.read_text()),
@@ -466,16 +466,29 @@ class IsolatedMaterialCheckTests(unittest.TestCase):
                 self.assertFalse((nested / ".clarity").exists())
                 self.assertFalse((nested / ".git").exists())
 
-    def test_invalid_repository_is_incomplete_without_creating_review_state(self):
+    def test_plain_directory_is_valid_but_missing_target_is_incomplete(self):
         outside = self.root / "not a repository"
-        outside.mkdir()
         for kind in ("rules", "fixtures"):
             with self.subTest(kind=kind):
                 result = self.check_quality(kind, repo=outside)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertNotIn("Traceback", result.stdout + result.stderr)
-                self.assertEqual(list(outside.iterdir()), [])
+                self.assertFalse(outside.exists())
                 self.assertEqual(self.calls(), [])
+        rules = outside / RULE_PATH
+        rules.parent.mkdir(parents=True)
+        rules.write_text(RULE_DOCUMENT)
+        cases = outside / CASE_DIRECTORY
+        cases.mkdir()
+        (cases / "case.md").write_text(fcase_document("PLAIN_DIRECTORY"))
+        self.set_mode("normal", repo=str(outside), state=str(outside / ".clarity/.local"))
+        for kind in ("rules", "fixtures"):
+            with self.subTest(plain_directory_kind=kind):
+                result = self.check_quality(kind, repo=outside)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                pointer = json.loads((outside / ".clarity/.local" / f"latest-quality-{kind}.json").read_text())
+                self.assertEqual(pointer["status"], "passed")
+        self.assertFalse((outside / ".git").exists())
 
 
 if __name__ == "__main__":
