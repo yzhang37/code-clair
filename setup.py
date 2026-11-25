@@ -16,6 +16,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
+
+sys.dont_write_bytecode = True
 
 
 # 兼容旧版下载入口只取得 setup.py 的情况；界面资源尚未取得时以英文原始消息回退。
@@ -230,6 +233,212 @@ def load_module(name: str, path: Path):
     module = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(module)
     return module
+
+
+def release_tools():
+    """release_tools() 加载同版唯一版本实现，不依赖模型 SDK 或宿主技术栈。
+
+    旧下载脚本只检出管理器和界面资源；仅当管理器正位于其自身 Git checkout 根目录，
+    且磁盘管理器与已固定 HEAD 原文相同，才从同一提交补读版本模块到内存。
+    不从宿主祖先项目取代码、不下载另一版本，也不为查询补写部署文件。
+    """
+    root = Path(__file__).resolve().parent
+    path = root / "engine/runner/release.py"
+    if path.is_file() and not path.is_symlink():
+        return load_module("clarity_release_tools", path)
+    if Path(git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve() != root:
+        raise SetupError(tr('The release manager dependency is missing; rerun the installation entry.'))
+    commit = git(root, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+    if git(root, "show", commit + ":setup.py") != Path(__file__).read_bytes():
+        raise SetupError(tr('The bootstrap manager differs from its source commit; dependency recovery was refused.'))
+    entries = git(root, "ls-tree", "-z", commit, "--", "engine/runner/release.py").split(b"\0")
+    entries = [entry for entry in entries if entry]
+    if len(entries) != 1:
+        raise SetupError(tr('The selected manager commit has no release dependency.'))
+    header, _ = entries[0].split(b"\t", 1)
+    mode, kind, oid = header.decode().split()
+    if kind != "blob" or mode not in {"100644", "100755"}:
+        raise SetupError(tr('The release manager dependency is not a regular file.'))
+    module = types.ModuleType("clarity_release_tools")
+    module.__file__ = str(path)
+    exec(compile(git(root, "cat-file", "blob", oid), str(path), "exec"), module.__dict__)
+    return module
+
+
+def offline_state(repo: Path) -> Path:
+    """offline_state() 只按安装位置读取记录路径，让无 Git 程序的电脑也能查看安装身份。
+
+    本机 sidecar 记录优先；Git 根与 worktree 的小型路径文件只用于找到已有记录，
+    不向父项目搜索安装、不创建目录，也不把宿主仓库的提交当成 Clarity 版本。
+    """
+    local = repo / ".clarity/.local"
+    if (local / "installation.json").is_file():
+        return local
+    git_dir = repo / ".git"
+    if git_dir.is_file() and not git_dir.is_symlink():
+        marker = git_dir.read_text().strip()
+        if not marker.startswith("gitdir: "):
+            raise SetupError(tr('The Git directory pointer is invalid.'))
+        target = Path(marker[len("gitdir: "):])
+        git_dir = (repo / target).resolve() if not target.is_absolute() else target.resolve()
+    if git_dir.is_dir():
+        common = git_dir / "commondir"
+        if common.is_file():
+            target = Path(common.read_text().strip())
+            git_dir = (git_dir / target).resolve() if not target.is_absolute() else target.resolve()
+        return git_dir / "clarity"
+    return local
+
+
+def installation_record(repo: Path, state: Path) -> dict | None:
+    """installation_record() 读取已登记事实，不以旧记录格式号代替产品发布号。"""
+    saved = read_file(state / "installation.json")
+    if saved is None:
+        return None
+    record = json.loads(saved[0])
+    if not isinstance(record, dict) or record.get("version") != 1 or record.get("worktree_root") != str(repo):
+        raise SetupError(tr('Unsupported installation record or a different bound worktree; shared installation was not replaced.'))
+    return record
+
+
+def installed_identity(repo: Path) -> tuple[dict, dict | None, Path]:
+    """installed_identity() 交付本机记录及文件现状，不联网或修复文件，也不把 current 当工厂程序。
+
+    已登记的发布身份优先；旧管理器取得新版本资料后可显示其声明版本，但不伪造未记录的正式标签。
+    缺失和本地改写单列，使同版本修复仍可执行，也避免把被改写的程序称作原版发行物。
+    """
+    state = offline_state(repo)
+    record = installation_record(repo, state)
+    changed, missing = [], []
+    files = (record or {}).get("files", {})
+    if not isinstance(files, dict):
+        raise SetupError(tr('Recorded factory file information is invalid.'))
+    for name, expected in files.items():
+        if not factory_path(name) and name not in {"Makefile", ".gitignore"}:
+            raise SetupError(tr('Installation record contains an out-of-scope file: ') + name)
+        path = repo / ".clarity" / name
+        try:
+            safe_parents(path)
+            actual = read_file(path)
+        except SetupError:
+            changed.append(name)
+            continue
+        if actual is None:
+            missing.append(name)
+        elif fingerprint(actual) != expected:
+            changed.append(name)
+    registered = (record or {}).get("release") or {}
+    if not isinstance(registered, dict):
+        raise SetupError(tr('Recorded release identity is invalid.'))
+    metadata = None
+    if "engine/release.json" not in changed:
+        path = repo / ".clarity/engine/release.json"
+        safe_parents(path)
+        material = read_file(path)
+        metadata = release_tools().parse_release(material[0] if material else None)
+    identity = {"product_version": registered.get("product_version", (metadata or {}).get("product_version")),
+                "built_at": registered.get("built_at", (metadata or {}).get("built_at")),
+                "commit": (record or {}).get("commit"), "kind": registered.get("kind", "unverified" if metadata else "legacy"),
+                "tag": registered.get("tag"), "modified_files": sorted(changed), "missing_files": sorted(missing),
+                "installed_at": (record or {}).get("installed_at")}
+    return identity, record, state
+
+
+def version_selection(args: argparse.Namespace, record: dict | None) -> tuple[str, dict]:
+    """version_selection() 区分跟随正式发布与显式 Git 选择，升级不把用户来源或旧 HEAD 改成另一种意图。"""
+    source = args.source or (record["source"] if record else DEFAULT_SOURCE)
+    if Path(source).expanduser().exists():
+        source = str(Path(source).expanduser().resolve())
+    if args.ref is not None:
+        selection = {"mode": "ref", "ref": args.ref}
+    elif record and record.get("selection") is not None:
+        selection = record["selection"]
+        if not isinstance(selection, dict) or selection.get("mode") not in {"stable", "ref"}:
+            raise SetupError(tr('Recorded version selection is invalid.'))
+        if selection["mode"] == "ref" and not isinstance(selection.get("ref"), str):
+            raise SetupError(tr('Recorded version selection is invalid.'))
+    elif record:
+        # 旧 HEAD 无法区分原来的默认和显式选择，保留原语义，不擅自转为正式发布追踪。
+        selection = {"mode": "ref", "ref": record["ref"]}
+    else:
+        selection = {"mode": "stable"}
+    return source, selection
+
+
+def commit_relation(cache: Path, installed: str | None, candidate: str) -> str:
+    """commit_relation() 仅用共同历史确认开发或旧版提交方向，分叉和缺失对象不按时间猜测。"""
+    import re
+    if not isinstance(installed, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", installed):
+        return "unknown"
+    if installed == candidate:
+        return "unknown"
+    try:
+        common = git(cache, "merge-base", installed, candidate).decode().strip()
+    except SetupError:
+        return "unknown"
+    return "forward" if common == installed else "backward" if common == candidate else "diverged"
+
+
+def candidate_release(args: argparse.Namespace, record: dict | None, state: Path) -> tuple[dict, str, dict, Path]:
+    """candidate_release() 从用户选择的来源获取事实，正式版按版本号选择，显式引用保留 Git 语义。"""
+    source, selection = version_selection(args, record)
+    cache = source_cache(state, source)
+    if selection["mode"] == "ref" and selection.get("ref") == "HEAD":
+        # mirror 的 HEAD 不随 fetch 更新；只为明确跟随 HEAD 的安装固定上游当前提交。
+        # 正式标签和固定引用不依赖远端默认分支，避免合法的仅标签来源因此无法查询或安装。
+        git(cache, "fetch", "--quiet", "origin", "HEAD")
+        head = git(cache, "rev-parse", "--verify", "FETCH_HEAD^{commit}").decode().strip()
+        git(cache, "update-ref", "--no-deref", "HEAD", head)
+    chosen = release_tools().select(cache, git, ref=selection.get("ref") if selection["mode"] == "ref" else None)
+    return chosen, source, selection, cache
+
+
+COMPARISON_MESSAGES = {
+    "same": "The installed version matches the selected candidate.",
+    "newer": "A newer release is available.",
+    "older": "The selected candidate is older; no automatic downgrade was performed.",
+    "conflict": "Release identity conflict: the same version identifies different source commits.",
+    "migration": "A versioned release is available after this unversioned or development installation.",
+    "development": "A later development build is available on the selected Git history.",
+    "diverged": "The selected Git histories have diverged; version order cannot be confirmed.",
+    "unknown": "Version order could not be confirmed from the available release and Git information.",
+}
+
+
+def print_identity(identity: dict, label: str) -> None:
+    """print_identity() 区分发布号、构建时间和安装时间，未知资料明确显示而不补造版本。"""
+    print(tr(label))
+    print(tr('Product version: ') + (identity.get("product_version") or tr('unversioned')))
+    print(tr('Release type: ') + tr(identity.get("kind", "legacy")))
+    print(tr('Build time (UTC): ') + (identity.get("built_at") or tr('unknown')))
+    print(tr('Actual commit: ') + (identity.get("commit") or tr('unknown')))
+    if identity.get("installed_at"):
+        print(tr('Installed at: ') + identity["installed_at"])
+
+
+def inspect_version(args: argparse.Namespace) -> int:
+    """inspect_version() 将离线查看和联网检查与部署分离，检查期间变动不会变成最新版结论。"""
+    repo = Path(args.repo).expanduser().resolve()
+    current, record, state = installed_identity(repo)
+    print_identity(current, 'Installed Clarity:')
+    source, selection = version_selection(args, record)
+    print(tr('Upstream source: ') + source)
+    print(tr('Version selection: ') + (tr('latest stable release') if selection["mode"] == "stable" else selection["ref"]))
+    for label, names in [('Locally modified factory files: ', current["modified_files"]),
+                         ('Missing factory files: ', current["missing_files"])]:
+        if names:
+            print(tr(label) + ", ".join(names))
+    if getattr(args, "show_version", False):
+        return 0
+    candidate, _, _, cache = candidate_release(args, record, state)
+    relation = commit_relation(cache, current.get("commit"), candidate["commit"])
+    status = release_tools().compare(current, candidate, relation=relation)
+    after, after_record, _ = installed_identity(repo)
+    if after != current or after_record != record:
+        raise SetupError(tr('Installed files or records changed during the version check; retry.'))
+    print_identity(candidate, 'Selected candidate:')
+    print(tr(COMPARISON_MESSAGES[status]))
+    return 2 if status in {"conflict", "diverged", "unknown"} else 0
 
 
 def materialize(root: Path, files: dict[str, tuple[bytes, int]]) -> None:
@@ -603,12 +812,15 @@ def install(args: argparse.Namespace) -> dict:
         legacy = legacy_files(sidecar) if manifest is None else None
         if args.command == "update" and not existing_installation(repo):
             raise SetupError(tr('No sidecar is installed; run install first.'))
-        source = args.source or (manifest["source"] if manifest else DEFAULT_SOURCE)
-        if Path(source).expanduser().exists():
-            source = str(Path(source).expanduser().resolve())
-        ref = args.ref or (manifest["ref"] if manifest else "HEAD")
-        cache = source_cache(state, source)
-        commit = git(cache, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").decode().strip()
+        candidate, source, selection, cache = candidate_release(args, manifest, state)
+        commit = candidate["commit"]
+        ref = candidate["ref"]
+        if manifest:
+            current = installed_identity(repo)[0]
+            relation = commit_relation(cache, current.get("commit"), commit)
+            comparison = release_tools().compare(current, candidate, relation=relation)
+            if comparison == "conflict" or (comparison in {"older", "diverged", "unknown"} and args.ref is None):
+                raise SetupError(tr(COMPARISON_MESSAGES[comparison]))
         files = snapshot(cache, commit)
         required = {"setup.py", "README.md", "initial/rules.md", "initial/cases/case.md",
                     "engine/runner/install.py", "engine/runner/make_integration.py", "engine/runner/commit-msg"}
@@ -690,7 +902,9 @@ def install(args: argparse.Namespace) -> dict:
                 if value is not None and new_install.is_owned_hook(path):
                     hook_records[name] = fingerprint(value)
             record = {"version": 1, "worktree_root": str(repo), "source": source, "ref": ref,
+                      "selection": selection, "release": {key: value for key, value in candidate.items() if key != "ref"},
                       "commit": commit, "previous_commit": manifest["commit"] if manifest else None,
+                      "previous_release": manifest.get("release") if manifest else None,
                       "previous_source": manifest["source"] if manifest else None,
                       "installed_at": datetime.now(timezone.utc).isoformat(), "host_makefile": make_name,
                       "track_git": manifest.get("track_git", already_tracked) if args.command == "update" and manifest else bool(promote or already_tracked),
@@ -722,7 +936,11 @@ def main(argv: list[str] | None = None) -> int:
         child = commands.add_parser(command)
         child.add_argument("--repo", default=".", help=tr('Installation directory; default is the current directory, never the parent Git root.'))
         child.add_argument("--source", help=tr('Upstream Git URL or local path; initially GitHub HTTPS, then reuse the selected source; supply explicitly to switch.'))
-        child.add_argument("--ref", help=tr('Upstream Git branch, tag, or commit; reuse the recorded selection, initially HEAD.'))
+        child.add_argument("--ref", help=tr('Explicit upstream Git branch, tag, or commit; otherwise reuse the selection, initially the latest stable release.'))
+        if command == "update":
+            query = child.add_mutually_exclusive_group()
+            query.add_argument("--version", dest="show_version", action="store_true", help=tr('Show the installed Clarity version offline without changing files.'))
+            query.add_argument("--check", dest="check_version", action="store_true", help=tr('Check the selected source for updates without deploying files.'))
         if command == "install":
             child.add_argument("--track", choices=("yes", "no"), help=tr('Add a fresh installation to host Git tracking; prompt by default, Enter means no.'))
     args = parser.parse_args(argv)
@@ -731,6 +949,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "update":
             if not existing_installation(target):
                 raise SetupError(tr('No .clarity directory exists here; use the first-install entry.'))
+            if args.show_version or args.check_version:
+                return inspect_version(args)
         elif existing_installation(target):
             choice = ask(tr('Clarity detected: [1] Update (default)  [2] Fresh installation (keep current): '),
                          {"1": "update", "update": "update", "更新": "update", "2": "install", "install": "install", "全新安装": "install",
@@ -744,7 +964,10 @@ def main(argv: list[str] | None = None) -> int:
                               tr("yes").casefold(): "yes", tr("no").casefold(): "no"}, "no")
         return deliver(args)
     except (SetupError, OSError, ValueError, KeyError, TypeError, ImportError) as error:
-        print(tr('Clarity installation/update did not complete: ') + str(error), file=sys.stderr)
+        message = ('Clarity version query did not complete: ' if getattr(args, "show_version", False)
+                   else 'Clarity update check did not complete: ' if getattr(args, "check_version", False)
+                   else 'Clarity installation/update did not complete: ')
+        print(tr(message) + tr(str(error)), file=sys.stderr)
         return 2
 
 
@@ -753,10 +976,13 @@ def deliver(args: argparse.Namespace) -> int:
     try:
         record = install(args)
     except (SetupError, OSError, ValueError, KeyError, TypeError, ImportError) as error:
-        print(tr('Clarity installation/update did not complete: ') + str(error), file=sys.stderr)
+        print(tr('Clarity installation/update did not complete: ') + tr(str(error)), file=sys.stderr)
         return 2
     print(tr('Clarity installed at: ') + record["worktree_root"] + "/.clarity")
     print(tr('Upstream source: ') + record["source"])
+    print(tr('Product version: ') + (record["release"].get("product_version") or tr('unversioned')))
+    print(tr('Release type: ') + tr(record["release"]["kind"]))
+    print(tr('Build time (UTC): ') + (record["release"].get("built_at") or tr('unknown')))
     print(tr('Actual commit: ') + record["commit"])
     print(tr('Existing current was preserved. A new sidecar uses release current; a missing current in an existing sidecar is restored from initial.'))
     print(tr('Start a code review with: make review'))

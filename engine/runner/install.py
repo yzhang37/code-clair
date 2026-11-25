@@ -27,7 +27,7 @@ from model_common import ModelFailure
 HOOK_MARKER = "# clarity-review-hook v1"
 HOOK_NAMES = ("pre-commit",)
 ENGINE_RUNNERS = ("review.py", "model_common.py", "acp_model.py", "acp_runtime.py", "model.py", "pi_entry.py",
-                  "directory_snapshot.py", "make_integration.py", "install.py", "rules_check.py", "rules_report.py",
+                  "directory_snapshot.py", "make_integration.py", "release.py", "install.py", "rules_check.py", "rules_report.py",
                   "material_check.py", "maintenance.py", "i18n.py")
 REQUIRED_PROMPTS = ("health.md", "fixtures.md", "review.md", "summarize.md", "learn.md", "rules-check.md",
                     "material-check.md")
@@ -120,6 +120,8 @@ def engine_sources(source_root: Path) -> dict[str, Path]:
     required = ["README.md", "principles.md", "workflow.md", "runner/locales/aliases.json"]
     required.extend("prompts/" + name for name in REQUIRED_PROMPTS)
     required.extend("runner/" + name for name in ENGINE_RUNNERS)
+    if (source_root / "release.json").exists():
+        required.append("release.json")
     sources = {name: source_root / name for name in required}
     for path in (source_root / "prompts").glob("*.md"):
         sources[path.relative_to(source_root).as_posix()] = path

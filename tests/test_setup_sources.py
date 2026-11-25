@@ -39,10 +39,12 @@ class SetupSourceTests(unittest.TestCase):
             arguments.extend(["--source", str(source)])
         return self.run_command(arguments, check=check)
 
-    def update(self, *, source=None, check=True):
+    def update(self, *, source=None, ref=None, check=True):
         arguments = [sys.executable, str(self.host / ".clarity/setup.py"), "update", "--repo", str(self.host)]
         if source is not None:
             arguments.extend(["--source", str(source)])
+        if ref is not None:
+            arguments.extend(["--ref", ref])
         return self.run_command(arguments, check=check)
 
     def test_default_https_is_recorded_and_reused_without_treating_git_rewrite_as_a_source_change(self):
@@ -72,9 +74,7 @@ class SetupSourceTests(unittest.TestCase):
         (local / "initial/source-marker.txt").write_bytes(b"selected source factory initial\n")
         workflow = local / "engine/workflow.md"
         workflow.write_bytes(workflow.read_bytes() + b"\nSelected alternate factory release.\n")
-        self.git(local, "add", "current", "initial", "engine")
-        self.git(local, "commit", "-q", "-m", "selected source with distinct current")
-        release = self.git(local, "rev-parse", "HEAD")
+        release = setup_fixture.publish_factory(self, local, "selected source with distinct current")
         expected = {directory: self.directory_state(local / directory)
                     for directory in ("engine", "initial", "current")}
         marker.write_bytes(b"dirty local source is not the selected release\n")
@@ -123,6 +123,7 @@ class SetupSourceTests(unittest.TestCase):
     def test_explicit_local_source_can_be_selected_and_then_changed_back_to_https(self):
         self.install()
         default_commit = self.manifest()["commit"]
+        default_version = json.loads((self.source / "engine/release.json").read_text())["product_version"]
         current = self.host / ".clarity/current/rules.md"
         current.write_bytes(b"Host materials remain the same across factory source choices.\n")
         current_state = self.directory_state(current.parent)
@@ -136,9 +137,7 @@ class SetupSourceTests(unittest.TestCase):
         (local / "initial/source-marker.txt").write_bytes(b"alternate factory initial\n")
         (local / "current/rules.md").write_bytes(b"Alternate upstream seed must not replace host rules.\n")
         (local / "current/source-note.txt").write_bytes(b"do not merge source current\n")
-        self.git(local, "add", "engine/workflow.md", "initial", "current")
-        self.git(local, "commit", "-q", "-m", "alternate factory version")
-        local_commit = self.git(local, "rev-parse", "HEAD")
+        local_commit = setup_fixture.publish_factory(self, local, "alternate factory version")
         self.update(source=local)
         self.assertEqual(self.manifest()["source"], str(local))
         self.assertEqual(self.manifest()["commit"], local_commit)
@@ -146,7 +145,7 @@ class SetupSourceTests(unittest.TestCase):
         self.assertEqual(self.directory_state(self.host / ".clarity/initial"),
                          self.directory_state(local / "initial"))
         self.assertEqual(self.directory_state(current.parent), current_state)
-        self.update(source=DEFAULT_SOURCE)
+        self.update(source=DEFAULT_SOURCE, ref="v" + default_version)
         self.assertEqual(self.manifest()["source"], DEFAULT_SOURCE)
         self.assertEqual(self.manifest()["commit"], default_commit)
         self.assertEqual((self.host / ".clarity/engine/workflow.md").read_bytes(),

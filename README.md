@@ -4,7 +4,7 @@ This is the upstream source repository for Clarity. Its root contains `engine/`,
 
 | Location | Responsibility | During installation or update |
 | --- | --- | --- |
-| [engine/](engine/) | Review model, the single Principles source, workflow, role prompts, and programs | Deployed from the selected upstream Git commit |
+| [engine/](engine/) | Review model, the single Principles source, workflow, role prompts, programs, and release metadata | Deployed from the selected upstream Git commit |
 | [initial/](initial/) | Factory recovery materials, including rule and case templates | Deployed unchanged from the selected upstream Git commit, alongside `engine/` |
 | [current/](current/) | Rules and fixed cases: the project's Registry | Copied from the selected release on first installation; existing host content is preserved |
 | [setup.py](setup.py) | Software installation, updates, source records, and Make integration | Deployed so the host can update itself later |
@@ -37,6 +37,8 @@ curl -fsSL https://raw.githubusercontent.com/yzhang37/code-clair/main/install.sh
 
 The installation target is always `.clarity/` in the current directory. That directory can have no Git repository, belong to a mature Git project with business code, history, build files, and uncommitted changes, or be a subdirectory of an existing Git repository. The installer does not move the target to a parent Git root or initialize Git for you. The machine needs working Git, curl, and Python 3.10+. Git downloads the release; its use does not require the target directory to be a Git repository.
 
+A new installation without `--ref` selects the highest stable release from its chosen source, using numeric version comparison. The bootstrap obtains its manager from a fixed formal-release commit. Prereleases and untagged development commits are available through an explicit `--ref`; they are not silently substituted when the source has no stable release. Later updates retain the selected source and selection mode. Existing installations with an older recorded ref, including `HEAD`, keep that ref's meaning rather than being silently switched to stable-release tracking.
+
 The entry follows this sequence:
 
 1. Check whether the current directory already contains a `.clarity` directory, including an installation with missing program files.
@@ -67,7 +69,7 @@ After installation, update directly:
 
 Updates replace the factory programs, `initial/`, and any existing runtime snapshot. While `current/` exists, updates and reinstallation retain its contents, model and timeout preferences, and adopted review basis. When the whole `current/` directory has to be restored, old adopted text is retired so it cannot override the restored materials; the next explicit review prepares their basis. Updates do not ask about Git tracking again. Directories without Git can also update.
 
-The first installation defaults to HTTPS from `https://github.com/yzhang37/code-clair.git`. Later updates reuse the selected source. To synchronize from a local repository, run in the installation directory:
+The first installation defaults to HTTPS from `https://github.com/yzhang37/code-clair.git`. Later updates reuse the selected source and version selection. To synchronize from a local repository, run in the installation directory:
 
 ```sh
 ./.clarity/update --source ../code-clair
@@ -85,13 +87,51 @@ Maintainers can also run the upstream management program directly from the targe
 python3 ../code-clair/setup.py install --source ../code-clair
 ```
 
-The underlying `setup.py install` and `setup.py update` commands remain available with `--repo`, `--source`, and `--ref`. An explicit `--repo` installs only in that directory, without resolving it to a parent worktree root. Noninteractive installation can use `--track yes` or `--track no` to specify the tracking choice; otherwise it uses the prompt's default. Sources are read only from committed Git versions, and the actual full commit is recorded.
+To select an unpublished local commit deliberately, add `--ref HEAD`. Local synchronization reads committed source; it does not distribute the maintainer's uncommitted working-tree changes.
+
+The underlying `setup.py install` and `setup.py update` commands remain available with `--repo`, `--source`, and `--ref`. An explicit `--repo` installs only in that directory, without resolving it to a parent worktree root. Noninteractive installation can use `--track yes` or `--track no` to specify the tracking choice; otherwise it uses the prompt's default. An explicit `--ref` preserves the selected Git tag, branch, or commit; stable tracking retains the intent to follow stable releases rather than pinning the tag chosen by the last installation. The actual full commit is recorded for either selection mode.
+
+## Versions and update checks
+
+Clarity's release version uses [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html): `MAJOR.MINOR.PATCH`. Every core component is a nonnegative decimal integer with no leading zero; `0` is valid, while `00` and `02` are invalid. Components compare numerically, so `4.2.0 < 4.10.0`. A version is not a floating-point number or a lexically sorted string. Formal versions always contain all three core components.
+
+| Release change | Version change |
+| --- | --- |
+| Backward-compatible correction | `1.2.3` to `1.2.4` |
+| Backward-compatible functionality | `1.2.3` to `1.3.0` |
+| Incompatible supported usage | `1.2.3` to `2.0.0` |
+
+Compatibility covers supported commands, parameters, exit codes, configuration, and installation/update behavior. A higher major version can require migration; it does not authorize replacing a host's `current/`. A prerelease such as `1.3.0-rc.1` precedes `1.3.0`, and numeric prerelease components also reject leading zeros. Build metadata after `+` never changes version precedence.
+
+The single maintained declaration is [engine/release.json](engine/release.json), deployed unchanged as `.clarity/engine/release.json`. It carries `product_version` and the UTC `built_at` timestamp. The installer obtains the actual full commit from Git; it is not handwritten into a file within that same commit. Installation time is recorded separately as `installed_at`. Both local-source and HTTPS installations of the same release retain the same build timestamp; installing or rebuilding old code later does not make its product version newer.
+
+A formal release requires the matching `v<product_version>` Git tag to point to its exact commit and agree with its metadata. Published tags and release content are immutable. An untagged commit is identified as a development build even if its version declaration still contains the preceding release's number. A package without release metadata is unversioned; a known commit remains useful evidence, but the installer does not invent `0.0.0`, guess a historical release number, or use installation time as build time. The first numbered formal release is `1.0.0`.
+
+Run from an installed host:
+
+```sh
+./.clarity/update --version
+./.clarity/update --check
+./.clarity/update
+```
+
+`--version` reads the local installation identity offline, without requiring a Git executable, an Agent, or the ACP Python environment. It reports the release or development/unversioned state, actual commit when recorded, build and installation times, source and selection, and changed or missing factory files. Host `current/` changes are not factory-program modifications.
+
+`--check` retrieves the selected source's candidate and compares it without deployment. It may refresh the download cache; it does not rewrite installed programs, `current/`, model configuration, hooks, the Git index, or the installation record. A failed network operation or insufficient identity evidence is reported as unable to confirm, not as up to date.
+
+Comparison distinguishes a newer candidate, the same release and commit, an older candidate, conflicting identity, development history, and unknown or diverged history. The same formal version number pointing to different commits is an identity conflict. Dates and the alphabetic value of commit hashes do not resolve it. Factory modifications remain visible and retain the existing overwrite protection.
+
+Default update does not silently downgrade to an older candidate. An explicit version selection, for example `./.clarity/update --ref v1.0.0`, requests that exact version, including a deliberate downgrade; it does not reset user materials or preferences. Deploying an old release retains its old identity. A new compatible bug-fix release that withdraws a faulty implementation uses a new patch version; incompatible changes follow the major-version rule. There is no separate system-snapshot or factory-reset subsystem.
+
+Version equality does not skip repair: an update at the same version can still restore missing factory programs or restore an entirely missing `current/` from that release's unchanged `initial/`, under the rules above. Existing modified factory files remain protected. The installation record's existing `version: 1` identifies its record format, not the Clarity product release.
+
+Older installations keep their recorded source, ref, user materials, and preferences. Their old updater does not acquire new query flags until the newer manager is installed; rerunning the installation entry can perform that transition without deleting the sidecar. If an old updater copied new release metadata but did not record tag verification, the product number is shown with an `unverified` release type until a verified update by the new manager records that identity. A known lower product number is still treated as older in this state. Version reporting does not retroactively assign a formal release to an old unversioned package.
 
 ## Installation records and protection boundaries
 
 At an existing Git root, Clarity uses `clarity/` in the Git common directory to preserve existing review configuration and records. Outside Git, or when installed in a repository subdirectory, local state lives in `.clarity/.local/`. If the user later creates a Git repository at that directory, its existing local state remains in use, including review configuration and records. The generated `.clarity/.gitignore` excludes local state and Python caches. Download caches are isolated by source, and a failed source switch leaves the selected source unchanged.
 
-Records include the current and previous sources, actual commits, deployed-file hashes and permissions, Git tracking choice, and Make entry. Missing factory files can be restored, while locally modified factory files and new paths occupied by local files remain protected against overwrite. When a tracked sidecar is cloned without its local records, updating first matches its remaining factory files against upstream history, checking at most the latest 200 ancestors. The Makefile and ignore file generated by that version are checked too; recognizing an existing directory does not grant ownership of arbitrary local files. Retained local installation records do not require manual cleanup merely because factory files or the whole sidecar were deleted.
+Records include the current and previous sources, actual commits, release identity, version-selection intent, deployed-file hashes and permissions, Git tracking choice, and Make entry. Missing factory files can be restored, while locally modified factory files and new paths occupied by local files remain protected against overwrite. When a tracked sidecar is cloned without its local records, updating first matches its remaining factory files against upstream history, checking at most the latest 200 ancestors. The Makefile and ignore file generated by that version are checked too; recognizing an existing directory does not grant ownership of arbitrary local files. Retained local installation records do not require manual cleanup merely because factory files or the whole sidecar were deleted.
 
 Installation and updates provide targets in `.clarity/Makefile` and an include entry in the effective host Makefile, creating a host Makefile when needed. This also applies when tracking is declined or the directory has no Git repository. Existing Makefile content and the default build target are preserved. Conflicting targets owned by others and locally modified managed blocks are not overwritten.
 

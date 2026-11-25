@@ -19,6 +19,30 @@ from unittest.mock import patch
 FACTORY = Path(__file__).resolve().parents[1]
 
 
+def publish_factory(test, directory, message):
+    """publish_factory() 将临时原厂的一次测试交付固定成带号发布，业务仓库提交不经过此入口。
+
+    已有标签不移动；同一测试原厂再次发布时递增补丁号，固定 UTC 构建资料后再提交和打标签。
+    明确删除发布资料的旧布局仍保持未编号，供旧安装识别测试使用，不替历史版本补造身份。
+    """
+    metadata = directory / "engine/release.json"
+    version = None
+    if metadata.is_file():
+        record = json.loads(metadata.read_text())
+        major, minor, patch = (int(part) for part in record["product_version"].split("."))
+        tags = set(test.git(directory, "tag", "--list").splitlines())
+        while "v" + f"{major}.{minor}.{patch}" in tags:
+            patch += 1
+        version = f"{major}.{minor}.{patch}"
+        record.update(product_version=version, built_at="2026-11-25T12:00:00Z")
+        metadata.write_text(json.dumps(record, indent=2) + "\n")
+    test.git(directory, "add", "--all")
+    test.git(directory, "commit", "-q", "-m", message)
+    if version is not None:
+        test.git(directory, "tag", "v" + version)
+    return test.git(directory, "rev-parse", "HEAD")
+
+
 class SidecarSetupTests(unittest.TestCase):
     """SidecarSetupTests() 使每项安装实验拥有独立原厂历史和宿主，不接触真实项目。"""
 
@@ -63,9 +87,8 @@ class SidecarSetupTests(unittest.TestCase):
         return repo
 
     def commit(self, message):
-        self.git(self.source, "add", "--all")
-        self.git(self.source, "commit", "-q", "-m", message)
-        return self.git(self.source, "rev-parse", "HEAD")
+        """commit() 发布当前临时原厂，明确保留每次交付与正式标签的对应。"""
+        return publish_factory(self, self.source, message)
 
     def install(self, *, host=None, check=True):
         target = host or self.host
@@ -312,12 +335,13 @@ class SidecarSetupTests(unittest.TestCase):
         legacy_makefile = make.rendered_sidecar_makefile()
         installer = self.source / "engine/runner/install.py"
         new_files = {"engine/runner/install.py": installer.read_bytes()}
-        directory_dependencies = b'"directory_snapshot.py", "make_integration.py", '
+        directory_dependencies = b'"directory_snapshot.py", "make_integration.py", "release.py", '
         self.assertEqual(new_files["engine/runner/install.py"].count(directory_dependencies), 1)
-        # 旧布局尚无目录审核模块，其安装依赖清单也须匹配旧版，而不是跳过实际缺失检查。
+        # 旧布局尚无目录审核及发布资料模块，依赖清单与缺失文件一并构造，保留真实缺失检查。
         installer.write_bytes(new_files["engine/runner/install.py"].replace(directory_dependencies, b"", 1))
         for name in ("setup.py", "engine/runner/make_integration.py", "engine/runner/test_make_integration.py",
-                     "engine/runner/directory_snapshot.py", "engine/runner/test_directory_snapshot.py"):
+                     "engine/runner/directory_snapshot.py", "engine/runner/test_directory_snapshot.py",
+                     "engine/runner/release.py", "engine/runner/test_release.py", "engine/release.json"):
             path = self.source / name
             if path.exists():
                 new_files[name] = path.read_bytes()
@@ -336,7 +360,7 @@ class SidecarSetupTests(unittest.TestCase):
                           "--repo", str(self.host), "--basis", ".clarity/current/rules.md",
                           "--codex-bin", sys.executable, "--model", "legacy-custom-model",
                           "--reviewers", "3", "--timeout", "41"])
-        for name in ("directory_snapshot.py", "make_integration.py"):
+        for name in ("directory_snapshot.py", "make_integration.py", "release.py"):
             self.assertFalse((sidecar / "engine/runner" / name).exists())
             self.assertFalse((self.host / ".git/clarity/engine/runner" / name).exists())
         hooks = self.host / ".git/hooks"
@@ -365,7 +389,7 @@ class SidecarSetupTests(unittest.TestCase):
                          (sidecar / "engine/runner/commit-msg").read_bytes())
         self.assertFalse((hooks / "pre-commit").exists())
         self.assertTrue((sidecar / "setup.py").exists())
-        for name in ("directory_snapshot.py", "make_integration.py"):
+        for name in ("directory_snapshot.py", "make_integration.py", "release.py"):
             self.assertEqual((sidecar / "engine/runner" / name).read_bytes(),
                              (self.source / "engine/runner" / name).read_bytes())
             self.assertEqual((self.host / ".git/clarity/engine/runner" / name).read_bytes(),
