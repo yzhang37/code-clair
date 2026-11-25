@@ -15,7 +15,8 @@ import time
 
 from install import InstallError, engine_digest, engine_sources
 from material_check import check_materials
-from rules_check import CASES, RULES, CheckIncomplete, check_rules, read_inputs
+from rules_check import CASES, RULES, CheckIncomplete, check_rules, digest, read_inputs
+from model import ADAPTER_FILES, agent_settings, model_config
 
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -65,7 +66,7 @@ def freeze_inputs(repo, config_path):
             "engine_digest": engine_digest(engine),
             "engine_files": {name: hashlib.sha256(content).hexdigest() for name, content in engine.items()},
             "config_path": str(config_path.resolve()),
-            "model_config": {key: config.get(key) for key in ["codex_bin", "model", "timeout"]},
+            "model_config": model_config(agent_settings(config)),
             "config_sha256": hashlib.sha256(config_bytes).hexdigest() if config_bytes is not None else None}
 
 
@@ -95,7 +96,7 @@ def validate_child_input(frozen, stage, child, snapshot):
         engine = frozen["engine_files"]
         expected = {**common, "documents": documents, "material_sha256": frozen["material_sha256"],
                     "protocol_sha256": engine["runner/rules_check.py"],
-                    "adapter_sha256": engine["runner/codex_model.py"],
+                    "adapter_sha256": digest({name: engine["runner/" + name] for name in ADAPTER_FILES}),
                     "reporter_sha256": engine["runner/rules_report.py"],
                     "prompt_sha256": engine["prompts/rules-check.md"]}
     changed = [key for key, value in expected.items() if child.get(key) != value]

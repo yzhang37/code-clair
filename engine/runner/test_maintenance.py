@@ -21,9 +21,10 @@ from unittest.mock import patch
 from make_integration import rendered_sidecar_makefile
 import maintenance
 import material_check
+import acp_model
 import review
 import rules_check
-from codex_model import ModelFailure
+from model_common import ModelFailure
 
 
 RUNNER = Path(__file__).resolve().parent
@@ -58,7 +59,9 @@ OMIT_THE_GIVEN_FACT
 ```
 """
 
-FAKE_CODEX = r'''
+from test_acp_fixture import FAKE_ACP_PRELUDE
+
+FAKE_CODEX = FAKE_ACP_PRELUDE + r'''
 import json
 from pathlib import Path
 import sys
@@ -171,9 +174,9 @@ repo, config, state, trace = map(Path, sys.argv[1:5])
 interrupt_at = int(sys.argv[5])
 sys.path.insert(0, str(repo / ".clarity/engine/runner"))
 import maintenance
-from codex_model import CodexModel
+from acp_model import AcpModel
 
-real_run = CodexModel.run
+real_run = AcpModel.run
 calls = []
 
 def run(self, prompt, schema, directory):
@@ -183,7 +186,7 @@ def run(self, prompt, schema, directory):
         raise KeyboardInterrupt()
     return real_run(self, prompt, schema, directory)
 
-CodexModel.run = run
+AcpModel.run = run
 sys.exit(maintenance.maintain(repo, config, state))
 '''
 
@@ -221,7 +224,8 @@ class IsolatedMaintenanceTests(unittest.TestCase):
         self.fake = self.root / "fake-codex.py"
         self.fake.write_text("#!" + sys.executable + "\n" + FAKE_CODEX)
         self.fake.chmod(0o755)
-        self.config.write_text(json.dumps({"codex_bin": str(self.fake), "model": "offline-maintenance",
+        self.config.write_text(json.dumps({"agent": "custom", "agent_command": [str(self.fake)],
+                                             "codex_bin": str(self.fake), "model": "offline-maintenance",
                                            "timeout": 3}))
         self.set_mode("normal")
         self.cli = self.engine / "runner/review.py"
@@ -286,7 +290,7 @@ class IsolatedMaintenanceTests(unittest.TestCase):
         observed = []
         templates = self.root / "input-templates"
         child_inputs = {}
-        with patch.object(material_check.CodexModel, "run", side_effect=ModelFailure("Synthetic input-only template.")), \
+        with patch.object(acp_model.AcpModel, "run", side_effect=ModelFailure("Synthetic input-only template.")), \
                 redirect_stdout(io.StringIO()):
             for kind in ["rules", "fixtures"]:
                 material_check.check_materials(self.repo, self.config, templates, kind)

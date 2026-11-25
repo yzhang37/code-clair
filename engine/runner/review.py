@@ -19,7 +19,8 @@ import re
 import subprocess
 import time
 
-from codex_model import CodexModel, ModelFailure
+from model_common import ModelFailure
+from model import agent_settings, create_model, model_config
 from install import engine_sources, engine_digest, ENGINE_BASIS_ROOT, InstallError, local_basis, prepare_review
 
 
@@ -576,7 +577,9 @@ def review(repo, target, baseline, config, state, config_path=None):
     responses_file = state / "responses.json"
     responses = json.loads(responses_file.read_text()) if responses_file.exists() else []
     repository = repository_identity(repo, basis, local_materials is not None)
+    resolved_model = agent_settings(config)
     identity = {"tree": current_tree, "baseline": baseline_tree, "config": config,
+                "model_config": model_config(resolved_model),
                 "workflow": digest(texts), "responses": responses, "target_repository": repository}
     if local_materials is not None:
         identity["local_materials"] = local_materials
@@ -595,7 +598,7 @@ def review(repo, target, baseline, config, state, config_path=None):
               "adopted_rules": {p: numbered(f["text"]) for p, f in code_rules.items()}, "human_responses": responses}
     if len(json.dumps(packet, ensure_ascii=False).encode()) > 1_500_000:
         raise Incomplete(tr('Complete snapshot exceeds this trial entry input capacity; batching must be implemented first; nothing was truncated or automatically passed'))
-    model = CodexModel(config.get("codex_bin", "codex"), config.get("model"), config.get("timeout", 300))
+    model = create_model(resolved_model)
     pending_findings = []
     incomplete_scope = tr('basis health check and subsequent review')
     try:
@@ -766,6 +769,9 @@ def main():
     if args.command in {"check-rules", "check-rules-quality", "check-fixtures-quality", "maintain", "maintain-respond"}:
         try:
             repo = Path(git(repo, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+            if args.command != "maintain-respond":
+                from acp_runtime import ensure_runtime
+                ensure_runtime()
             state = control_dir(repo)
             state.mkdir(parents=True, exist_ok=True)
             config_path = Path(args.config) if args.config else state / "config.json"
@@ -781,7 +787,7 @@ def main():
                 if args.command == "maintain-respond":
                     return respond_maintenance(repo, state, response_text(args), args.stage)
                 return maintain(repo, config_path, state)
-        except (Incomplete, ModelFailure, InstallError, OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
+        except (Incomplete, ModelFailure, InstallError, OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError) as error:
             print(tr('Material check or maintenance did not complete: ') + str(error), file=sys.stderr)
             return 2
     root = git(repo, "rev-parse", "--show-toplevel", optional=True)
@@ -810,6 +816,9 @@ def main():
                     return 0
             if installed_project and not (Path(installed_project) / ".clarity/engine/runner/review.py").is_file():
                 return 0
+        if args.command != "respond":
+            from acp_runtime import ensure_runtime
+            ensure_runtime()
         with run_lock(state):
             if args.command == "review" and not args.config:
                 prepare_review(repo, project)
@@ -842,7 +851,7 @@ def main():
             head = git(repo, "rev-parse", "--verify", "HEAD", optional=True)
             baseline = (args.baseline if args.command == "review" else None) or ("HEAD" if head else "empty")
             return review(repo, target, baseline, config, state, config_path)
-    except (Incomplete, ModelFailure, InstallError, OSError, ValueError, TypeError, KeyError) as error:
+    except (Incomplete, ModelFailure, InstallError, OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
         if args.command == "respond":
             print(tr('Code-review response was not saved: ') + str(error), file=sys.stderr)
             return 2

@@ -20,12 +20,14 @@ import shutil
 import stat
 import subprocess
 import tempfile
+from model import agent_settings
+from model_common import ModelFailure
 
 
 HOOK_MARKER = "# clarity-review-hook v1"
 HOOK_NAMES = ("pre-commit",)
-ENGINE_RUNNERS = ("review.py", "codex_model.py", "install.py", "rules_check.py", "rules_report.py",
-                  "material_check.py", "maintenance.py", "i18n.py")
+ENGINE_RUNNERS = ("review.py", "model_common.py", "acp_model.py", "acp_runtime.py", "model.py", "pi_entry.py",
+                  "install.py", "rules_check.py", "rules_report.py", "material_check.py", "maintenance.py", "i18n.py")
 REQUIRED_PROMPTS = ("health.md", "fixtures.md", "review.md", "summarize.md", "learn.md", "rules-check.md",
                     "material-check.md")
 DEFAULT_BASIS_SELECTIONS = (".clarity/current/rules.md", ".clarity/current/cases")
@@ -165,14 +167,6 @@ def basis_files(repo: Path, requested: list[str]) -> list[str]:
     return sorted(collected)
 
 
-def codex_executable(requested: str | None) -> str:
-    """codex_executable() 固定实际可执行文件位置，避免 hook 从另一套 PATH 误选调用器。"""
-    executable = shutil.which(requested or "codex")
-    if not executable:
-        raise InstallError(tr('Codex CLI executable was not found; install it or provide --codex-bin PATH.'))
-    return str(Path(executable).resolve())
-
-
 def hook_script(name: str, engine_dir: Path, config_path: Path) -> bytes:
     """hook_script() 生成只转交给同一审核入口的 pre-commit hook，保留 Git 的索引环境。
 
@@ -279,6 +273,8 @@ def prepare_review(repo: Path, project: Path | None = None) -> None:
                                  "basis_worktree", "basis_ignored", "cases_root", "basis_reset"}}
     preserved["sidecar_project"] = str(project)
     args = argparse.Namespace(repo=str(repo), basis=selections, codex_bin=previous.get("codex_bin"),
+                              agent=previous.get("agent"), agent_command=previous.get("agent_command"),
+                              agent_bin=previous.get("agent_bin"),
                               model=previous.get("model"), reviewers=previous.get("reviewers", 2),
                               timeout=previous.get("timeout", 600))
     install(args, with_hook=False, adopted_local=materials, ignored_local=ignored, preserved_config=preserved)
@@ -299,7 +295,12 @@ def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ign
     # 首次手动审核允许尚无案例目录；仍在配置保留完整选择边界，以便后续新增案例作为候选进入。
     requested = args.basis if with_hook else [name for name in args.basis if (repo / name).exists()]
     adopted_basis = basis_files(repo, requested)
-    executable = codex_executable(args.codex_bin)
+    settings = agent_settings({**(preserved_config or {}),
+                               **{key: getattr(args, key, None) for key in
+                                  ("agent", "agent_command", "agent_bin", "codex_bin")
+                                  if getattr(args, key, None) is not None}},
+                              from_environment=not any((preserved_config or {}).get(key) for key in
+                                                       ("agent", "agent_command", "agent_bin", "codex_bin")))
     clarity_dir = common_dir / "clarity"
     engine_dir = clarity_dir / "engine"
     config_path = clarity_dir / "config.json"
@@ -315,8 +316,8 @@ def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ign
         "basis_selections": list(args.basis or DEFAULT_BASIS_SELECTIONS),
         # 两个独立首审用于之后交叉反证；这是默认编排，不是多数票放行门槛。
         "reviewers": args.reviewers,
-        "codex_bin": executable,
-        # 隔离审核入口不继承用户模型别名；未明确选择时使用已验证可用的 CLI 内置默认。
+        **{key: settings[key] for key in ("agent", "agent_command", "agent_bin", "codex_bin") if key in settings},
+        # 不指定模型时沿用所选 Agent 的默认；Pi 自己管理供应商与模型，不在审核器维护目录。
         "model": args.model,
         # 每次模型调用有边界，超时须报告审核未完成，不能伪装代码失败或通过。
         "timeout": args.timeout,
@@ -345,6 +346,7 @@ def install(args: argparse.Namespace, *, with_hook=True, adopted_local=None, ign
             destination = staged_engine / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(content)
+            destination.chmod(stat.S_IMODE((source_root / name).stat().st_mode))
         moved_previous = False
         installed_engine = False
         written_hooks: list[str] = []
@@ -402,8 +404,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=tr('Install or uninstall the repository-local Clarity code-review pre-commit hook.'))
     parser.add_argument("--repo", required=True, help=tr('Target Git repository directory.'))
     parser.add_argument("--basis", action="append", default=[], metavar="RELPATH", help=tr('Explicit basis file or directory in the target repository; may be repeated.'))
-    parser.add_argument("--model", help=tr('Explicit Codex model; otherwise use the CLI built-in default.'))
+    parser.add_argument("--model", help='Explicit agent model; otherwise use the selected agent default.')
     parser.add_argument("--codex-bin", metavar="PATH", help=tr('Codex executable; default is resolved from the current PATH.'))
+    parser.add_argument("--agent", choices=("pi", "codex", "custom"), help="Local review agent; new configurations prefer installed Pi.")
+    parser.add_argument("--agent-command", type=json.loads, help="Existing ACP server command as a JSON argument array.")
     parser.add_argument("--reviewers", type=int, default=2, help=tr('Independent first reviewers, 2..8; default is 2.'))
     parser.add_argument("--timeout", type=int, default=300, help=tr('Timeout per model call in seconds; default is 300.'))
     parser.add_argument("--uninstall", action="store_true", help=tr('Uninstall only the pre-commit hook owned by this installer.'))
@@ -412,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(tr('--reviewers must be 2..8 and --timeout must be greater than 0.'))
     try:
         uninstall(args) if args.uninstall else install(args)
-    except (InstallError, OSError) as error:
+    except (InstallError, ModelFailure, OSError, ValueError) as error:
         print(tr('Clarity review activation did not complete: ') + str(error), file=sys.stderr)
         return 2
     return 0

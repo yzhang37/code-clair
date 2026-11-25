@@ -92,7 +92,9 @@ COMPLETE_FCASE_END_{label}
 """
 
 
-FAKE_CODEX = r'''
+from test_acp_fixture import FAKE_ACP_PRELUDE
+
+FAKE_CODEX = FAKE_ACP_PRELUDE + r'''
 import json
 from pathlib import Path
 import sys
@@ -106,7 +108,8 @@ schema = Path(sys.argv[sys.argv.index("--output-schema") + 1])
 calls = fixture_path.parent / "calls"
 calls.mkdir(exist_ok=True)
 ordinal = len(list(calls.glob("*.json"))) + 1
-progress = json.loads((output.parent.parent / "result.json").read_text())
+progress_files = sorted((Path(fixture["repo"]) / ".git/clarity/material-checks" / packet["kind"]).glob("run-*/result.json"))
+progress = json.loads(progress_files[-1].read_text())
 (calls / f"{ordinal:04}.json").write_text(json.dumps({
     "packet": packet, "prompt": prompt, "schema": json.loads(schema.read_text()),
     "argv": sys.argv[1:], "progress": progress,
@@ -204,7 +207,8 @@ class IsolatedMaterialCheckTests(unittest.TestCase):
         self.fake.chmod(0o755)
         self.fixture_path = self.fake.with_suffix(".json")
         self.config_path = self.root / "quality config.json"
-        self.config_path.write_text(json.dumps({"codex_bin": str(self.fake), "model": "offline-material-check",
+        self.config_path.write_text(json.dumps({"agent": "custom", "agent_command": [str(self.fake)],
+                                             "codex_bin": str(self.fake), "model": "offline-material-check",
                                                 "timeout": 3}))
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "Offline Material Fixture")
@@ -248,7 +252,7 @@ class IsolatedMaterialCheckTests(unittest.TestCase):
     def set_mode(self, mode, **extra):
         for path in (self.root / "calls").glob("*.json"):
             path.unlink()
-        self.fixture_path.write_text(json.dumps({"mode": mode, **extra}))
+        self.fixture_path.write_text(json.dumps({"mode": mode, "repo": str(self.repo), **extra}))
 
     def check_quality(self, kind, *, cwd=None, repo=None):
         return self.execute([sys.executable, str(self.engine / "runner/review.py"),
@@ -401,7 +405,9 @@ class IsolatedMaterialCheckTests(unittest.TestCase):
     def test_material_engine_and_config_changes_during_a_call_invalidate_the_result(self):
         targets = [self.repo / RULE_PATH, self.engine / "principles.md", self.engine / "README.md",
                    self.engine / "prompts/material-check.md", self.engine / "runner/material_check.py",
-                   self.engine / "runner/codex_model.py", self.config_path]
+                   self.engine / "runner/acp_model.py", self.engine / "runner/model_common.py",
+                   self.engine / "runner/model.py", self.engine / "runner/pi_entry.py",
+                   self.engine / "runner/acp_runtime.py", self.config_path]
         for target in targets:
             with self.subTest(target=target.relative_to(self.root).as_posix()):
                 original = target.read_bytes()

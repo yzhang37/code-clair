@@ -13,7 +13,8 @@ import json
 import re
 import time
 
-from codex_model import CodexModel, ModelFailure
+from model_common import ModelFailure
+from model import ADAPTER_FILES, agent_settings, create_model, model_config
 from rules_report import emit, finish_report, prepare_report, sample_result, save_report
 
 
@@ -354,8 +355,7 @@ def check_rules(repo, config_path, state):
             raise CheckIncomplete(tr('Model configuration must be a JSON object'))
         prompt = prompt_path.read_text()
         protocol = Path(__file__).read_bytes()
-        adapter_path = Path(__file__).parent / "codex_model.py"
-        adapter = adapter_path.read_bytes()
+        adapter = {name: (Path(__file__).parent / name).read_bytes() for name in ADAPTER_FILES}
         reporter_path = Path(__file__).parent / "rules_report.py"
         reporter = reporter_path.read_bytes()
         frozen = {"repository": str(repo), "documents": documents,
@@ -363,9 +363,9 @@ def check_rules(repo, config_path, state):
                   "prompt": prompt, "prompt_sha256": hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
                   "config_sha256": hashlib.sha256(config_bytes).hexdigest() if config_bytes is not None else None,
                   "protocol_sha256": hashlib.sha256(protocol).hexdigest(),
-                  "adapter_sha256": hashlib.sha256(adapter).hexdigest(),
+                  "adapter_sha256": digest({name: hashlib.sha256(raw).hexdigest() for name, raw in adapter.items()}),
                   "reporter_sha256": hashlib.sha256(reporter).hexdigest(),
-                  "model_config": {key: config.get(key) for key in ["codex_bin", "model", "timeout"]}}
+                  "model_config": model_config(agent_settings(config))}
         snapshot = digest(frozen)
         report["snapshot_id"] = snapshot
         directory.mkdir(parents=True, exist_ok=True)
@@ -375,7 +375,7 @@ def check_rules(repo, config_path, state):
         save_report(directory, report)
         emit(tr('Rule verification: {v0} cases / {v1} subcases', v0=(len(report['reason_checks'])), v1=(len(samples))))
         emit(tr('Stage 1: independent classification (correct rejection of a negative example also matches)'))
-        model = CodexModel(config.get("codex_bin", "codex"), config.get("model"), config.get("timeout", 300))
+        model = create_model(config)
         rules = documents[RULES]
         predictions = {}
         previous_case = None
@@ -436,7 +436,8 @@ def check_rules(repo, config_path, state):
         if (read_inputs(repo) != documents
                 or {path: hashlib.sha256((repo / path).read_bytes()).hexdigest() for path in documents}
                 != frozen["material_sha256"] or prompt_path.read_text() != prompt
-                or Path(__file__).read_bytes() != protocol or adapter_path.read_bytes() != adapter
+                or Path(__file__).read_bytes() != protocol
+                or {name: (Path(__file__).parent / name).read_bytes() for name in ADAPTER_FILES} != adapter
                 or reporter_path.read_bytes() != reporter):
             raise CheckIncomplete(tr('Rules, cases, or the classification protocol changed during verification'))
         if (config_file.read_bytes() if config_file.exists() else None) != config_bytes:

@@ -1,6 +1,6 @@
 # 本地审核器运行说明
 
-本目录是 `engine/` 的执行程序，使用 Python 标准库及独立 Codex CLI；目标仓库不因此改变技术栈。当前提供代码审核、独立材料质量检查、固定案例回归、组合材料维护、回应保存及 commit-msg，Pi 尚未接入。对象与职责见 [Engine 审核模型](../README.md)，编写质量统一使用 [Principles](../principles.md)，执行流程见 [workflow.md](../workflow.md)。
+本目录是 `engine/` 的执行程序，通过同一个 ACP Python 客户端连接本地 Agent；Pi 和 Codex 使用已有 ACP 适配器，目标仓库不因此改变技术栈。当前提供代码审核、独立材料质量检查、固定案例回归、组合材料维护、回应保存及 commit-msg。对象与职责见 [Engine 审核模型](../README.md)，编写质量统一使用 [Principles](../principles.md)，执行流程见 [workflow.md](../workflow.md)。
 
 ## 已确认要求与当前实现
 
@@ -22,7 +22,7 @@
 
 本节 Make 命令在安装后的宿主根目录运行。原厂仓库直接使用根 `engine/`，宿主才使用 `.clarity/engine/`；软件安装、Git 更新和生成 Make 入口见[安装说明](../../README.md#installation-and-updates)。原厂根 Makefile 只负责离线测试。
 
-需要 Python 3.10+、有已跟踪代码的 Git 仓库和可用的独立 Codex CLI；配置未指定模型时使用 CLI 默认。API key/auth.json 认证适配已有，只有系统钥匙串的方式仍未验证。软件可安装或更新到没有 Git 的目录，但不会初始化 Git；代码审核在这种目录明确报告需要 Git 仓库和已跟踪代码。
+需要 Python 3.10+（含 `venv`、`pip`）、有已跟踪代码的 Git 仓库，以及已安装并完成认证的本地 Pi 或 Codex。第一次审核在用户私有缓存准备固定版本的 ACP Python 依赖，不把包装进宿主或全局 Python。适配器优先使用 `PATH` 中已有的程序，否则通过 `npx` 启动固定版本的 npm 包；该后备方式需要 Node/npm。认证与账号可用模型由所选 Agent 自己处理，不写入审核报告。软件可安装或更新到没有 Git 的目录，但不会初始化 Git；代码审核在这种目录明确报告需要 Git 仓库和已跟踪代码。
 
 安装和更新都会生成 `.clarity/Makefile`，并在宿主实际生效的 Makefile 加入入口；没有宿主 Makefile 时创建它。已有正文及默认构建目标保留，拒绝覆盖外来同名目标或被修改的托管块。是否选择 Git tracking 只决定自动暂存，不决定能否运行 Make 入口；默认 no 保留原有索引。
 
@@ -36,9 +36,11 @@
 make review
 ```
 
+新审核配置优先选择已安装的 Pi，其次 Codex；第一次可用 `CLARITY_AGENT=pi make review` 或 `CLARITY_AGENT=codex make review` 明确选择。选择保存后，后续审核和更新保持它，不因 shell 环境变化重选。旧 `codex_bin` 配置保留执行文件偏好，通信改走 ACP。可用 `CLARITY_AGENT_COMMAND` 在新配置中提供已有 ACP 服务的 JSON 参数数组，保存为 `agent_command`；各审核阶段仍共用同一客户端与结果校验，不维护多套原生 CLI 输出解析器。
+
 安装器复制版本中已有资料，不为宿主改写规则，也不凭复制完成宣称材料质量通过。准备审核时，缺失或空白的 rules 会明确拒绝，提示填写 `.clarity/current/rules.md` 后重新运行；不因规则与 `initial/` 相同就拒绝，材料质量与可用性由实际审核判断。软件安装和恢复不对 `initial/` 附加审核就绪要求。初次建立本机依据时，与同版底稿相同的 `.clarity/current/cases/case.md` 不作为正式 fixture；没有其他案例时保留 `no_coverage`，已有正式规则仍可用于代码审核，不把没有覆盖说成 fixtures 验收通过。
 
-首次 `make review` 或 `make review-staged` 在配置缺失时调用 `prepare_review()`，在审核锁内建立配置和运行引擎快照，不安装 hook。已有 `current/` 被保留时，配置与采用依据保持原样，不因更新或重装重新采用资料，也不重置自定义模型或超时参数。整个 `current/` 被恢复时，旧采用正文不再覆盖恢复后的资料，由下一次明确执行的审核重新准备依据。新配置默认选择 `.clarity/current/rules.md` 和 `.clarity/current/cases/`，使用 Codex CLI 默认模型、两个首审及每次调用 600 秒上限。
+首次 `make review` 或 `make review-staged` 在配置缺失时调用 `prepare_review()`，在审核锁内建立配置和运行引擎快照，不安装 hook。已有 `current/` 被保留时，配置与采用依据保持原样，不因更新或重装重新采用资料，也不重置自定义模型或超时参数。整个 `current/` 被恢复时，旧采用正文不再覆盖恢复后的资料，由下一次明确执行的审核重新准备依据。新配置默认选择 `.clarity/current/rules.md` 和 `.clarity/current/cases/`，使用所选 Agent 默认模型、两个首审及每次调用 600 秒上限。Pi 自己管理供应商与默认模型；显式 `model` 通过 Agent 公布的 ACP 模型选项设置，不把供应商目录复制进 Clarity。
 
 新建配置或在整个 `current/` 恢复后重建采用关系时，保存当前生效的本机资料原文为 `basis_snapshot`，并记录 `basis_source=local`；即使 HEAD 中仍有旧资料，也采用当前本机原文，不要求先将 `.clarity/current/` 加入 Git。该配置绑定采用时的工作树，保存正文、模式及 SHA-256 标识；本机标识不是 Git 对象。之后冻结本次本机资料，与已保存的采用原文配对；新增或修订内容作为候选，不因重新运行审核或启用 hook 自动成为正式依据。未填案例底稿的排除按配置中保存的底稿哈希判断；填写后进入候选集合。审核输入标识包含本机资料，结束时重新读取资料、配置和仓库身份核对，变化时报告未完成。
 
@@ -65,7 +67,7 @@ make review-install
 
 运行引擎复制到 Git common dir 并绑定版本，包括模型正文、唯一 Principles、流程、全部共享 Markdown 提示词及安装清单中的 runner 模块。已有快照不会随源文件编辑自动更新。普通仓库通常使用 `.git/clarity/`，worktree 由 Git 决定控制目录。commit-msg 执行该运行快照，读取 Git 实际索引，包括 Git 传入的 GIT_INDEX_FILE，保持部分提交和未暂存修改的边界。直接调用 Python 审核安装器仍会安装 pre-commit，不等于上述可选 commit-msg 入口。源码、运行快照及某次审核实际使用的版本须分别核对；源码或文档存在不表示实际语义审核已经执行或通过。
 
-下述独立材料检查和组合维护由 Make 调用源工作树的 runner，读取工作树材料，不要求安装引擎摘要匹配。它们只复用配置中的 Codex 可执行文件、模型和调用上限；没有配置时使用 `codex`、CLI 默认模型和 300 秒上限。它们固定使用 `.clarity/current/rules.md` 与 `.clarity/current/cases/`，不沿用代码审核的自定义 `--basis`。独立入口可在安装前运行，但不能据此认为代码入口或 hook 已刷新。
+下述独立材料检查和组合维护由 Make 调用源工作树的 runner，读取工作树材料，不要求安装引擎摘要匹配。它们复用同一份 Agent 启动配置、模型和调用上限；没有配置时按已安装 Pi、Codex 的顺序选择，使用 Agent 默认模型和 300 秒上限。它们固定使用 `.clarity/current/rules.md` 与 `.clarity/current/cases/`，不沿用代码审核的自定义 `--basis`。独立入口可在安装前运行，但不能据此认为代码入口或 hook 已刷新。
 
 显式启用 hook 后，在 SourceTree 中正常暂存文件、填写提交说明、点击提交即可触发。审核未通过时，SourceTree 的提交错误结果中会显示 hook 输出。若仍要提交，在提交说明另起一行填写：
 
@@ -186,6 +188,6 @@ sh .clarity/engine/runner/commit-msg --uninstall
 
 ## 已知限制
 
-真实试跑曾出现注释重复及独立待办缺标记被全部模型漏审；控制流程回归通过不证明语义可靠。fixtures 兼容核对仍不能证明真实代码不存在误判或漏判。正式知识自动整理、Pi 及更完整的恢复仍未实现；learn 提示词不会自行写回规则或案例。
+真实试跑曾出现注释重复及独立待办缺标记被全部模型漏审；控制流程回归通过不证明语义可靠。fixtures 兼容核对仍不能证明真实代码不存在误判或漏判。正式知识自动整理仍未实现；learn 提示词不会自行写回规则或案例。
 
 当前代码审核仍交付完整快照和已采用依据，尚未按代码主题分批。来源原文作为已跟踪文件可在完整快照中出现，但不作为另一套正式规则。超过 1.5 MB、二进制、非 UTF-8、子模块、符号链接或其他不支持的 Git 文件模式明确返回未完成，不截断或跳过后声称覆盖。大范围适用规则的压缩等价性仍需用有效证据与固定 fixtures 持续核验。

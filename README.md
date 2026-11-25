@@ -113,11 +113,17 @@ Localization applies only to interface labels, help, errors, and progress. Rule 
 
 ## Running reviews in a host
 
-Review requires a Git repository with tracked code, Python 3.10+, and a working standalone Codex CLI. First installation includes the selected release's existing rules and cases. Check that `.clarity/current/rules.md` expresses the standards you want to use, then run from the host directory:
+Review requires a Git repository with tracked code, Python 3.10+ with `venv` and `pip`, and an installed, authenticated local Agent. Pi and Codex use the same ACP Python client through their existing ACP adapters. First installation includes the selected release's existing rules and cases. Check that `.clarity/current/rules.md` expresses the standards you want to use, then run from the host directory:
 
 ```sh
 make review
 ```
+
+For a new review configuration, Clarity prefers an installed Pi, then Codex. Use `CLARITY_AGENT=pi make review` or `CLARITY_AGENT=codex make review` to choose explicitly on that first review. The choice is saved; later reviews and software updates retain it. Existing `codex_bin` configurations keep their Codex executable preference and now connect through ACP.
+
+The first review prepares the pinned ACP Python dependencies in a private user cache. It does not install packages into the host project or global Python. An ACP adapter already on `PATH` is used directly; otherwise Clarity uses `npx` to run its pinned adapter package, so Node/npm must be available for that fallback. Pi or Codex itself must already be installed and authenticated. Model and account availability are determined by that Agent; Clarity does not copy credentials into review reports.
+
+The saved `model` remains optional. Pi manages its own providers and default model; an explicit model is selected through the Agent's advertised ACP model options. Other ACP agents can be selected with `CLARITY_AGENT_COMMAND`, a JSON argument array saved as `agent_command` when preparing a new configuration. The review workflow and result checks are shared; Clarity does not parse each Agent's native CLI output.
 
 The installer copies release materials and prepares Make entries. It does not rewrite the rules for the host or certify their quality. Missing or blank rules are rejected when preparing review, with a message to fill the rules and run again. Rules are not rejected merely because they match `initial/`; their quality and usability are checked by the actual review. Software installation and recovery impose no review-readiness requirement on `initial/`. The unchanged case template is not a formal fixture in a new local-basis configuration. Code review can proceed without fixtures, recording `no_coverage`; this does not establish that the rules passed fixture validation.
 
@@ -156,8 +162,8 @@ Objects, responsibilities, and terminology are maintained in the [Engine model](
 
 `current/rules.md` is a standalone standard for writing and reviewing code. `current/cases/` tests rules using fixed positive and negative expectations, premises, rationales, and scope; it adds no code criteria. One Markdown file manages one case, with additions concerning the same judgment kept in that file. Template headings and unfilled fields are not formal review basis materials; empty templates do not make code pass automatically.
 
-Review checks basis health and compatibility per case before organizing independent code review, counterevidence checks, and a summary. Full capabilities, exit codes, record locations, and limitations are documented in the [runner guide](engine/runner/README.md). Call failures or quotation and coverage gaps cannot be marked as passes. Passing fixed cases does not prove that unknown code has no false positives or missed findings. Pi and automatic knowledge organization are not integrated.
+Review checks basis health and compatibility per case before organizing independent code review, counterevidence checks, and a summary. Full capabilities, exit codes, record locations, and limitations are documented in the [runner guide](engine/runner/README.md). Call failures or quotation and coverage gaps cannot be marked as passes. Passing fixed cases does not prove that unknown code has no false positives or missed findings. Automatic knowledge organization is not integrated.
 
 ## Upstream verification
 
-Run `make test` in this repository. Offline tests use temporary upstream and host Git repositories and fake models to check the existing review flow, Make integration, installation, and updates. They do not run target business programs or real model reviews. The upstream Makefile does not provide host `review` targets.
+Run `make test` in this repository. Offline tests use temporary upstream and host Git repositories and deterministic ACP agent fixtures to check the review flow, Make integration, installation, and updates. They do not run target business programs or real model reviews. The upstream Makefile does not provide host `review` targets.

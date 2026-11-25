@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_review.py() 用临时 Git 仓库核验审核编排和 hooks 的拒绝放行边界。
 
-确定性 Codex 夹具只验证输入、证据传输和 Git 行为，不验证真实模型的语义审核能力。
+确定性 ACP 夹具只验证输入、证据传输和 Git 行为，不验证真实模型的语义审核能力。
 所有目标、commit hook 和模型进程均在 TemporaryDirectory 中；不运行业务测试或联网。
 """
 
@@ -23,7 +23,9 @@ TEMPLATE = b"Template fixture: do not replace this with adopted repository rules
 CASE = "# Empty input\n\n## 正例\nGuard empty input before indexing.\n\n## 反例\nIndex without checking empty input.\n\n## 理由与边界\nAn empty input has no first value.\n"
 
 
-FAKE_CODEX = r'''
+from test_acp_fixture import FAKE_ACP_PRELUDE
+
+FAKE_CODEX = FAKE_ACP_PRELUDE + r'''
 import json
 from pathlib import Path
 import sys
@@ -230,6 +232,7 @@ class IsolatedReviewTests(unittest.TestCase):
         self.fake = self.root / "fake-codex.py"
         self.fake.write_text("#!" + sys.executable + "\n" + FAKE_CODEX)
         self.fake.chmod(0o755)
+        self.environment.update(CLARITY_AGENT="custom", CLARITY_AGENT_COMMAND=json.dumps([str(self.fake)]))
         self.fixture_path = self.fake.with_suffix(".json")
         self.fixture_path.write_text(json.dumps({"mode": "normal"}))
         self.git("init", "-q", "-b", "main")
@@ -764,7 +767,7 @@ class IsolatedReviewTests(unittest.TestCase):
         latest = json.loads((self.state / "latest.json").read_text())
         frozen = json.loads((Path(latest["run"]) / "input.json").read_text())
         self.assertEqual(frozen["target_repository"], identity)
-        keys = ("tree", "baseline", "config", "workflow", "responses", "target_repository")
+        keys = ("tree", "baseline", "config", "model_config", "workflow", "responses", "target_repository")
         bound_input = {key: frozen[key] for key in keys}
         snapshot = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         self.assertEqual(snapshot(bound_input), latest["snapshot_id"])

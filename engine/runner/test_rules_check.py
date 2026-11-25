@@ -22,7 +22,9 @@ CASES = RUNNER.parents[1] / "current" / "cases"
 BASELINE_RULE = "BASELINE_ONLY_RULE_MUST_NOT_REACH_THE_CLASSIFIER\n"
 WORKTREE_RULE = "Working tree policy is the sole selected rule for this offline transport test.\n"
 
-FAKE_CODEX = r'''
+from test_acp_fixture import FAKE_ACP_PRELUDE
+
+FAKE_CODEX = FAKE_ACP_PRELUDE + r'''
 import json
 from pathlib import Path
 import sys
@@ -150,7 +152,8 @@ class IsolatedRulesCheckTests(unittest.TestCase):
         self.fake.chmod(0o755)
         self.fixture_path = self.fake.with_suffix(".json")
         self.config_path = self.root / "rules-check-config.json"
-        self.config_path.write_text(json.dumps({"codex_bin": str(self.fake), "model": "offline-rules-check",
+        self.config_path.write_text(json.dumps({"agent": "custom", "agent_command": [str(self.fake)],
+                                             "codex_bin": str(self.fake), "model": "offline-rules-check",
                                                 "timeout": 3}))
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "Offline Rules Fixture")

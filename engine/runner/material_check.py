@@ -12,7 +12,8 @@ import hashlib
 import json
 import time
 
-from codex_model import CodexModel, ModelFailure
+from model_common import ModelFailure
+from model import agent_settings, create_model, model_config
 from install import engine_digest, engine_sources, InstallError
 
 
@@ -268,7 +269,7 @@ def check_materials(repo, config_path, state, kind):
                   "prompt": prompt, "engine_digest": engine_digest(engine_bytes),
                   "engine_sha256": {name: hashlib.sha256(raw).hexdigest() for name, raw in engine_bytes.items()},
                   "config_sha256": hashlib.sha256(config_bytes).hexdigest() if config_bytes is not None else None,
-                  "model_config": {key: config.get(key) for key in ["codex_bin", "model", "timeout"]}}
+                  "model_config": model_config(agent_settings(config))}
         snapshot = digest(frozen)
         report["snapshot_id"] = snapshot
         for path, text in documents.items():
@@ -278,7 +279,7 @@ def check_materials(repo, config_path, state, kind):
         save_json(directory / "input.json", frozen)
         save_report(directory, report)
         print(tr('{v0} writing quality: {v1} complete materials; checked against the same Principles', v0=(kind), v1=(len(documents))), flush=True)
-        model = CodexModel(config.get("codex_bin", "codex"), config.get("model"), config.get("timeout", 300))
+        model = create_model(config)
         for index, active in enumerate(report["materials"], 1):
             started = time.monotonic()
             active["status"] = "running"

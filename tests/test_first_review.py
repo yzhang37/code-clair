@@ -33,6 +33,7 @@ class FirstReviewTests(unittest.TestCase):
         self.fake = self.binary / 'codex'
         self.fake.write_text('#!' + sys.executable + '\n' + FAKE_CODEX)
         self.fake.chmod(0o755)
+        self.environment.update(CLARITY_AGENT='custom', CLARITY_AGENT_COMMAND=json.dumps([str(self.fake)]))
         self.fake.with_suffix('.json').write_text(json.dumps({'mode': 'normal'}))
         self.environment['PATH'] = str(self.binary) + os.pathsep + self.environment.get('PATH', os.defpath)
         (self.host / 'legacy.py').write_text(BROKEN)
@@ -192,7 +193,7 @@ class FirstReviewTests(unittest.TestCase):
         self.assertTrue(reset['basis_reset'])
         self.assertEqual(reset['sidecar_project'], str(child))
         self.assertFalse({'basis', 'basis_hashes', 'basis_snapshot'} & reset.keys())
-        for name in ('model', 'reviewers', 'timeout', 'codex_bin', 'owner_preference'):
+        for name in ('agent', 'agent_command', 'model', 'reviewers', 'timeout', 'owner_preference'):
             self.assertEqual(reset[name], old[name])
         self.run_command(['make', 'review'], cwd=child, check=False)
         self.assertEqual(self.result()[0]['status'], 'issues')
@@ -202,7 +203,7 @@ class FirstReviewTests(unittest.TestCase):
         self.assertEqual(adopted['basis_snapshot'][key]['text'], (self.source / 'initial/rules.md').read_text())
         self.assertNotEqual(adopted['basis_snapshot'], old['basis_snapshot'])
         self.assertEqual(adopted['basis_worktree'], str(self.host))
-        for name in ('model', 'reviewers', 'timeout', 'codex_bin', 'owner_preference'):
+        for name in ('agent', 'agent_command', 'model', 'reviewers', 'timeout', 'owner_preference'):
             self.assertEqual(adopted[name], old[name])
         self.assertEqual(self.directory_state(rule.parent), self.directory_state(self.source / 'initial'))
         active_config = config_path.read_bytes()
@@ -264,7 +265,7 @@ class FirstReviewTests(unittest.TestCase):
         reset = json.loads(config_path.read_text())
         self.assertTrue(reset['basis_reset'])
         self.assertFalse({'basis', 'basis_hashes', 'basis_snapshot'} & reset.keys())
-        for name in ('model', 'reviewers', 'timeout', 'codex_bin', 'owner_preference'):
+        for name in ('agent', 'agent_command', 'model', 'reviewers', 'timeout', 'owner_preference'):
             self.assertEqual(reset[name], old[name])
         calls_before = self.calls()
         message = self.root / 'pending-adoption-message.txt'
@@ -283,7 +284,7 @@ class FirstReviewTests(unittest.TestCase):
         self.assertEqual(adopted['basis_snapshot']['.clarity/current/rules.md']['text'],
                          (self.source / 'initial/rules.md').read_text())
         self.assertNotEqual(adopted['basis_snapshot'], old['basis_snapshot'])
-        for name in ('model', 'reviewers', 'timeout', 'codex_bin', 'owner_preference'):
+        for name in ('agent', 'agent_command', 'model', 'reviewers', 'timeout', 'owner_preference'):
             self.assertEqual(adopted[name], old[name])
 
     def test_deleted_sidecar_disables_own_commit_hook_and_preserves_foreign_hook(self):
