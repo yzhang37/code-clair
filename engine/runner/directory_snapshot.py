@@ -81,7 +81,10 @@ def read_snapshot(root, *, max_bytes=MAX_BYTES):
             material = _text_file(ignore_file, max_bytes)
             if material is None:
                 raise ValueError("Project .gitignore is not UTF-8 text: " + str(ignore_file))
-            rules = [*inherited, (folder, GitIgnoreSpec.from_lines(material[0].splitlines()))]
+            # Git 将文件开头的 UTF-8 BOM 当编码标记；只在规则解析时移除，防止第一条排除失效。
+            # 冻结到 files 的 .gitignore 原文仍保留 BOM，不改写用户文件或读取被排除目录的正文。
+            patterns = material[0].removeprefix("\ufeff")
+            rules = [*inherited, (folder, GitIgnoreSpec.from_lines(patterns.splitlines()))]
         with os.scandir(folder) as scanned:
             entries = sorted(scanned, key=lambda entry: entry.name)
         for entry in entries:

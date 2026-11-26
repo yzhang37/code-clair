@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import directory_snapshot
 from directory_snapshot import read_snapshot
 from make_integration import INCLUDE_BLOCK
 
@@ -60,6 +61,34 @@ class DirectorySnapshotTests(unittest.TestCase):
         self.assertEqual(set(snapshot["files"]), {".gitignore", "keep.tmp", "src/.gitignore", "src/keep.log"})
         self.assertEqual(snapshot["excluded"], {"discard.tmp": "gitignore", "ignored/": "gitignore",
                                                   "src/discard.log": "gitignore"})
+
+    def test_utf8_bom_rules_prune_root_and_nested_directories(self):
+        """test_utf8_bom_rules_prune_root_and_nested_directories() 核对第一条规则生效且冻结原文保留 BOM。
+
+        被排除目录放入超限文本，并记录目录遍历与正文读取，避免先读依赖后从结果中丢弃。
+        """
+        raw_ignores = {".gitignore": b"\xef\xbb\xbfdist/\n",
+                       "src/.gitignore": b"\xef\xbb\xbfnode_modules/\n"}
+        for name, raw in raw_ignores.items():
+            self.write(name, raw)
+        self.write("dist/generated.js", b"x" * 129)
+        self.write("src/node_modules/package/index.js", b"x" * 129)
+        self.write("src/app.py", b"value = 1\n")
+        with patch("directory_snapshot._text_file", wraps=directory_snapshot._text_file) as reads, \
+                patch("directory_snapshot.os.scandir", wraps=os.scandir) as scans:
+            snapshot = read_snapshot(self.root, max_bytes=128)
+        self.assertEqual(set(snapshot["files"]), {".gitignore", "src/.gitignore", "src/app.py"})
+        self.assertEqual(snapshot["excluded"], {"dist/": "gitignore", "src/node_modules/": "gitignore"})
+        scanned = {Path(call.args[0]).resolve().relative_to(self.root.resolve()).as_posix()
+                   for call in scans.call_args_list}
+        self.assertEqual(scanned, {".", "src"})
+        read_files = {Path(call.args[0]).resolve().relative_to(self.root.resolve()).as_posix()
+                      for call in reads.call_args_list}
+        self.assertEqual(read_files, {".gitignore", "src/.gitignore", "src/app.py"})
+        for name, raw in raw_ignores.items():
+            self.assertEqual(snapshot["files"][name]["text"], raw.decode("utf-8"))
+            self.assertEqual(snapshot["files"][name]["oid"], "sha256:" + hashlib.sha256(raw).hexdigest())
+            self.assertEqual((self.root / name).read_bytes(), raw)
 
     def test_links_do_not_read_outside_and_binary_exclusions_are_visible(self):
         outside = Path(self.temporary.name) / "outside.txt"

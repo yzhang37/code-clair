@@ -94,15 +94,22 @@ class DirectoryReviewTests(unittest.TestCase):
         self.fill_rules()
         code = self.host / 'identity.py'
         code.write_text('def identity(value):\n    return value\n')
-        (self.host / '.gitignore').write_text('ignored/\n')
+        ignored = b'\xef\xbb\xbfdist/\nnode_modules/\nignored/\n'
+        (self.host / '.gitignore').write_bytes(ignored)
         (self.host / 'ignored').mkdir()
         (self.host / 'ignored/unselected.py').write_text('MUST_NOT_ENTER_REVIEW = True\n')
+        for directory_name in ('dist', 'node_modules'):
+            folder = self.host / directory_name
+            folder.mkdir()
+            (folder / 'unselected.js').write_text('IGNORED_DEPENDENCY_MUST_NOT_ENTER_REVIEW = true;\n')
         current = self.directory_state(self.rule.parent)
         completed = self.run_command(['make', 'review'])
         result, directory = self.report(completed)
         self.assertEqual(result['status'], 'clear')
         source = json.loads((directory / 'input.json').read_text())
         self.assertEqual(set(source['files']), {'.gitignore', 'identity.py'})
+        self.assertEqual(source['excluded_paths']['dist/'], 'gitignore')
+        self.assertEqual(source['excluded_paths']['node_modules/'], 'gitignore')
         prompts = [call for call in self.calls() if call['method'] == 'session/prompt']
         self.assertEqual(len(prompts), 5)
         self.assertEqual(sum(call['health'] for call in prompts), 1)
@@ -110,6 +117,7 @@ class DirectoryReviewTests(unittest.TestCase):
                             for call in prompts if not call['health']))
         self.assertEqual(self.directory_state(self.rule.parent), current)
         self.assertEqual(code.read_text(), 'def identity(value):\n    return value\n')
+        self.assertEqual((self.host / '.gitignore').read_bytes(), ignored)
         self.assertFalse((self.host / '.git').exists())
 
     def test_empty_installed_directory_does_not_call_a_model_or_claim_code_passed(self):
