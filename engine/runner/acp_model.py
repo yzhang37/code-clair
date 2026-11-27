@@ -239,7 +239,9 @@ class AcpModel:
             servers = [McpServerStdio.model_validate(server) for server in self.mcp_servers]
             session = await connection.new_session(cwd=str(work_root), mcp_servers=servers)
             client.start_session(session.session_id, session.field_meta)
-            client.record("session/new", session=session.model_dump(mode="json", by_alias=True, exclude_none=True))
+            # 只记录本次冻结视图的位置，供交付核验把原生读取路径绑定到此会话，不记录认证环境。
+            client.record("session/new", session=session.model_dump(mode="json", by_alias=True, exclude_none=True),
+                          cwd=str(work_root))
             if self.model is not None:
                 options = [option for option in session.config_options or [] if option.category == "model"]
                 if len(options) != 1:

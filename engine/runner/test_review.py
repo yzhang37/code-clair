@@ -25,17 +25,7 @@ CASE = "# Empty input\n\n## 正例\nGuard empty input before indexing.\n\n## 反
 
 from test_acp_fixture import FAKE_ACP_PRELUDE
 
-FAKE_CODEX = FAKE_ACP_PRELUDE.replace(
-    'import json as _acp_json', 'import os as _acp_os\nimport json as _acp_json',
-).replace(
-    '        elif _acp_method == "session/new":\n',
-    '''        elif _acp_method == "session/new":
-            for _acp_server in _acp_params.get("mcpServers", []):
-                _acp_arguments = _acp_server.get("args", [])
-                if _acp_server.get("name") == "clarity" and "--log" in _acp_arguments:
-                    _acp_os.environ["CLARITY_CONTEXT_LOG"] = _acp_arguments[_acp_arguments.index("--log") + 1]
-''',
-) + r'''
+FAKE_CODEX = FAKE_ACP_PRELUDE + r'''
 import json
 import os
 from pathlib import Path
@@ -62,8 +52,14 @@ retry_behavior = (fixture.get("retry_behavior") if own_stage_history is not None
 context, context_manifest, context_audit = None, None, []
 current_files = packet.get("current_files", {})
 if "code_context" in packet:
+    sys.path.insert(0, os.environ["CLARITY_FIXTURE_RUNNER"])
+    from review_context import ContextStore
+
     assert "current_files" not in packet and "baseline_changed_files" not in packet
     view = Path.cwd()
+    audit_path = Path(os.environ["CLARITY_CONTEXT_LOG"])
+    audit_start = len(audit_path.read_text().splitlines())
+    store = ContextStore(view, audit_path)
     context_manifest = json.loads((view / packet["code_context"]["manifest"]).read_text())
     context = {"current": {}, "baseline": {}}
     for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files")):
@@ -77,14 +73,24 @@ if "code_context" in packet:
                        and (mode == "delivery_partial_" + stage
                             or (mode in {"feedback_complete_" + stage, "feedback_drop_" + stage,
                                          "feedback_failure_" + stage} and native_turn == 1)))
-            with (view / record["view_path"]).open(encoding="utf-8", newline="") as source:
-                text = source.read(1) if partial else source.read()
-            context[version][path] = text
-            context_audit.append({"tool": "read_file", "version": version, "path": path,
-                                  "start_line": 1, "start_column": 1, "returned_chars": len(text),
-                                  "truncated": partial})
-    with Path(os.environ["CLARITY_CONTEXT_LOG"]).open("a") as audit:
-        audit.write("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in context_audit))
+            cursor = {"start_line": 1, "start_column": 1}
+            pieces = []
+            while True:
+                arguments = {"path": path, "version": version, **cursor,
+                             "line_count": 200, "char_limit": 1 if partial else 16000}
+                payload = store.read_file(**arguments)
+                transport_status = ("failed" if mode == "delivery_failed_ack_" + stage
+                                    or (mode == "feedback_recover_ack_" + stage and native_turn == 1)
+                                    else "completed")
+                print(json.dumps({"type": "clarity.fixture.context_read", "arguments": arguments,
+                                  "result": payload, "transport_status": transport_status}, ensure_ascii=False))
+                pieces.append(payload["text"])
+                if partial or payload["next"] is None:
+                    break
+                cursor = payload["next"]
+            context[version][path] = "".join(pieces)
+    context_audit = [json.loads(line) for line in audit_path.read_text().splitlines()[audit_start:]]
+    with audit_path.open("a") as audit:
         if mode == "feedback_invalid_audit_" + stage:
             audit.write("invalid audit record\n")
     current_files = {path: "\n".join(f"{number}: {line}" for number, line in enumerate(text.splitlines(), 1))
@@ -452,6 +458,10 @@ class IsolatedReviewTests(unittest.TestCase):
         run = Path(json.loads((self.state / "latest.json").read_text())["run"])
         self.assertFalse(list(run.glob("*/context-delivery.json")))
         self.assertFalse(list(run.glob("*/attempt-*/context-access.jsonl")))
+        for events_path in run.glob("*/attempt-*/events.jsonl"):
+            events = [json.loads(line) for line in events_path.read_text().splitlines()]
+            self.assertFalse(any(event.get("update", {}).get("sessionUpdate") in
+                                 {"tool_call", "tool_call_update"} for event in events))
 
     def test_custom_oversized_inline_snapshot_stops_before_model_without_truncation(self):
         """test_custom_oversized_inline_snapshot_stops_before_model_without_truncation() 保留 custom 全文容量边界，不能静默改成视图或截断后放行。"""
@@ -598,6 +608,59 @@ class IsolatedReviewTests(unittest.TestCase):
         before = len(self.calls())
         self.assertEqual(self.review().returncode, 1)
         self.assertEqual(len(self.calls()), before)
+
+    def test_server_read_with_only_failed_acp_results_cannot_pass_or_cache(self):
+        """test_server_read_with_only_failed_acp_results_cannot_pass_or_cache() 服务成功读到全文但 Agent 只收到失败结果时，保持未完成且不可缓存。"""
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        self.set_mode("delivery_failed_ack_reviewer-1")
+        completed = self.review()
+        self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        receipt = json.loads((run / "reviewer-1/context-delivery.json").read_text())["delivery"]
+        self.assertTrue(receipt["audit_valid"])
+        self.assertTrue(receipt["transport_confirmed"])
+        self.assertFalse(receipt["complete"])
+        self.assertEqual(receipt["current"]["complete"], 0)
+        attempts = list((run / "reviewer-1").glob("attempt-*/context-access.jsonl"))
+        self.assertEqual(len(attempts), 1)
+        audit = [json.loads(line) for line in attempts[0].read_text().splitlines()]
+        self.assertTrue(any(row.get("returned_chars", 0) > 0 for row in audit))
+        events = [json.loads(line) for line in attempts[0].with_name("events.jsonl").read_text().splitlines()]
+        terminal = [event["update"]["status"] for event in events
+                    if event.get("update", {}).get("sessionUpdate") == "tool_call_update"]
+        self.assertTrue(terminal)
+        self.assertEqual(set(terminal), {"failed"})
+        before = sum(call["stage"] == "reviewer-1" for call in self.calls())
+        self.assertEqual(self.review().returncode, 2)
+        self.assertEqual(sum(call["stage"] == "reviewer-1" for call in self.calls()), before + 2)
+
+    def test_failed_source_transport_requires_later_completed_exact_pages(self):
+        """test_failed_source_transport_requires_later_completed_exact_pages() 同会话补读必须实际完成并交付全部真实分页，失败首轮的服务记录不补认正文。"""
+        self.install()
+        text = "# " + "续" * 17000 + "\nVERSION = 2\n"
+        self.write("edited.py", text)
+        self.git("add", "edited.py")
+        self.set_mode("feedback_recover_ack_reviewer-1")
+        completed = self.review()
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        calls = sorted((call for call in self.calls() if call["stage"] == "reviewer-1"), key=lambda call: call["native_turn"])
+        self.assertEqual([call["native_turn"] for call in calls], [1, 2])
+        self.assertTrue(all(call["context"]["current"]["edited.py"] == text for call in calls))
+        self.assertTrue(all(sum(row["path"] == "edited.py" and row["version"] == "current"
+                                for row in call["context_audit"]) >= 2 for call in calls))
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        delivery = json.loads((run / "reviewer-1/context-delivery.json").read_text())["delivery"]
+        self.assertTrue(delivery["complete"])
+        self.assertTrue(delivery["transport_confirmed"])
+        protocol = next((run / "reviewer-1").glob("attempt-*/events.jsonl"))
+        events = [json.loads(line) for line in protocol.read_text().splitlines()]
+        terminal = [event["update"]["status"] for event in events
+                    if event.get("update", {}).get("sessionUpdate") == "tool_call_update"]
+        self.assertIn("failed", terminal)
+        self.assertIn("completed", terminal)
+        self.assertLess(terminal.index("failed"), terminal.index("completed"))
 
     def test_same_session_feedback_can_repair_json_without_retaining_invalid_first_output(self):
         """test_same_session_feedback_can_repair_json_without_retaining_invalid_first_output() 无效首轮 JSON 只触发结构反馈，不成为已核验发现。"""
@@ -805,6 +868,7 @@ class IsolatedReviewTests(unittest.TestCase):
         self.assertEqual(self.review().returncode, 1)
         self.assertEqual(len(self.calls()), len(calls))
         for mismatch in ("missing", "prompt", "output", "partial", "minimal", "invalid_audit",
+                         "missing_transport", "false_transport",
                          "reported_gap", "audit_errors", "zero_counts", "boolean_counts"):
             with self.subTest(mismatch=mismatch):
                 receipt_path = run / "reviewer-1/context-delivery.json"
@@ -821,6 +885,10 @@ class IsolatedReviewTests(unittest.TestCase):
                         receipt["delivery"] = {"complete": True}
                     elif mismatch == "invalid_audit":
                         delivery["audit_valid"] = False
+                    elif mismatch == "missing_transport":
+                        delivery.pop("transport_confirmed")
+                    elif mismatch == "false_transport":
+                        delivery["transport_confirmed"] = False
                     elif mismatch == "reported_gap":
                         total = len(context["current"]["edited.py"]["text"])
                         delivery["current"]["missing"] = [{"path": "edited.py", "total_chars": total,

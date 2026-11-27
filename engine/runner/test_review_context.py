@@ -46,6 +46,31 @@ class ReviewContextTests(unittest.TestCase):
         materialize_context({"current": current or {}, "baseline": baseline or {}}, self.root)
         return ContextStore(self.root, log_path)
 
+    def write_events(self, events, *, include_session=True, cwd=None):
+        path = self.base / "events.jsonl"
+        session = {"type": "session/new", "session": {"sessionId": "test-session"},
+                   "cwd": str(self.root.resolve()) if cwd is None else cwd}
+        records = [session, *events] if include_session else events
+        path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records))
+        return path
+
+    def mcp_event(self, identifier, arguments, reply=None, *, status="completed", update_kind="tool_call"):
+        update = {"sessionUpdate": update_kind, "toolCallId": identifier, "kind": "execute", "status": status,
+                  "rawInput": {"server": "clarity", "tool": "read_file", "arguments": arguments}}
+        if reply is not None:
+            update["rawOutput"] = {"result": {"content": [{"type": "text", "text": json.dumps(reply, ensure_ascii=False)}],
+                                                "structuredContent": reply, "isError": False}, "error": None}
+        elif status == "failed":
+            update["rawOutput"] = {"result": None, "error": {"message": "synthetic timeout"}}
+        return {"type": "session/update", "session_id": "test-session", "category": "tool", "update": update}
+
+    def native_event(self, identifier, path, text, *, kind="read"):
+        block = {"type": "text", "text": text}
+        return {"type": "session/update", "session_id": "test-session", "category": "tool", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": identifier, "kind": kind, "status": "completed",
+            "title": "Localized tool display", "rawInput": {"path": path},
+            "content": [{"type": "content", "content": block}], "rawOutput": {"content": [block]}}}
+
     def test_materialization_preserves_frozen_text_identity_and_input(self):
         text = "\ufeff身份 = 'é'\r\n\r\nlast line"
         context = {"current": {"有 空格/run.py": frozen(text, "git-object", "100755")},
@@ -731,6 +756,236 @@ class ReviewContextTests(unittest.TestCase):
         feedback = make_reply_feedback(context, log, schema)
         self.assertIsNone(feedback('{"quote": "this does not match actual source"}'))
         self.assertEqual(log.read_bytes(), before)
+
+    def test_transport_failed_pending_or_server_only_reads_do_not_complete_source(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        body = store.read_file("a.py")
+        low_level = assess_delivery(context, log)
+        self.assertTrue(low_level["complete"])
+        self.assertFalse(low_level["transport_confirmed"])
+        for status in ("failed", "pending", "in_progress"):
+            with self.subTest(status=status):
+                events = self.write_events([self.mcp_event("call", {"path": "a.py"}, body, status=status)])
+                receipt = assess_delivery(context, log, events_path=events)
+                self.assertTrue(receipt["audit_valid"])
+                self.assertTrue(receipt["transport_confirmed"])
+                self.assertFalse(receipt["complete"])
+                self.assertEqual(receipt["current"]["missing"][0]["delivered_chars"], 0)
+        receipt = assess_delivery(context, log, events_path=self.write_events([]))
+        self.assertFalse(receipt["complete"])
+
+    def test_transport_failed_timeout_then_successful_same_body_read_completes(self):
+        context = {"current": {"a.py": frozen("body\r\n")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.read_file("a.py")
+        failed = self.mcp_event("failed-call", {"path": "a.py"}, status="failed")
+        failed_events = self.write_events([failed])
+        self.assertFalse(assess_delivery(context, log, events_path=failed_events)["complete"])
+        received = store.read_file("a.py")
+        completed = self.mcp_event("retry-call", {"path": "a.py"}, received)
+        receipt = assess_delivery(context, log, events_path=self.write_events([failed, completed]))
+        self.assertTrue(receipt["complete"])
+        self.assertTrue(receipt["transport_confirmed"])
+
+    def test_transport_direct_completion_omitted_fields_and_duplicate_notifications(self):
+        context = {"current": {"a.py": frozen("text")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        received = store.read_file("a.py")
+        direct = self.mcp_event("call", {"path": "a.py"}, received)
+        duplicate = {"type": "session/update", "session_id": "test-session", "update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": "call", "status": "completed", "title": "New display title"}}
+        self.assertTrue(assess_delivery(context, log, events_path=self.write_events([direct, duplicate, duplicate]))["complete"])
+        initial = copy.deepcopy(direct)
+        initial["update"]["status"] = "in_progress"
+        self.assertTrue(assess_delivery(context, log, events_path=self.write_events([initial, duplicate]))["complete"])
+        conflict = copy.deepcopy(duplicate)
+        conflict["update"]["rawInput"] = {"path": "different.py"}
+        receipt = assess_delivery(context, log, events_path=self.write_events([direct, conflict]))
+        self.assertFalse(receipt["complete"])
+        self.assertFalse(receipt["audit_valid"])
+
+    def test_transport_partial_unicode_body_counts_only_exact_received_range(self):
+        context = {"current": {"a.py": frozen("甲\r\n乙😀e\u0301")}, "baseline": {"a.py": frozen("old")}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], context["baseline"], log)
+        arguments = {"path": "a.py", "char_limit": 2}
+        first = store.read_file(**arguments)
+        events = [self.mcp_event("first", arguments, first)]
+        receipt = assess_delivery(context, log, events_path=self.write_events(events))
+        self.assertEqual(receipt["current"]["missing"][0]["missing_ranges"], [{"start": 2, "end": 7}])
+        self.assertEqual(receipt["baseline"]["complete"], 0)
+        rest_arguments = {"path": "a.py", **first["next"]}
+        rest = store.read_file(**rest_arguments)
+        old_arguments = {"path": "a.py", "version": "baseline"}
+        old = store.read_file(**old_arguments)
+        events.extend([self.mcp_event("rest", rest_arguments, rest), self.mcp_event("old", old_arguments, old)])
+        self.assertTrue(assess_delivery(context, log, events_path=self.write_events(events))["complete"])
+
+    def test_transport_fake_source_identity_cursor_or_body_is_not_credited(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        body = store.read_file("a.py")
+        for changes in ({"text": "fake"}, {"oid": "wrong"}, {"mode": "100755"}, {"start_line": True},
+                        {"numbered_text": "1: fake"}, {"end_column": 99}, {"next": {"start_line": 2, "start_column": 1}}):
+            with self.subTest(changes=changes):
+                events = self.write_events([self.mcp_event("call", {"path": "a.py"}, {**body, **changes})])
+                receipt = assess_delivery(context, log, events_path=events)
+                self.assertFalse(receipt["complete"])
+                self.assertTrue(receipt["transport_confirmed"])
+                self.assertEqual(receipt["current"]["complete"], 0)
+
+    def test_transport_conflicting_content_copies_and_arbitrary_wrappers_fail_closed(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        body = store.read_file("a.py")
+        event = self.mcp_event("call", {"path": "a.py"}, body)
+        bad_structured = copy.deepcopy(event)
+        bad_structured["update"]["rawOutput"]["result"]["structuredContent"]["text"] = "fake"
+        bad_display = copy.deepcopy(event)
+        bad_display["update"]["content"] = [{"type": "content", "content": {"type": "text", "text": "fake"}}]
+        wrapped = copy.deepcopy(event)
+        wrapped["update"]["rawOutput"] = {"nested": event["update"]["rawOutput"]}
+        for value in (bad_structured, bad_display):
+            with self.subTest(value=value):
+                receipt = assess_delivery(context, log, events_path=self.write_events([value]))
+                self.assertFalse(receipt["complete"])
+                self.assertFalse(receipt["transport_confirmed"])
+                self.assertFalse(receipt["audit_valid"])
+        receipt = assess_delivery(context, log, events_path=self.write_events([wrapped]))
+        self.assertFalse(receipt["complete"])
+        self.assertTrue(receipt["audit_valid"])
+        self.assertEqual(receipt["current"]["complete"], 0)
+
+    def test_transport_empty_display_uses_received_mcp_body_and_absent_body_is_a_gap(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        body = store.read_file("a.py")
+        event = self.mcp_event("call", {"path": "a.py"}, body)
+        event["update"]["content"] = []
+        self.assertTrue(assess_delivery(context, log, events_path=self.write_events([event]))["complete"])
+        event["update"]["rawOutput"] = {"result": {"content": []}, "error": None}
+        receipt = assess_delivery(context, log, events_path=self.write_events([event]))
+        self.assertFalse(receipt["complete"])
+        self.assertTrue(receipt["audit_valid"])
+        self.assertTrue(receipt["transport_confirmed"])
+
+    def test_transport_wrong_session_orphan_conflict_and_missing_events_fail_closed(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        event = self.mcp_event("call", {"path": "a.py"}, store.read_file("a.py"))
+        foreign = {**event, "session_id": "foreign-session"}
+        orphan = copy.deepcopy(event)
+        orphan["update"]["sessionUpdate"] = "tool_call_update"
+        failed = copy.deepcopy(event)
+        failed["update"]["status"] = "failed"
+        for records, include_session in (([foreign], True), ([orphan], True), ([event], False),
+                                         ([failed, event], True), ([{"type": "session/new", "session": {"sessionId": "second"}}], True)):
+            with self.subTest(records=records):
+                events = self.write_events(records, include_session=include_session)
+                receipt = assess_delivery(context, log, events_path=events)
+                self.assertFalse(receipt["complete"])
+                self.assertFalse(receipt["audit_valid"])
+                self.assertFalse(receipt["transport_confirmed"])
+        events = self.base / "missing-events.jsonl"
+        self.assertFalse(assess_delivery(context, log, events_path=events)["complete"])
+        events.write_text("invalid-json\n")
+        self.assertFalse(assess_delivery(context, log, events_path=events)["audit_valid"])
+        events.write_text(json.dumps(event))
+        self.assertFalse(assess_delivery(context, log, events_path=events)["audit_valid"])
+
+    def test_transport_native_reads_bind_original_path_and_recorded_cwd_without_title(self):
+        context = {"current": {"a.py": frozen("原文\r\n")}, "baseline": {"a.py": frozen("旧文\n")}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], context["baseline"], log)
+        self.assertTrue(store.record_native_read("a.py", "current", "原文\r\n"))
+        self.assertTrue(store.record_native_read("a.py", "baseline", "旧文\n"))
+        events = [self.native_event("current", "current/a.py", "原文\r\n"),
+                  self.native_event("old", str(self.root.resolve() / "baseline/a.py"), "旧文\n"),
+                  self.native_event("manifest", "context.json", (self.root / "context.json").read_text())]
+        receipt = assess_delivery(context, log, events_path=self.write_events(events))
+        self.assertTrue(receipt["complete"])
+        self.assertTrue(receipt["transport_confirmed"])
+        absolute = events[1]
+        receipt = assess_delivery(context, log, events_path=self.write_events([absolute], cwd="/different/view"))
+        self.assertFalse(receipt["complete"])
+        self.assertEqual(receipt["baseline"]["complete"], 0)
+        path = self.write_events([events[0]])
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        records[0].pop("cwd")
+        path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        self.assertFalse(assess_delivery(context, log, events_path=path)["audit_valid"])
+
+    def test_transport_native_partial_normalized_wrong_path_or_wrong_kind_does_not_count(self):
+        context = {"current": {"a.py": frozen("\ufeff甲\r\n乙")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.record_native_read("a.py", "current", context["current"]["a.py"]["text"])
+        cases = [("current/a.py", "\ufeff甲\n乙", "read"), ("current/a.py", "\ufeff甲", "read"),
+                 ("current/a.py", "甲\r\n乙", "read"), ("current/unknown.py", "\ufeff甲\r\n乙", "read"),
+                 ("./current/a.py", "\ufeff甲\r\n乙", "read"), ("/outside/a.py", "\ufeff甲\r\n乙", "read"),
+                 ("current/a.py", "\ufeff甲\r\n乙", "other")]
+        for path, text, kind in cases:
+            with self.subTest(path=path, text=text, kind=kind):
+                event = self.native_event("call", path, text, kind=kind)
+                receipt = assess_delivery(context, log, events_path=self.write_events([event]))
+                self.assertFalse(receipt["complete"])
+                self.assertEqual(receipt["current"]["complete"], 0)
+
+    def test_transport_own_fallback_uses_standard_text_and_exact_response_shape(self):
+        context = {"current": {"a.py": frozen("界\r\n尾")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        first_args = {"path": "a.py", "char_limit": 2}
+        first = store.read_file(**first_args)
+        last_args = {"path": "a.py", **first["next"]}
+        last = store.read_file(**last_args)
+        events = []
+        for identifier, arguments, body in (("first", first_args, first), ("last", last_args, last)):
+            event = self.native_event(identifier, arguments["path"], json.dumps(body, ensure_ascii=False), kind="other")
+            event["update"]["rawInput"] = arguments
+            event["update"]["rawOutput"]["details"] = body
+            events.append(event)
+        self.assertTrue(assess_delivery(context, log, events_path=self.write_events(events))["complete"])
+
+    def test_transport_discovery_and_received_body_without_server_audit_never_pass(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        body = store.read_file("a.py")
+        for tool in ("list_files", "search"):
+            event = self.mcp_event("call", {"path": "a.py"}, body)
+            event["update"]["rawInput"]["tool"] = tool
+            self.assertFalse(assess_delivery(context, log, events_path=self.write_events([event]))["complete"])
+        log.write_text("")
+        event = self.mcp_event("call", {"path": "a.py"}, body)
+        receipt = assess_delivery(context, log, events_path=self.write_events([event]))
+        self.assertFalse(receipt["complete"])
+        self.assertFalse(receipt["audit_valid"])
+
+    def test_reply_feedback_fills_transport_gaps_and_rechecks_live_events(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.read_file("a.py")
+        failed = self.mcp_event("failed", {"path": "a.py"}, status="failed")
+        events = self.write_events([failed])
+        feedback = make_reply_feedback(context, log, REPLY_SCHEMA, events_path=events)
+        message = feedback('{"ok": true}')
+        self.assertIn('path="a.py" start_line=1 start_column=1', message)
+        received = store.read_file("a.py")
+        self.write_events([failed, self.mcp_event("completed", {"path": "a.py"}, received)])
+        self.assertIsNone(feedback('{"ok": true}'))
+        events.write_text("bad-event\n")
+        with self.assertRaises(ModelFailure):
+            feedback('{"ok": true}')
 
 
 if __name__ == "__main__":

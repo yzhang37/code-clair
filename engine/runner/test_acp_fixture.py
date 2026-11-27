@@ -44,6 +44,13 @@ if "--output-last-message" not in _acp_sys.argv:
         elif _acp_method == "session/new":
             _acp_initial_prompt = None
             _acp_turn = 0
+            for _acp_server in _acp_params.get("mcpServers", []):
+                _acp_arguments = _acp_server.get("args", [])
+                if _acp_server.get("name") == "clarity" and "--log" in _acp_arguments:
+                    _acp_environment["CLARITY_CONTEXT_LOG"] = _acp_arguments[_acp_arguments.index("--log") + 1]
+                    _acp_environment["CLARITY_FIXTURE_RUNNER"] = str(_AcpPath(_acp_arguments[0]).parent)
+            if "CLARITY_FIXTURE_RUNNER" not in _acp_environment and "PI_ACP_PI_COMMAND" in _acp_environment:
+                _acp_environment["CLARITY_FIXTURE_RUNNER"] = str(_AcpPath(_acp_environment["PI_ACP_PI_COMMAND"]).parent)
             _acp_result = {"sessionId": "offline-session", "configOptions": _acp_options()}
         elif _acp_method == "session/set_config_option":
             _acp_model = _acp_params["value"]
@@ -76,8 +83,24 @@ if "--output-last-message" not in _acp_sys.argv:
                     _acp_emit({"jsonrpc": "2.0", "id": _acp_request["id"], "error": {
                         "code": -32000, "message": "Offline model fixture exited with status " + str(_acp_process.returncode)}})
                     continue
-                for _acp_event_line in _acp_process.stdout.splitlines():
+                for _acp_event_number, _acp_event_line in enumerate(_acp_process.stdout.splitlines()):
                     _acp_event = _acp_json.loads(_acp_event_line)
+                    if _acp_event.get("type") == "clarity.fixture.context_read":
+                        _acp_call_id = f"source-{_acp_turn}-{_acp_event_number}"
+                        _acp_payload = _acp_event["result"]
+                        _acp_emit({"jsonrpc": "2.0", "method": "session/update", "params": {
+                            "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call",
+                            "toolCallId": _acp_call_id, "title": "mcp.clarity.read_file", "kind": "execute",
+                            "status": "in_progress", "rawInput": {"server": "clarity", "tool": "read_file",
+                            "arguments": _acp_event["arguments"]}, "_meta": {"is_mcp_tool_call": True}}}})
+                        _acp_status = _acp_event.get("transport_status", "completed")
+                        _acp_output_value = ({"result": {"content": [{"type": "text", "text": _acp_json.dumps(_acp_payload, ensure_ascii=False)}],
+                                              "structuredContent": _acp_payload, "isError": False}}
+                                             if _acp_status == "completed" else
+                                             {"result": None, "error": {"message": "Synthetic source transport failure"}})
+                        _acp_emit({"jsonrpc": "2.0", "method": "session/update", "params": {
+                            "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call_update",
+                            "toolCallId": _acp_call_id, "status": _acp_status, "rawOutput": _acp_output_value}}})
                     if _acp_event.get("item", {}).get("type") == "command_execution":
                         _acp_emit({"jsonrpc": "2.0", "method": "session/update", "params": {
                             "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call",

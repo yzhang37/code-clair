@@ -335,10 +335,12 @@ def complete_context_delivery(delivery, context):
     """complete_context_delivery() 核对交付回执与实际范围一致，不把单个完成标记当作证据。
 
     审计须有效且没有错误，两版计数须与冻结输入相同并无缺口；损坏或自相矛盾的缓存只能重跑。
+    服务端成功读取不能代替 Agent 实际收到正文；回执还须确认同会话 completed 工具结果中的冻结原文。
     这里只核对取材记录，不增加源码的业务判据，也不把交付完整等同于语义审核正确。
     """
     if (not isinstance(delivery, dict) or delivery.get("complete") is not True
-            or delivery.get("audit_valid") is not True or delivery.get("errors") != []):
+            or delivery.get("audit_valid") is not True or delivery.get("transport_confirmed") is not True
+            or delivery.get("errors") != []):
         return False
     for version in ("current", "baseline"):
         scope = delivery.get(version)
@@ -502,7 +504,8 @@ def run_stage(model, directory, name, prompt, snapshot, expected, files, rules, 
         (attempt / "context-access.jsonl").touch(mode=0o600, exist_ok=False)
         prior = {item["id"]: item for item in previous_findings or []}
         prior.update({item["id"]: item for item in history})
-        feedback_for_reply = make_reply_feedback(context, attempt / "context-access.jsonl", schema())
+        feedback_for_reply = make_reply_feedback(context, attempt / "context-access.jsonl", schema(),
+                                                 events_path=attempt / "events.jsonl")
 
         def retain_turn(result, location):
             """retain_turn() 先保存原文核验通过的本轮发现，解除项仍须经过原 account_for。"""
@@ -520,7 +523,8 @@ def run_stage(model, directory, name, prompt, snapshot, expected, files, rules, 
             """save_turn() 绑定本轮已核验输出与累计原文交付；partial 回执不能成为完整缓存。"""
             save(delivery_file, {"base_prompt_sha256": key, "prompt_sha256": digest(actual_prompt),
                                  "output_sha256": digest(result),
-                                 "delivery": assess_delivery(context, attempt / "context-access.jsonl")})
+                                 "delivery": assess_delivery(context, attempt / "context-access.jsonl",
+                                                             events_path=attempt / "events.jsonl")})
             base_file.write_text(key, encoding="utf-8")
             base_file.chmod(0o600)
             save(output_file, result)
