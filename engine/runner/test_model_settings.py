@@ -96,6 +96,7 @@ class ModelSettingsTests(unittest.TestCase):
             self.assertTrue(options["allow_tools"])
             self.assertEqual(options["instructions"], _CONTEXT_INSTRUCTIONS)
             self.assertEqual(options["max_request_chars"], 1_048_576)
+            self.assertIsNone(options["startup_metadata_path"])
             self.assertEqual(options["environment"]["CLARITY_CONTEXT_ROOT"], str(view))
             configuration = json.loads(options["environment"]["CODEX_CONFIG"])
             self.assertEqual(configuration["sandbox_mode"], "read-only")
@@ -138,6 +139,7 @@ class ModelSettingsTests(unittest.TestCase):
             self.assertTrue(options["allow_tools"])
             self.assertIsNone(options["mcp_servers"])
             self.assertIsNone(options["max_request_chars"])
+            self.assertEqual(options["startup_metadata_path"], ("piAcp", "startupInfo"))
             environment = options["environment"]
             self.assertEqual(environment["CLARITY_PI_BINARY"], "owner-pi")
             self.assertEqual(environment["CLARITY_CONTEXT_PYTHON"], sys.executable)
@@ -171,6 +173,7 @@ class ModelSettingsTests(unittest.TestCase):
             self.assertIsNone(options["cwd"])
             self.assertIsNone(options["mcp_servers"])
             self.assertEqual(options["instructions"], _INSTRUCTIONS)
+            self.assertEqual(options["startup_metadata_path"], ("piAcp", "startupInfo") if agent == "pi" else None)
             self.assertNotIn("CLARITY_CONTEXT_ROOT", options["environment"])
 
     def test_custom_context_is_rejected_before_projection_or_agent_invocation(self):
@@ -322,6 +325,72 @@ process.stdout.write(JSON.stringify({pages,original_paths:true,unicode_crlf:true
                 self.assertEqual(json.loads(result.stdout), {"pages": 7, "original_paths": True,
                                                            "unicode_crlf": True, "outside_denied": True})
                 self.assertEqual((view / "current/long.txt").read_bytes(), text.encode("utf-8"))
+            finally:
+                _restore_view_permissions(view)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed for the native Pi extension")
+    def test_pi_native_read_audit_counts_only_guarded_exact_successful_file_delivery(self):
+        """test_pi_native_read_audit_counts_only_guarded_exact_successful_file_delivery() 核对全文交付证据且保持原生结果原样。"""
+        from model import _restore_view_permissions
+        from review_context import materialize_context
+
+        record = lambda text: {"text": text, "oid": "frozen", "mode": "100644"}
+        context = {"current": {"src/value.py": record("first\r\n汉😀\r\nlast\r\n")},
+                   "baseline": {"src/value.py": record("old\n")}}
+        with tempfile.TemporaryDirectory(prefix="clarity-pi-native-audit-test-") as temporary:
+            folder = Path(temporary)
+            view = folder / "view"
+            materialize_context(context, view)
+            (folder / "outside.txt").write_text("OUTSIDE_MUST_NOT_COUNT\n")
+            try:
+                script = '''import guard from MODULE;
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const handlers={};
+guard({registerTool:()=>{},on:(event,fn)=>{handlers[event]=fn;}});
+const root=process.env.CLARITY_CONTEXT_ROOT;
+const current=readFileSync(join(root,"current/src/value.py"),"utf8");
+const baseline=readFileSync(join(root,"baseline/src/value.py"),"utf8");
+async function result(id,path,text,extra={}){
+ const input={path};
+ await handlers.tool_call({toolCallId:id,toolName:"read",input},{cwd:root});
+ const event={toolCallId:id,toolName:"read",input,content:[{type:"text",text}],isError:false,...extra};
+ const before=JSON.stringify(event);
+ const returned=await handlers.tool_result(event,{cwd:root});
+ if(returned!==undefined||JSON.stringify(event)!==before)throw Error("Audit changed a native result");
+ return event;
+}
+await result("full","current/src/value.py",current);
+await result("baseline","baseline/src/value.py",baseline);
+await result("partial","current/src/value.py","first\\r\\n\\n[More lines remain]");
+await result("truncated","current/src/value.py",current,{details:{truncation:{truncated:true}}});
+await result("failed","current/src/value.py",current,{isError:true});
+await result("unknown-status","current/src/value.py",current,{isError:undefined});
+await result("nontext","current/src/value.py",current,{content:[{type:"image",data:"none",mimeType:"image/png"}]});
+await result("outside","../outside.txt","OUTSIDE_MUST_NOT_COUNT\\n");
+const unknown={toolCallId:"not-guarded",toolName:"read",input:{path:join(root,"current/src/value.py")},content:[{type:"text",text:current}],isError:false};
+await handlers.tool_result(unknown,{cwd:root});
+const input={path:"current/src/value.py"};
+await handlers.tool_call({toolCallId:"tampered",toolName:"read",input},{cwd:root});
+chmodSync(input.path,0o644);writeFileSync(input.path,"tampered\\n");
+const event={toolCallId:"tampered",toolName:"read",input,content:[{type:"text",text:"tampered\\n"}],isError:false};
+const original=JSON.stringify(event);let tamperRejected=false;
+try{await handlers.tool_result(event,{cwd:root});}catch(error){tamperRejected=error.message.includes("changed");}
+if(!tamperRejected||JSON.stringify(event)!==original)throw Error("Tampered source was counted or native body changed");
+const rows=readFileSync(process.env.CLARITY_CONTEXT_LOG,"utf8").trim().split("\\n").map(JSON.parse);
+if(rows.length!==2||rows.some(row=>row.tool!=="read_file"||row.source!=="native"||row.truncated!==false))throw Error("Incomplete or failed reads counted as complete");
+if(rows[0].version!=="current"||rows[0].path!=="src/value.py"||rows[0].returned_chars!==Array.from(current).length)throw Error("Current mapping changed");
+if(rows[1].version!=="baseline"||rows[1].path!=="src/value.py"||rows[1].returned_chars!==Array.from(baseline).length)throw Error("Baseline mapping changed");
+process.stdout.write(JSON.stringify({native_entries:rows.length,tamper_rejected:true,tool_results_unchanged:true}));
+'''.replace("MODULE", json.dumps(Path(__file__).with_name("pi_context_guard.mjs").as_uri()))
+                result = subprocess.run([shutil.which("node"), "--input-type=module", "-e", script],
+                                        env=dict(os.environ, CLARITY_CONTEXT_ROOT=str(view),
+                                                 CLARITY_CONTEXT_PYTHON=sys.executable,
+                                                 CLARITY_CONTEXT_LOG=str(folder / "audit.jsonl")),
+                                        text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"native_entries": 2, "tamper_rejected": True,
+                                                           "tool_results_unchanged": True})
             finally:
                 _restore_view_permissions(view)
 

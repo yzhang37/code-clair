@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,14 @@ const READ_CODE = `import json, sys
 sys.path.insert(0, sys.argv[1])
 from review_context import ContextStore
 try:
-    result = ContextStore(sys.argv[2], sys.argv[3] or None).read_file(**json.loads(sys.argv[4]))
+    store = ContextStore(sys.argv[2], sys.argv[3] or None)
+    params = json.load(sys.stdin)
+    if sys.argv[4] == "read_file":
+        result = store.read_file(**params)
+    elif sys.argv[4] == "record_native_read":
+        result = store.record_native_read(**params)
+    else:
+        raise ValueError("Unknown frozen context operation")
 except (ValueError, TypeError, OSError, UnicodeError) as error:
     result = {"error": str(error)}
 print(json.dumps(result, ensure_ascii=False, allow_nan=False))
@@ -45,6 +52,24 @@ export default function contextGuard(pi) {
     const python = process.env.CLARITY_CONTEXT_PYTHON;
     if (!python || !isAbsolute(python)) throw new Error("Clarity managed Python is required");
     const audit = process.env.CLARITY_CONTEXT_LOG ?? "";
+    const manifest = audit ? JSON.parse(readFileSync(join(root, "context.json"), "utf8")) : null;
+    const pendingReads = new Map();
+
+    /** queryContext() 只运行固定可信操作；正文经标准输入传递，避免载荷进入命令参数或错误命令行。 */
+    async function queryContext(operation, params, signal) {
+        const task = executeFile(python,
+            ["-I", "-S", "-B", "-c", READ_CODE, TRUSTED_RUNNER, root, audit, operation],
+            { signal, timeout: 10000, maxBuffer: 256 * 1024, encoding: "utf8", shell: false });
+        // 进程退出或取消的失败由 task 交付；输入管道关闭不能另行中断 Pi 的原生工具结果。
+        task.child.stdin.on("error", () => {});
+        task.child.stdin.end(JSON.stringify(params));
+        const { stdout } = await task;
+        const result = JSON.parse(stdout);
+        if (result !== null && typeof result === "object" && Object.hasOwn(result, "error")) {
+            throw new Error(result.error);
+        }
+        return result;
+    }
 
     pi.registerTool({
         name: READ_FILE,
@@ -52,7 +77,8 @@ export default function contextGuard(pi) {
         description: "Read bounded original frozen text when native read truncates a long line or normalizes a filename. " +
             "Use the exact original repository-relative path from context.json and explicit current/baseline version; " +
             "never use an absolute path or current/ or baseline/ view prefix. Lines and Unicode-character columns are " +
-            "one-based. Text retains original newlines. Continue with next.start_line and next.start_column until next " +
+            "one-based. Text retains original newlines. numbered_text labels original lines for citation; its number " +
+            "prefixes are not source text. Continue with next.start_line and next.start_column until next " +
             "is null when complete text is needed. Cite original path/line/text, not pagination metadata.",
         parameters: {
             type: "object", required: ["path"], additionalProperties: false,
@@ -67,17 +93,14 @@ export default function contextGuard(pi) {
         },
         /** execute() 只运行固定隔离 Python 和可信模块，模型参数仅作为 JSON 数据交给原文校验器。 */
         async execute(_id, params, signal) {
-            const { stdout } = await executeFile(python,
-                ["-I", "-S", "-B", "-c", READ_CODE, TRUSTED_RUNNER, root, audit, JSON.stringify(params)],
-                { signal, timeout: 10000, maxBuffer: 256 * 1024, encoding: "utf8", shell: false });
-            const result = JSON.parse(stdout);
-            if (Object.hasOwn(result, "error")) throw new Error(result.error);
+            const result = await queryContext("read_file", params, signal);
             return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
         },
     });
 
     /** guardCall() 先规范化并检查目标，再把相同绝对路径交给原生工具，越界请求只返回工具错误。 */
     pi.on("tool_call", async function guardCall(event, ctx) {
+        if (event.toolName === "read") pendingReads.delete(event.toolCallId);
         // 续读工具接受原清单路径和版本，由 ContextStore 映射；不能套用原生工具的投影路径重写。
         if (event.toolName === READ_FILE) return;
         if (!READ_ONLY_TOOLS.has(event.toolName)) {
@@ -106,5 +129,29 @@ export default function contextGuard(pi) {
             return { block: true, reason: "Path cannot be read without changing its snapshot identity" };
         }
         event.input.path = target;
+        if (event.toolName === "read" && manifest && typeof event.toolCallId === "string" && event.toolCallId) {
+            const [version, ...parts] = relative(root, target).split(sep);
+            const path = parts.join("/");
+            const files = version === "current" ? manifest.current_files :
+                version === "baseline" ? manifest.baseline_changed_files : null;
+            if (files && Object.hasOwn(files, path) && files[path]?.view_path === `${version}/${path}`) {
+                pendingReads.set(event.toolCallId, { path, version, target });
+            }
+        }
+    });
+
+    /** auditRead() 只核对成功读取实际交付的单段原文；精确相等才登记全文，不修改工具正文或失败状态。 */
+    pi.on("tool_result", async function auditRead(event, ctx) {
+        const selected = pendingReads.get(event.toolCallId);
+        pendingReads.delete(event.toolCallId);
+        if (!selected || event.toolName !== "read" || event.isError !== false ||
+            event.input?.path !== selected.target || event.details?.truncation?.truncated === true ||
+            !Array.isArray(event.content) || event.content.length !== 1 ||
+            event.content[0].type !== "text" || typeof event.content[0].text !== "string") {
+            return;
+        }
+        await queryContext("record_native_read", {
+            path: selected.path, version: selected.version, observed_text: event.content[0].text,
+        }, ctx.signal);
     });
 }

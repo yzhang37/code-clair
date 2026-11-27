@@ -8,7 +8,7 @@ import stat
 import tempfile
 import unittest
 
-from review_context import ContextStore, EXCERPT_CHARS, materialize_context
+from review_context import ContextStore, EXCERPT_CHARS, assess_delivery, materialize_context
 
 
 def frozen(text, oid="recorded-oid", mode="100644"):
@@ -132,6 +132,78 @@ class ReviewContextTests(unittest.TestCase):
         reply = store.read_file("many.py")
         self.assertEqual(reply["text"], "x\n" * 200)
         self.assertEqual(reply["next"], {"start_line": 201, "start_column": 1})
+
+    def test_numbered_text_labels_first_blank_and_last_original_lines(self):
+        text = "首行\r\n\r\n末行"
+        store = self.store(baseline={"original.py": frozen(text, "original-object", "100755")})
+        reply = store.read_file("original.py", version="baseline")
+        self.assertEqual(reply["numbered_text"], "1: 首行\r\n2: \r\n3: 末行")
+        self.assertEqual({key: value for key, value in reply.items() if key != "numbered_text"}, {
+            "version": "baseline", "path": "original.py", "oid": "original-object", "mode": "100755",
+            "text": text, "start_line": 1, "start_column": 1, "end_line": 3, "end_column": 2,
+            "next": None, "total_lines": 3, "truncated": False})
+        self.assertEqual((self.root / "baseline/original.py").read_bytes(), text.encode("utf-8"))
+
+    def test_numbered_text_pagination_keeps_absolute_line_numbers(self):
+        store = self.store({"pages.py": frozen("first\nsecond\nthird\nfourth\nfifth\nlast")})
+        first = store.read_file("pages.py", line_count=2)
+        middle = store.read_file("pages.py", **first["next"], line_count=2)
+        last = store.read_file("pages.py", **middle["next"], line_count=2)
+        self.assertEqual(first["numbered_text"], "1: first\n2: second\n")
+        self.assertEqual(middle["numbered_text"], "3: third\n4: fourth\n")
+        self.assertEqual(last["numbered_text"], "5: fifth\n6: last")
+        self.assertEqual(first["text"] + middle["text"] + last["text"], "first\nsecond\nthird\nfourth\nfifth\nlast")
+        self.assertEqual(first["next"], {"start_line": 3, "start_column": 1})
+        self.assertEqual(middle["next"], {"start_line": 5, "start_column": 1})
+        self.assertIsNone(last["next"])
+
+    def test_numbered_text_long_line_continuation_keeps_original_line_and_column(self):
+        text = "界" * 20_001 + "\r\n尾"
+        store = self.store({"long.py": frozen(text)})
+        first = store.read_file("long.py")
+        last = store.read_file("long.py", **first["next"])
+        self.assertEqual(first["text"], "界" * 16_000)
+        self.assertEqual(first["numbered_text"], "1: " + "界" * 16_000)
+        self.assertEqual(first["next"], {"start_line": 1, "start_column": 16_001})
+        self.assertEqual(last["start_line"], 1)
+        self.assertEqual(last["start_column"], 16_001)
+        self.assertEqual(last["numbered_text"], "1: " + "界" * 4_001 + "\r\n2: 尾")
+        self.assertEqual(first["text"] + last["text"], text)
+        self.assertIsNone(last["next"])
+
+    def test_numbered_text_crlf_split_uses_existing_cursor_without_advancing_early(self):
+        store = self.store({"crlf.py": frozen("甲\r\n乙")})
+        first = store.read_file("crlf.py", char_limit=2)
+        newline = store.read_file("crlf.py", **first["next"], char_limit=1)
+        last = store.read_file("crlf.py", **newline["next"], char_limit=1)
+        self.assertEqual((first["text"], first["numbered_text"], first["next"]),
+                         ("甲\r", "1: 甲\r", {"start_line": 1, "start_column": 3}))
+        self.assertEqual((newline["text"], newline["numbered_text"], newline["next"]),
+                         ("\n", "1: \n", {"start_line": 2, "start_column": 1}))
+        self.assertEqual((last["text"], last["numbered_text"], last["next"]), ("乙", "2: 乙", None))
+
+    def test_numbered_text_is_empty_when_no_source_piece_is_returned(self):
+        store = self.store({"empty.py": frozen(""), "one.py": frozen("one\n")})
+        for path, cursor in (("empty.py", {}), ("one.py", {"start_line": 2}),
+                             ("one.py", {"start_line": 1, "start_column": 5})):
+            with self.subTest(path=path, cursor=cursor):
+                reply = store.read_file(path, **cursor)
+                self.assertEqual(reply["text"], "")
+                self.assertEqual(reply["numbered_text"], "")
+                self.assertIsNone(reply["next"])
+
+    def test_numbered_text_uses_existing_splitlines_boundaries_and_read_line_limit(self):
+        store = self.store({"separators.py": frozen("一\u2028二\v三\r四\n"), "many.py": frozen("x\n" * 401)})
+        separators = store.read_file("separators.py")
+        self.assertEqual(separators["numbered_text"], "1: 一\u20282: 二\v3: 三\r4: 四\n")
+        self.assertEqual(separators["text"], "一\u2028二\v三\r四\n")
+        self.assertEqual(separators["total_lines"], 4)
+        page = store.read_file("many.py")
+        self.assertTrue(page["numbered_text"].startswith("1: x\n"))
+        self.assertTrue(page["numbered_text"].endswith("200: x\n"))
+        self.assertNotIn("201: ", page["numbered_text"])
+        self.assertEqual(page["text"], "x\n" * 200)
+        self.assertEqual(page["next"], {"start_line": 201, "start_column": 1})
 
     def test_search_is_literal_and_pages_matching_lines(self):
         store = self.store({"b.py": frozen("a.*b repeated a.*b\n"), "a.py": frozen("a.*b\naxxb\na.*b\n")})
@@ -289,6 +361,209 @@ class ReviewContextTests(unittest.TestCase):
                 (Path(folder) / name).rmdir()
         self.root.rmdir()
         self.assertFalse(self.root.exists())
+
+    def test_native_confirmation_requires_exact_full_text_and_logs_only_metadata(self):
+        text = "\ufeff" + "界" * 17_001 + "\r\nSYNTHETIC_SOURCE_MARKER"
+        context = {"current": {"source.py": frozen(text)}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        for observed in (text[:-1], text + "\n", text.replace("\r\n", "\n"), "x" + text[1:], None):
+            with self.subTest(observed_type=type(observed).__name__):
+                self.assertFalse(store.record_native_read("source.py", "current", observed))
+                self.assertFalse(log.exists())
+        self.assertTrue(store.record_native_read("source.py", "current", text))
+        rows = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(rows, [{"tool": "read_file", "version": "current", "path": "source.py",
+                                 "start_line": 1, "start_column": 1, "returned_chars": len(text),
+                                 "truncated": False, "source": "native"}])
+        self.assertNotIn("SYNTHETIC_SOURCE_MARKER", log.read_text())
+        self.assertTrue(assess_delivery(context, log)["complete"])
+
+    def test_native_partial_rejection_can_be_completed_by_explicit_read_pages(self):
+        context = {"current": {"a.py": frozen("first\r\nsecond\n")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        self.assertFalse(store.record_native_read("a.py", "current", "first\r\n"))
+        self.assertFalse(assess_delivery(context, log)["complete"])
+        cursor = {"start_line": 1, "start_column": 1}
+        while cursor is not None:
+            cursor = store.read_file("a.py", **cursor, char_limit=3)["next"]
+        receipt = assess_delivery(context, log)
+        self.assertTrue(receipt["complete"])
+        self.assertEqual(receipt["current"], {"total": 1, "complete": 1, "missing": []})
+
+    def test_native_confirmation_keeps_version_and_path_boundaries(self):
+        log = self.base / "audit.jsonl"
+        store = self.store({"a.py": frozen("new")}, {"a.py": frozen("old")}, log)
+        for path, version in (("../a.py", "current"), ("unknown.py", "current"), ("a.py", "HEAD")):
+            with self.subTest(path=path, version=version), self.assertRaises(ValueError):
+                store.record_native_read(path, version, "new")
+        self.assertFalse(store.record_native_read("a.py", "baseline", "new"))
+        self.assertFalse(log.exists())
+        self.assertTrue(store.record_native_read("a.py", "baseline", "old"))
+        self.assertEqual(json.loads(log.read_text())["version"], "baseline")
+        path = self.root / "current/a.py"
+        path.chmod(0o600)
+        path.write_text("bad")
+        with self.assertRaisesRegex(ValueError, "changed"):
+            store.record_native_read("a.py", "current", "bad")
+
+    def test_delivery_merges_fragmented_overlapping_out_of_order_unicode_reads(self):
+        context = {"current": {"a.py": frozen("αβ\r\nγδε\nlast")}, "baseline": {}}
+        original = copy.deepcopy(context)
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.read_file("a.py", start_line=3, start_column=2, char_limit=3)
+        store.read_file("a.py", start_line=1, start_column=3, char_limit=4)
+        store.read_file("a.py", start_line=2, start_column=2, char_limit=4)
+        store.read_file("a.py", start_line=1, start_column=1, char_limit=3)
+        receipt = assess_delivery(context, log)
+        self.assertTrue(receipt["complete"])
+        self.assertTrue(receipt["audit_valid"])
+        self.assertEqual(receipt["current"], {"total": 1, "complete": 1, "missing": []})
+        self.assertEqual(receipt["baseline"], {"total": 0, "complete": 0, "missing": []})
+        self.assertEqual(context, original)
+        json.dumps(receipt)
+
+    def test_delivery_reports_exact_gaps_without_double_counting_repeated_reads(self):
+        context = {"current": {"a.py": frozen("abcdefghi")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.read_file("a.py", start_column=3, char_limit=2)
+        store.read_file("a.py", start_column=7, char_limit=2)
+        store.read_file("a.py", start_column=3, char_limit=2)
+        receipt = assess_delivery(context, log)
+        self.assertFalse(receipt["complete"])
+        self.assertTrue(receipt["audit_valid"])
+        self.assertEqual(receipt["current"], {"total": 1, "complete": 0, "missing": [{
+            "path": "a.py", "total_chars": 9, "delivered_chars": 4,
+            "missing_ranges": [{"start": 0, "end": 2}, {"start": 4, "end": 6}, {"start": 8, "end": 9}]}]})
+
+    def test_delivery_requires_both_versions_and_discovery_does_not_count(self):
+        context = {"current": {"a.py": frozen("new"), "b.py": frozen("other")},
+                   "baseline": {"old.py": frozen("old")}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], context["baseline"], log)
+        store.list_files()
+        store.list_files(version="baseline")
+        store.search("new")
+        store.search("other")
+        store.search("old", version="baseline")
+        discovery = assess_delivery(context, log)
+        self.assertTrue(discovery["audit_valid"])
+        self.assertFalse(discovery["complete"])
+        self.assertEqual(discovery["current"]["complete"], 0)
+        self.assertEqual(discovery["baseline"]["complete"], 0)
+        store.read_file("a.py")
+        store.read_file("b.py")
+        current_only = assess_delivery(context, log)
+        self.assertEqual(current_only["current"]["complete"], 2)
+        self.assertEqual(current_only["baseline"], {"total": 1, "complete": 0, "missing": [{
+            "path": "old.py", "total_chars": 3, "delivered_chars": 0,
+            "missing_ranges": [{"start": 0, "end": 3}]}]})
+        self.assertFalse(current_only["complete"])
+        store.read_file("old.py", version="baseline")
+        self.assertTrue(assess_delivery(context, log)["complete"])
+
+    def test_delivery_empty_files_are_known_but_missing_audit_still_fails_closed(self):
+        context = {"current": {"empty.py": frozen("")}, "baseline": {"old-empty.py": frozen("")}}
+        log = self.base / "audit.jsonl"
+        missing = assess_delivery(context, log)
+        self.assertFalse(missing["complete"])
+        self.assertFalse(missing["audit_valid"])
+        self.assertEqual(missing["current"], {"total": 1, "complete": 1, "missing": []})
+        self.assertEqual(missing["baseline"], {"total": 1, "complete": 1, "missing": []})
+        log.touch()
+        self.assertTrue(assess_delivery(context, log)["complete"])
+        self.assertTrue(assess_delivery({"current": {}, "baseline": {}}, log)["complete"])
+
+    def test_delivery_successful_zero_character_read_does_not_complete_nonempty_file(self):
+        context = {"current": {"a.py": frozen("one\nlast")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        self.assertEqual(store.read_file("a.py", start_column=5, line_count=1)["text"], "")
+        receipt = assess_delivery(context, log)
+        self.assertTrue(receipt["audit_valid"])
+        self.assertFalse(receipt["complete"])
+        self.assertEqual(receipt["current"]["missing"][0]["delivered_chars"], 0)
+        self.assertEqual(receipt["current"]["missing"][0]["missing_ranges"], [{"start": 0, "end": 8}])
+
+    def test_delivery_malformed_audit_never_passes_even_after_complete_valid_reads(self):
+        context = {"current": {"a.py": frozen("abc")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.read_file("a.py")
+        valid = log.read_text()
+        with log.open("a") as output:
+            output.write("not-json\n")
+        receipt = assess_delivery(context, log)
+        self.assertFalse(receipt["complete"])
+        self.assertFalse(receipt["audit_valid"])
+        self.assertEqual(receipt["current"]["complete"], 1)
+        self.assertEqual(receipt["errors"], [{"line": 2, "reason": "invalid_audit_record"}])
+        log.write_text(valid + valid.rstrip("\n"))
+        self.assertFalse(assess_delivery(context, log)["complete"])
+
+    def test_delivery_invalid_record_fields_cannot_manufacture_full_coverage(self):
+        context = {"current": {"a.py": frozen("界\r\nz")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        good = {"tool": "read_file", "version": "current", "path": "a.py", "start_line": 1,
+                "start_column": 1, "returned_chars": 4, "truncated": False}
+        invalid = [[], {"tool": "unknown"}, {**good, "version": "HEAD"}, {**good, "path": "../a.py"},
+                   {**good, "path": "unknown.py"}, {**good, "start_line": 0}, {**good, "start_line": 4},
+                   {**good, "start_column": 0}, {**good, "start_column": 5}, {**good, "returned_chars": -1},
+                   {**good, "returned_chars": True}, {**good, "returned_chars": 6}, {**good, "truncated": True},
+                   {**good, "source": "unknown"}, {**good, "success": False},
+                   {**good, "source": "native", "start_column": 2, "returned_chars": 3},
+                   {key: value for key, value in good.items() if key != "returned_chars"},
+                   {"tool": "list_files", "version": "current"}]
+        for record in invalid:
+            with self.subTest(record=record):
+                log.write_text(json.dumps(record) + "\n")
+                receipt = assess_delivery(context, log)
+                self.assertFalse(receipt["complete"])
+                self.assertFalse(receipt["audit_valid"])
+                self.assertEqual(receipt["current"]["complete"], 0)
+        log.write_text(json.dumps(good)[:-1] + ', "returned_chars": 4}\n')
+        self.assertFalse(assess_delivery(context, log)["audit_valid"])
+        log.write_text(json.dumps(good) + "\n")
+        self.assertTrue(assess_delivery(context, log)["complete"])
+
+    def test_delivery_invalid_encoding_symlink_hardlink_and_special_audits_fail_closed(self):
+        context = {"current": {}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        log.write_bytes(b"\xff\n")
+        self.assertFalse(assess_delivery(context, log)["complete"])
+        log.unlink()
+        outside = self.base / "outside.jsonl"
+        outside.touch()
+        log.symlink_to(outside)
+        self.assertFalse(assess_delivery(context, log)["complete"])
+        log.unlink()
+        os.link(outside, log)
+        self.assertFalse(assess_delivery(context, log)["complete"])
+        log.unlink()
+        os.mkfifo(log)
+        self.assertFalse(assess_delivery(context, log)["complete"])
+        log.unlink()
+        log.mkdir()
+        self.assertFalse(assess_delivery(context, log)["complete"])
+        self.assertFalse(assess_delivery(context, None)["complete"])
+
+    def test_delivery_invalid_context_does_not_pass_as_an_empty_scope(self):
+        log = self.base / "audit.jsonl"
+        log.touch()
+        for context in (None, {"unknown": {}}, {"current": []}, {"current": {"a.py": {}}},
+                        {"current": {"../outside": frozen("x")}}):
+            with self.subTest(context=context):
+                receipt = assess_delivery(context, log)
+                self.assertFalse(receipt["complete"])
+                self.assertEqual(receipt["errors"], [{"line": None, "reason": "invalid_context"}])
+
+    def test_native_confirmation_does_not_report_success_when_audit_write_fails(self):
+        store = self.store({"a.py": frozen("body")}, log_path=self.base)
+        with self.assertRaises(OSError):
+            store.record_native_read("a.py", "current", "body")
 
 
 if __name__ == "__main__":

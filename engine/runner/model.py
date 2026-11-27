@@ -204,9 +204,11 @@ class ModelClient:
                     environment["CODEX_CONFIG"] = json.dumps(overrides)
                     environment["INITIAL_AGENT_MODE"] = "read-only"
                 # 已核对的 Codex 入口按一次请求的字符总量限制；不把该数值套到其他 Agent 或 token 窗口。
+                # Pi 适配器声明的启动通知独立分类，避免闭合材料回合把它串入答案；其他文字仍须严格核验。
                 return AcpModel(config["agent_command"], config.get("model"), config.get("timeout", 300),
                                 environment=environment, cwd=view, mcp_servers=servers,
                                 allow_tools=view is not None, instructions=instructions,
+                                startup_metadata_path=("piAcp", "startupInfo") if config.get("agent") == "pi" else None,
                                 max_request_chars=1_048_576 if config.get("agent") == "codex" else None).run(
                                     prompt, schema, stage_dir)
             finally:

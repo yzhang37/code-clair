@@ -96,6 +96,143 @@ def materialize_context(context, root):
     return manifest
 
 
+def _missing_ranges(length, intervals):
+    """_missing_ranges() 合并重复、重叠和相邻交付区间，再取正文字符范围内的补集。"""
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    missing, cursor, delivered = [], 0, 0
+    for start, end in merged:
+        if cursor < start:
+            missing.append({"start": cursor, "end": start})
+        delivered += end - start
+        cursor = end
+    if cursor < length:
+        missing.append({"start": cursor, "end": length})
+    return delivered, missing
+
+
+def _audit_object(pairs):
+    """_audit_object() 拒绝同名字段的歧义，避免后写值覆盖先前的审计边界。"""
+    record = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError("Duplicate context audit field")
+        record[key] = value
+    return record
+
+
+def assess_delivery(context, log_path):
+    """assess_delivery() 用成功原文读取的审计区间核对每版正文是否完整交付。
+
+    行列按冻结原文的 splitlines 规则转换为 Unicode 字符偏移，重复和乱序读取只计
+    并集；list_files、search 和模型自报路径不证明正文交付，已知空文件无正文缺口。
+    missing_ranges 使用从 0 开始、不含 end 的字符区间；回执只含路径、计数和边界，
+    不保存正文，也不证明模型已理解或正确审核这些正文。
+    日志缺失、不安全、损坏或含无效记录均使 complete 为 False，保留有效区间供定位。
+    正文分行成本随字符数增长；每文件的 R 个区间排序合并为 O(R log R)，额外空间随
+    行数、审计区间和回执缺口数增长，调用方应在本次模型退出后传入该阶段专用日志。
+    """
+    receipt = {"complete": False, "audit_valid": False,
+               "current": {"total": 0, "complete": 0, "missing": []},
+               "baseline": {"total": 0, "complete": 0, "missing": []}, "errors": []}
+    files = {version: {} for version in VERSIONS}
+    try:
+        if not isinstance(context, dict) or set(context) - set(VERSIONS):
+            raise ValueError("Invalid context maps")
+        for version in VERSIONS:
+            snapshot = context.get(version, {})
+            if not isinstance(snapshot, dict):
+                raise ValueError("Invalid context file map")
+            for path, record in snapshot.items():
+                _relative_path(path)
+                if not isinstance(record, dict) or not isinstance(record.get("text"), str):
+                    raise ValueError("Invalid frozen context text")
+                starts = [0]
+                for line in record["text"].splitlines(keepends=True):
+                    starts.append(starts[-1] + len(line))
+                files[version][path] = {"starts": starts, "length": len(record["text"]), "intervals": []}
+    except ValueError:
+        receipt["errors"].append({"line": None, "reason": "invalid_context"})
+        return receipt
+
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        descriptor = os.open(log_path, flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8", newline="") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise ValueError("Unsafe context audit")
+            for number, line in enumerate(source, 1):
+                try:
+                    if not line.endswith("\n"):
+                        raise ValueError("Unterminated context audit record")
+                    record = json.loads(line, object_pairs_hook=_audit_object)
+                    if not isinstance(record, dict) or record.get("tool") not in ("read_file", "list_files", "search"):
+                        raise ValueError("Unknown context audit record")
+                    version = record.get("version")
+                    if not isinstance(version, str) or version not in files:
+                        raise ValueError("Unknown audit version")
+                    if record["tool"] in ("list_files", "search"):
+                        fields = {"tool", "version", "prefix", "offset", "returned", "total"}
+                        if record["tool"] == "search":
+                            fields.add("query_chars")
+                            _integer(record.get("query_chars"), "audit query_chars", 1, MAX_QUERY_CHARS)
+                        if set(record) != fields:
+                            raise ValueError("Invalid context discovery audit fields")
+                        _relative_path(record["prefix"], prefix=True)
+                        offset = _integer(record["offset"], "audit offset", 0)
+                        total = _integer(record["total"], "audit total", 0)
+                        _integer(record["returned"], "audit returned", 0, min(MAX_RESULTS, max(0, total - offset)))
+                        continue
+                    fields = {"tool", "version", "path", "start_line", "start_column", "returned_chars", "truncated"}
+                    if set(record) - fields - {"source"}:
+                        raise ValueError("Invalid context read audit fields")
+                    path = _relative_path(record.get("path"))
+                    if path not in files[version]:
+                        raise ValueError("Unknown audit path")
+                    material = files[version][path]
+                    starts, length = material["starts"], material["length"]
+                    start_line = _integer(record.get("start_line"), "audit start_line", 1, len(starts))
+                    line_length = starts[start_line] - starts[start_line - 1] if start_line < len(starts) else 0
+                    start_column = _integer(record.get("start_column"), "audit start_column", 1, line_length + 1)
+                    start = starts[start_line - 1] + start_column - 1
+                    count = _integer(record.get("returned_chars"), "audit returned_chars", 0, length - start)
+                    end = start + count
+                    if type(record.get("truncated")) is not bool or record["truncated"] != (end < length):
+                        raise ValueError("Inconsistent audit continuation")
+                    if "source" in record and (record["source"] != "native" or start != 0 or end != length):
+                        raise ValueError("Invalid native full-text confirmation")
+                    if count:
+                        material["intervals"].append((start, end))
+                except (ValueError, RecursionError):
+                    # 损坏行不能被当成没有发生；仍检查后续完整行，保留已确认的交付范围。
+                    receipt["errors"].append({"line": number, "reason": "invalid_audit_record"})
+            after = os.fstat(source.fileno())
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                receipt["errors"].append({"line": None, "reason": "audit_changed_during_read"})
+    except (OSError, TypeError, ValueError, UnicodeError):
+        receipt["errors"].append({"line": None, "reason": "audit_unavailable_or_unsafe"})
+
+    for version, snapshot in files.items():
+        summary = receipt[version]
+        summary["total"] = len(snapshot)
+        for path, material in sorted(snapshot.items()):
+            delivered, missing = _missing_ranges(material["length"], material["intervals"])
+            if missing:
+                summary["missing"].append({"path": path, "total_chars": material["length"],
+                                           "delivered_chars": delivered, "missing_ranges": missing})
+            else:
+                summary["complete"] += 1
+    receipt["audit_valid"] = not receipt["errors"]
+    receipt["complete"] = receipt["audit_valid"] and all(receipt[version]["complete"] == receipt[version]["total"]
+                                                          for version in VERSIONS)
+    return receipt
+
+
 class ContextStore:
     """ContextStore 只按固定清单读取投影，查询不发现宿主文件，也不提供执行或改写入口。"""
 
@@ -193,6 +330,21 @@ class ContextStore:
                     raise ValueError("Context audit log must be an ordinary file")
                 output.write(json.dumps({"tool": tool, **values}, ensure_ascii=False) + "\n")
 
+    def record_native_read(self, path, version, observed_text):
+        """record_native_read() 只为可信原生工具确认与固定正文逐字符相等的完整读取。
+
+        截断、前后缀和换行改写都返回 False，不以长度或近似匹配补认交付；调用方可改用
+        read_file 明确分页取全。
+        成功时只记录全文件范围的 read_file 元数据；路径越界、投影变化或审计写入失败
+        仍传播错误，不记录正文，此入口不作为模型可调用工具暴露。
+        """
+        text, _ = self._text(path, version)
+        if not isinstance(observed_text, str) or observed_text != text:
+            return False
+        self._audit("read_file", version=version, path=path, start_line=1, start_column=1,
+                    returned_chars=len(text), truncated=False, source="native")
+        return True
+
     def list_files(self, version="current", prefix="", offset=0, limit=100):
         """list_files() 按原路径排序分页，不扫描投影目录或列出未声明的文件。"""
         files = self._version(version)
@@ -212,6 +364,8 @@ class ContextStore:
 
         行列均从 1 开始，列按 Unicode 字符计；行数和字符数任一用尽就停，next 指向
         尚未交付的正文，而不是把长行后半截丢弃。
+        numbered_text 复用同一游标给实际片段加原始行号，帮助引用定位；前缀只属于展示，
+        原文证据仍是 text，长行续页的起始列仍由 start_column 表示。
         每次核验完整投影并按现有审核器的 splitlines 规则分行，成本随本文件长度增长。
         """
         _integer(start_line, "start_line", 1)
@@ -224,7 +378,7 @@ class ContextStore:
             raise ValueError("Context cursor is past the file")
         if start_line <= len(lines) and start_column > len(lines[start_line - 1]) + 1:
             raise ValueError("Context column is past the line")
-        pieces, remaining = [], char_limit
+        pieces, numbered_pieces, remaining = [], [], char_limit
         cursor_line, cursor_column = start_line, start_column
         end_line, end_column = start_line, start_column - 1
         stop_line = min(len(lines) + 1, start_line + line_count)
@@ -234,13 +388,15 @@ class ContextStore:
             pieces.append(piece)
             remaining -= len(piece)
             if piece:
+                numbered_pieces.append(f"{cursor_line}: {piece}")
                 end_line, end_column = cursor_line, cursor_column + len(piece) - 1
             cursor_column += len(piece)
             if cursor_column > len(line):
                 cursor_line, cursor_column = cursor_line + 1, 1
         continuation = {"start_line": cursor_line, "start_column": cursor_column} if cursor_line <= len(lines) else None
         result = {"version": version, "path": path, "oid": record["oid"], "mode": record["mode"],
-                  "text": "".join(pieces), "start_line": start_line, "start_column": start_column,
+                  "text": "".join(pieces), "numbered_text": "".join(numbered_pieces),
+                  "start_line": start_line, "start_column": start_column,
                   "end_line": end_line, "end_column": end_column, "next": continuation,
                   "total_lines": len(lines), "truncated": continuation is not None}
         self._audit("read_file", version=version, path=path, start_line=start_line, start_column=start_column,

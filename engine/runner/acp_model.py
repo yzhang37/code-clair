@@ -18,7 +18,7 @@ from model_common import ModelFailure, _CONTEXT_INSTRUCTIONS, _INSTRUCTIONS, _lo
 class _ReviewClient:
     """_ReviewClient 按消息边界收集回答，不提供宿主文件或终端能力。"""
 
-    def __init__(self, events, *, allow_tools=False):
+    def __init__(self, events, *, allow_tools=False, startup_metadata_path=None):
         """__init__() 将过程记录与回答分开，避免启动提示或推理成为审核 JSON。"""
         self.events = events
         self.session_id = None
@@ -27,12 +27,50 @@ class _ReviewClient:
         self.message_id = None
         self.after_tool = False
         self.allow_tools = allow_tools
+        self.startup_metadata_path = startup_metadata_path
+        self.first_messages = {}
+        self.startup_text = None
         self.violation = None
 
     def record(self, kind, **values):
         """record() 保存已解析的 ACP 过程，保留调用证据而不解释审核结论。"""
         self.events.write(json.dumps({"type": kind, **values}, ensure_ascii=False, allow_nan=False) + "\n")
         self.events.flush()
+
+    def start_session(self, session_id, metadata):
+        """start_session() 绑定会话及调用方声明的启动通知字段，不解释任何 Agent 的文本格式。
+
+        只把该会话首条无消息标识的完整文本与元数据逐字比较，防止将后续相同的模型正文吞掉。
+        首条通知可能早于 session/new 响应；它已在回答收取前到达时也记为已识别，不重新开放豁免。
+        """
+        self.session_id = session_id
+        if self.startup_metadata_path is None:
+            return
+        value = metadata
+        for key in self.startup_metadata_path:
+            value = value.get(key) if isinstance(value, dict) else None
+        self.startup_text = value if isinstance(value, str) and value else None
+        first = self.first_messages.get(session_id)
+        if first is not None and self._matches_startup(first):
+            self.record("adapter/startup", session_id=session_id,
+                        metadata_path=self.startup_metadata_path, timing="before_session_response")
+
+    def _matches_startup(self, value):
+        """_matches_startup() 只核对声明字段与一条完整通知，不裁剪、规范化或提取 JSON。"""
+        content = value.get("content", {})
+        return (self.startup_text is not None and value.get("messageId") is None
+                and content.get("type") == "text" and content.get("text") == self.startup_text)
+
+    def _startup_notification(self, session_id, value):
+        """_startup_notification() 保存首条候选并最多识别一次，使异步早到通知与提示内通知使用同一边界。"""
+        if self.startup_metadata_path is None or session_id in self.first_messages:
+            return False
+        self.first_messages[session_id] = value
+        if self.session_id != session_id or not self._matches_startup(value):
+            return False
+        self.record("adapter/startup", session_id=session_id, metadata_path=self.startup_metadata_path,
+                    timing="during_prompt" if self.receiving else "before_prompt")
+        return True
 
     async def session_update(self, session_id, update, **kwargs):
         """session_update() 按 ACP 消息标识收取末条回答，过程事件只保留为调用证据。
@@ -50,6 +88,8 @@ class _ReviewClient:
         self.record("session/update", session_id=session_id, category=category, update=value)
         if self.session_id is not None and session_id != self.session_id:
             self.violation = "ACP update belongs to another session"
+            return
+        if kind == "agent_message_chunk" and self._startup_notification(session_id, value):
             return
         if kind in {"tool_call", "tool_call_update"}:
             if not self.allow_tools:
@@ -125,7 +165,8 @@ class AcpModel:
     def __init__(self, command: list[str], model: str | None = None, timeout: float = 300,
                  *, environment: dict[str, str] | None = None, cwd: Path | None = None,
                  mcp_servers: list[dict] | None = None, allow_tools: bool = False,
-                 instructions: str | None = None, max_request_chars: int | None = None):
+                 instructions: str | None = None, max_request_chars: int | None = None,
+                 startup_metadata_path: tuple[str, ...] | None = None):
         """__init__() 保存已选择的 Agent 启动方式，供应商认证和原生协议由现成适配器负责。"""
         if (not isinstance(command, list) or not command
                 or any(not isinstance(item, str) or not item or "\0" in item for item in command)):
@@ -147,6 +188,11 @@ class AcpModel:
             raise ValueError("instructions must be a nonempty string or null")
         if max_request_chars is not None and (type(max_request_chars) is not int or max_request_chars <= 0):
             raise ValueError("max_request_chars must be a positive integer or null")
+        if startup_metadata_path is not None and (not isinstance(startup_metadata_path, tuple)
+                                                  or not startup_metadata_path
+                                                  or any(not isinstance(key, str) or not key or "\0" in key
+                                                         for key in startup_metadata_path)):
+            raise ValueError("startup_metadata_path must be a nonempty tuple of metadata field names or null")
         self.command = list(command)
         self.model = model
         self.timeout = timeout
@@ -157,6 +203,7 @@ class AcpModel:
         self.instructions = instructions if instructions is not None else (
             _CONTEXT_INSTRUCTIONS if allow_tools else _INSTRUCTIONS)
         self.max_request_chars = max_request_chars
+        self.startup_metadata_path = startup_metadata_path
 
     async def _exchange(self, process, work_root, client, request):
         """_exchange() 完成握手、新建会话和一次审核，只接受正常结束的最终文字回答。
@@ -178,7 +225,7 @@ class AcpModel:
                 raise ModelFailure("ACP agent uses an unsupported protocol version")
             servers = [McpServerStdio.model_validate(server) for server in self.mcp_servers]
             session = await connection.new_session(cwd=str(work_root), mcp_servers=servers)
-            client.session_id = session.session_id
+            client.start_session(session.session_id, session.field_meta)
             client.record("session/new", session=session.model_dump(mode="json", by_alias=True, exclude_none=True))
             if self.model is not None:
                 options = [option for option in session.config_options or [] if option.category == "model"]
@@ -274,7 +321,8 @@ class AcpModel:
                     (stage_dir / "stderr.log").open("xb") as errors:
                 os.chmod(events.name, 0o600)
                 os.chmod(errors.name, 0o600)
-                client = _ReviewClient(events, allow_tools=self.allow_tools)
+                client = _ReviewClient(events, allow_tools=self.allow_tools,
+                                       startup_metadata_path=self.startup_metadata_path)
                 if self.cwd is None:
                     with tempfile.TemporaryDirectory(prefix="clarity-acp-") as temporary:
                         text = asyncio.run(self._invoke(Path(temporary), client, request, errors))

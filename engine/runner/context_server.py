@@ -54,7 +54,8 @@ def create_server(root, log_path=None):
         description=("Read bounded original text from one frozen file, using its original repository-relative "
                      "path and current or baseline version. One-based line and Unicode-character columns "
                      "refer to that original version. Returned text preserves original newlines and omits "
-                     "no characters before the explicit next cursor. Continue with next.start_line and "
+                     "no characters before the explicit next cursor. numbered_text labels original lines "
+                     "for citation; its added number prefixes are not source text. Continue with next.start_line and "
                      "next.start_column until next is null when the complete file is needed. Absolute paths, "
                      "view-path prefixes, undeclared files and path traversal are rejected. Findings must "
                      "cite original path, line and original line text, not pagination or view metadata."),

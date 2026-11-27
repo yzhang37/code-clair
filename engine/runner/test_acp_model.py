@@ -26,6 +26,9 @@ from pathlib import Path
 mode, capture = sys.argv[1], Path(sys.argv[2])
 session_id = "transport-fixture"
 model = "fixture/default"
+startup = "Synthetic adapter startup notice.\n"
+answer_mode = {"banner_bad_json": "markdown", "banner_bad_schema": "schema",
+               "banner_refusal": "refusal", "banner_max_tokens": "max_tokens"}.get(mode, mode)
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -54,16 +57,44 @@ for line in sys.stdin:
         else:
             reply(identifier, {"protocolVersion": 1, "agentCapabilities": {}})
     elif method == "session/new":
-        update("agent_message_chunk", content={"type": "text", "text": "Startup information"})
+        if not mode.startswith("banner_"):
+            update("agent_message_chunk", content={"type": "text", "text": "Startup information"})
+        elif mode in {"banner_before_response", "banner_echo_after_early"}:
+            update("agent_message_chunk", content={"type": "text", "text": startup})
         response = {"sessionId": session_id}
+        if mode.startswith("banner_") and mode != "banner_missing_metadata":
+            response["_meta"] = {"fixture": {"startup": None if mode == "banner_null_metadata" else
+                                           1 if mode == "banner_invalid_metadata" else startup}}
         if mode != "no_model_option":
             response["configOptions"] = options()
         reply(identifier, response)
     elif method == "session/set_config_option":
+        if mode == "banner_before_prompt":
+            update("agent_message_chunk", content={"type": "text", "text": startup})
         if mode != "ignore_model":
             model = message["params"]["value"]
         reply(identifier, {"configOptions": options()})
     elif method == "session/prompt":
+        if mode.startswith("banner_") and mode not in {"banner_before_response", "banner_before_prompt",
+                                                        "banner_suffix"}:
+            if mode == "banner_prefix":
+                update("agent_message_chunk", content={"type": "text", "text": "Unrelated prefix."})
+            if mode == "banner_split":
+                update("agent_message_chunk", content={"type": "text", "text": startup[:8]})
+                update("agent_message_chunk", content={"type": "text", "text": startup[8:]})
+            elif mode == "banner_wrong_session":
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": "other-session", "update": {"sessionUpdate": "agent_message_chunk",
+                                                               "content": {"type": "text", "text": startup}}}})
+            else:
+                text = startup.rstrip("\n") if mode == "banner_changed" else (
+                       startup + '{"accepted":true}' if mode == "banner_combined" else startup)
+                fields = {"messageId": "answer"} if mode == "banner_message_id" else {}
+                update("agent_message_chunk", content={"type": "text", "text": text}, **fields)
+            if mode == "banner_duplicate":
+                update("agent_message_chunk", content={"type": "text", "text": startup})
+            if mode == "banner_answer_prefix":
+                update("agent_message_chunk", content={"type": "text", "text": "Unrelated answer prefix."})
         if mode == "provider_error":
             send({"jsonrpc": "2.0", "id": identifier,
                   "error": {"code": -32000, "message": "Synthetic provider failure"}})
@@ -92,11 +123,11 @@ for line in sys.stdin:
                 saved.write(json.dumps(answer) + "\n")
         if mode == "tool":
             update("tool_call", toolCallId="tool", title="Unexpected tool", kind="execute", status="completed")
-        if mode in {"message_ids", "pi_tools", "same_id", "unmarked_progress", "invalid_final", "tool_no_final"}:
+        if mode in {"message_ids", "pi_tools", "same_id", "unmarked_progress", "invalid_final", "tool_no_final", "banner_with_tools"}:
             initial = '{"accepted":false}' if mode in {"invalid_final", "tool_no_final"} else "Inspecting related code."
-            fields = {} if mode in {"pi_tools", "unmarked_progress"} else {"messageId": "progress"}
+            fields = {} if mode in {"pi_tools", "unmarked_progress", "banner_with_tools"} else {"messageId": "progress"}
             update("agent_message_chunk", content={"type": "text", "text": initial}, **fields)
-        if mode in {"message_ids", "pi_tools"}:
+        if mode in {"message_ids", "pi_tools", "banner_with_tools"}:
             update("plan", entries=[{"content": "Inspect related code", "priority": "medium", "status": "completed"}])
             update("session_info_update", _meta={"fixture": {"state": "working"}})
             update("usage_update", used=10, size=100)
@@ -107,20 +138,24 @@ for line in sys.stdin:
             update("agent_message_chunk", content={"type": "resource_link", "uri": "file:///not-provided", "name": "file"})
         body = {"duplicate": '{"accepted":true,"accepted":false}', "invalid_final": 'not JSON',
                 "nan": '{"accepted":NaN}', "array": '[]', "schema": '{"accepted":"yes"}',
-                "markdown": '```json\n{"accepted":true}\n```', "empty": ''}.get(mode, '{"accepted":true}')
+                "markdown": '```json\n{"accepted":true}\n```', "empty": '', "banner_only": ''}.get(answer_mode, '{"accepted":true}')
         update("agent_thought_chunk", content={"type": "text", "text": "Transport fixture reasoning"})
         fields = {"messageId": "final"} if mode in {"message_ids", "invalid_final"} else (
-                 {"messageId": "progress"} if mode == "same_id" else {})
+                 {"messageId": "progress"} if mode == "same_id" else (
+                 {"messageId": "answer"} if mode == "banner_message_id" else {}))
         for text in (body[:5], body[5:]):
-            if mode != "tool_no_final":
+            if mode not in {"tool_no_final", "banner_combined"}:
                 update("agent_message_chunk", content={"type": "text", "text": text}, **fields)
+        if mode in {"banner_suffix", "banner_answer_suffix"}:
+            text = startup if mode == "banner_suffix" else "Unrelated answer suffix."
+            update("agent_message_chunk", content={"type": "text", "text": text})
         if mode == "tool_no_final":
             update("tool_call", toolCallId="last", title="Last action", kind="read", status="completed")
         if mode == "other_session":
             send({"jsonrpc": "2.0", "method": "session/update", "params": {
                 "sessionId": "other-session", "update": {"sessionUpdate": "agent_message_chunk",
                                                            "content": {"type": "text", "text": "{}"}}}})
-        reply(identifier, {"stopReason": mode if mode in {"cancelled", "max_tokens", "refusal"} else "end_turn"})
+        reply(identifier, {"stopReason": answer_mode if answer_mode in {"cancelled", "max_tokens", "refusal"} else "end_turn"})
         if mode == "exit_failure":
             sys.exit(7)
 '''
@@ -242,9 +277,61 @@ class AcpModelTests(unittest.TestCase):
     def test_context_options_require_an_explicit_view_and_boolean_tool_choice(self):
         for options in ({"allow_tools": True}, {"allow_tools": 1}, {"mcp_servers": [{}]},
                         {"mcp_servers": "not a list"}, {"instructions": ""},
-                        {"max_request_chars": 0}, {"max_request_chars": True}, {"max_request_chars": 1.5}):
+                        {"max_request_chars": 0}, {"max_request_chars": True}, {"max_request_chars": 1.5},
+                        {"startup_metadata_path": []}, {"startup_metadata_path": ()},
+                        {"startup_metadata_path": ("",)}, {"startup_metadata_path": (1,)}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 AcpModel([sys.executable], **options)
+
+    def test_declared_whole_startup_notification_is_separate_from_closed_answer(self):
+        result, stage = self.invoke("banner_during_prompt", startup_metadata_path=("fixture", "startup"))
+        self.assertEqual(result, {"accepted": True})
+        self.assertEqual((stage / "output.json").read_text(), '{"accepted":true}')
+        events = [json.loads(line) for line in (stage / "events.jsonl").read_text().splitlines()]
+        startup = [event for event in events if event["type"] == "adapter/startup"]
+        self.assertEqual(startup, [{"type": "adapter/startup", "session_id": "transport-fixture",
+                                    "metadata_path": ["fixture", "startup"], "timing": "during_prompt"}])
+        self.assertTrue(any(event.get("update", {}).get("content", {}).get("text") ==
+                            "Synthetic adapter startup notice.\n" for event in events))
+
+    def test_startup_metadata_is_opt_in_and_never_a_prefix_or_json_parser(self):
+        with self.assertRaises(ModelFailure):
+            self.invoke("banner_during_prompt")
+        for mode in ("banner_missing_metadata", "banner_null_metadata", "banner_invalid_metadata", "banner_changed",
+                     "banner_split", "banner_combined", "banner_duplicate", "banner_prefix", "banner_suffix",
+                     "banner_answer_prefix", "banner_answer_suffix", "banner_message_id", "banner_only",
+                     "banner_wrong_session", "banner_echo_after_early", "banner_bad_json", "banner_bad_schema",
+                     "banner_refusal", "banner_max_tokens"):
+            with self.subTest(mode=mode), self.assertRaises(ModelFailure):
+                self.invoke(mode, startup_metadata_path=("fixture", "startup"))
+
+    def test_early_startup_is_consumed_before_response_or_before_prompt(self):
+        for mode, model in (("banner_before_response", None), ("banner_before_prompt", "fixture/default")):
+            with self.subTest(mode=mode):
+                result, stage = self.invoke(mode, model=model, startup_metadata_path=("fixture", "startup"))
+                self.assertEqual(result, {"accepted": True})
+                events = [json.loads(line) for line in (stage / "events.jsonl").read_text().splitlines()]
+                notices = [event for event in events if event["type"] == "adapter/startup"]
+                self.assertEqual(len(notices), 1)
+                self.assertIn(notices[0]["timing"], {"before_session_response", "before_prompt"})
+
+    def test_declared_startup_does_not_change_tool_or_answer_boundaries(self):
+        result, stage = self.invoke("banner_with_tools", cwd=self.root, allow_tools=True,
+                                    startup_metadata_path=("fixture", "startup"))
+        self.assertEqual(result, {"accepted": True})
+        self.assertEqual((stage / "output.json").read_text(), '{"accepted":true}')
+        command = [sys.executable, str(self.server), "banner_with_tools", str(self.capture)]
+        client = AcpModel(command, startup_metadata_path=("fixture", "startup"))
+        with self.assertRaisesRegex(ModelFailure, "attempted a tool"):
+            client.run("Closed stage", SCHEMA, self.root / "closed_banner_tools" / "attempt")
+
+    def test_each_invocation_has_its_own_startup_consumption(self):
+        command = [sys.executable, str(self.server), "banner_during_prompt", str(self.capture)]
+        client = AcpModel(command, startup_metadata_path=("fixture", "startup"))
+        for attempt in ("first", "second"):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(client.run("Closed stage", SCHEMA, self.root / "private_session" / attempt),
+                                 {"accepted": True})
 
     def test_custom_instructions_are_saved_and_sent(self):
         _, stage = self.invoke(instructions="Use the supplied frozen evidence.")

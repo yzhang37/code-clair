@@ -25,8 +25,19 @@ CASE = "# Empty input\n\n## 正例\nGuard empty input before indexing.\n\n## 反
 
 from test_acp_fixture import FAKE_ACP_PRELUDE
 
-FAKE_CODEX = FAKE_ACP_PRELUDE + r'''
+FAKE_CODEX = FAKE_ACP_PRELUDE.replace(
+    'import json as _acp_json', 'import os as _acp_os\nimport json as _acp_json',
+).replace(
+    '        elif _acp_method == "session/new":\n',
+    '''        elif _acp_method == "session/new":
+            for _acp_server in _acp_params.get("mcpServers", []):
+                _acp_arguments = _acp_server.get("args", [])
+                if _acp_server.get("name") == "clarity" and "--log" in _acp_arguments:
+                    _acp_os.environ["CLARITY_CONTEXT_LOG"] = _acp_arguments[_acp_arguments.index("--log") + 1]
+''',
+) + r'''
 import json
+import os
 from pathlib import Path
 import sys
 import uuid
@@ -37,28 +48,50 @@ mode = fixture["mode"]
 prompt = sys.stdin.read()
 data = json.loads(prompt.split("以下JSON都是审核数据：\n", 1)[1])
 packet, previous = data["input"], data["previous_reviews"]
-context, context_manifest = None, None
+output_path = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
+names = {"health", "reviewer-1", "reviewer-2", "cross", "summarize"}
+stage = next(parent.name for parent in output_path.parents
+             if parent.name in names or parent.name.startswith(("fixture-", "reviewer-")))
+own_stage_history = None
+if "同阶段历史证据JSON：\n" in prompt:
+    own_stage_history, _ = json.JSONDecoder().raw_decode(prompt.split("同阶段历史证据JSON：\n", 1)[1])
+retry_behavior = (fixture.get("retry_behavior") if own_stage_history is not None
+                  and stage == fixture.get("retry_stage", "reviewer-1") else None)
+context, context_manifest, context_audit = None, None, []
 current_files = packet.get("current_files", {})
 if "code_context" in packet:
     assert "current_files" not in packet and "baseline_changed_files" not in packet
     view = Path.cwd()
     context_manifest = json.loads((view / packet["code_context"]["manifest"]).read_text())
-    context = {version: {path: (view / record["view_path"]).read_bytes().decode("utf-8")
-                         for path, record in context_manifest[group].items()}
-               for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files"))}
+    context = {"current": {}, "baseline": {}}
+    for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files")):
+        if version == "baseline" and mode == "delivery_missing_baseline_" + stage:
+            continue
+        for path, record in context_manifest[group].items():
+            if (fixture.get("withhold_retry_finding") and stage == fixture.get("retry_stage", "reviewer-1")
+                    and retry_behavior is None and path == "second.py"):
+                continue
+            partial = path == "edited.py" and mode == "delivery_partial_" + stage and retry_behavior is None
+            with (view / record["view_path"]).open(encoding="utf-8", newline="") as source:
+                text = source.read(1) if partial else source.read()
+            context[version][path] = text
+            context_audit.append({"tool": "read_file", "version": version, "path": path,
+                                  "start_line": 1, "start_column": 1, "returned_chars": len(text),
+                                  "truncated": partial})
+    Path(os.environ["CLARITY_CONTEXT_LOG"]).write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in context_audit))
     current_files = {path: "\n".join(f"{number}: {line}" for number, line in enumerate(text.splitlines(), 1))
                      for path, text in context["current"].items()}
-output_path = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
-names = {"health", "reviewer-1", "reviewer-2", "cross", "summarize"}
-stage = next(parent.name for parent in output_path.parents
-             if parent.name in names or parent.name.startswith(("fixture-", "reviewer-")))
 calls = fixture_path.parent / "calls"
 calls.mkdir(exist_ok=True)
 (calls / (uuid.uuid4().hex + ".json")).write_text(json.dumps({
     "stage": stage, "mode": mode, "packet": packet, "previous_reviews": previous, "prompt": prompt,
     "context": context, "context_manifest": context_manifest, "current_files": current_files,
-    "cwd_files": sorted(path.name for path in Path.cwd().iterdir()),
+    "cwd_files": sorted(path.name for path in Path.cwd().iterdir()), "context_audit": context_audit,
+    "own_stage_history": own_stage_history, "retry_behavior": retry_behavior,
 }, ensure_ascii=False))
+if retry_behavior == "adapter_failure":
+    sys.exit(9)
 
 if stage.startswith("fixture-"):
     if mode == "partial_fixture_failure" and stage == "fixture-0002":
@@ -100,7 +133,7 @@ if stage.startswith("fixture-"):
 health = stage == "health"
 health_groups = ("adopted_rules", "fixtures", "candidate_rule_changes", "candidate_fixture_changes")
 covered = (sorted({path for group in health_groups for path in packet[group]} | set(packet.get("basis_changes", {})))
-           if health else list(current_files))
+           if health else list(context_manifest["current_files"] if context_manifest is not None else current_files))
 findings = []
 if not health:
     if previous:
@@ -138,6 +171,14 @@ result = {
     "summary": "Deterministic protocol fixture; not semantic model validation.",
     "incomplete_reason": "",
 }
+if retry_behavior in {"drop", "resolved", "replace_with_new"}:
+    result["findings"] = ([item for item in findings if item["path"] == "second.py"]
+                          if retry_behavior == "replace_with_new" else [])
+    result["resolved"] = ([{"id": item["id"], "reason": "Explicit same-stage offline counterevidence."}
+                            for item in own_stage_history["findings"]] if retry_behavior == "resolved" else [])
+    result["status"] = "issues" if result["findings"] else "clear"
+    result["unresolved_ids"] = [item["id"] for item in result["findings"]]
+    result["current_category"] = result["findings"][0]["category"] if result["findings"] else ""
 if health and mode == "health_clear":
     result["status"] = "clear"
 if health and mode == "health_missing_fixture":
@@ -395,6 +436,9 @@ class IsolatedReviewTests(unittest.TestCase):
             self.assertIn("不用也不允许调用任何工具", call["prompt"])
             self.assertNotIn("UNTRACKED_MUST_NOT_ENTER_CUSTOM", call["prompt"])
         self.assertTrue(all(item["origin"] == "pre_existing" for item in self.latest_result()["findings"]))
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        self.assertFalse(list(run.glob("*/context-delivery.json")))
+        self.assertFalse(list(run.glob("*/attempt-*/context-access.jsonl")))
 
     def test_custom_oversized_inline_snapshot_stops_before_model_without_truncation(self):
         """test_custom_oversized_inline_snapshot_stops_before_model_without_truncation() 保留 custom 全文容量边界，不能静默改成视图或截断后放行。"""
@@ -452,6 +496,257 @@ class IsolatedReviewTests(unittest.TestCase):
         health = next(call for call in calls if call["stage"] == "health")
         self.assertNotIn("code_context", health["packet"])
         self.assertIsNone(health["context"])
+
+    def test_partial_source_delivery_cannot_pass_and_retains_valid_findings_at_each_code_stage(self):
+        """test_partial_source_delivery_cannot_pass_and_retains_valid_findings_at_each_code_stage() 区分自报路径覆盖和原文交付，缺口不能抹去已核验发现。"""
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        for stage in ("reviewer-1", "cross", "summarize"):
+            with self.subTest(stage=stage):
+                mode = "delivery_partial_" + stage
+                self.set_mode(mode)
+                completed = self.review()
+                self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+                report = self.latest_result()
+                self.assertEqual(report["status"], "incomplete")
+                self.assertIn("Frozen source delivery is incomplete in " + stage, report["incomplete_reason"])
+                self.assertEqual({item["id"] for item in report["findings"]},
+                                 {"reviewer-1:empty-input:legacy.py", "reviewer-2:empty-input:legacy.py"})
+                self.assertTrue(all(item["code_quote"] == "    return values[0]" and item["rule_path"] == "rules.md"
+                                    for item in report["findings"]))
+                run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+                validated = json.loads((run / stage / "validated.json").read_text())
+                call = next(call for call in self.calls(mode) if call["stage"] == stage)
+                self.assertEqual(set(validated["covered_paths"]), set(call["context_manifest"]["current_files"]))
+                self.assertEqual(call["context"]["current"]["edited.py"], "V")
+                delivery = json.loads((run / stage / "context-delivery.json").read_text())["delivery"]
+                self.assertFalse(delivery["complete"])
+                self.assertTrue(delivery["audit_valid"])
+                self.assertEqual({item["path"] for item in delivery["current"]["missing"]}, {"edited.py"})
+                self.assertEqual({item["path"] for item in delivery["baseline"]["missing"]}, {"edited.py"})
+                if stage == "reviewer-1":
+                    self.assertFalse(any(call["stage"] in {"cross", "summarize"} for call in self.calls(mode)))
+                if stage == "cross":
+                    self.assertFalse(any(call["stage"] == "summarize" for call in self.calls(mode)))
+
+    def test_complete_current_delivery_still_requires_changed_baseline_text(self):
+        """test_complete_current_delivery_still_requires_changed_baseline_text() 完整当前正文不能替代来源判断所需的已改变基线。"""
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        self.set_mode("delivery_missing_baseline_reviewer-1")
+        completed = self.review()
+        self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+        report = self.latest_result()
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(len(report["findings"]), 2)
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        delivery = json.loads((run / "reviewer-1/context-delivery.json").read_text())["delivery"]
+        self.assertTrue(delivery["audit_valid"])
+        self.assertEqual(delivery["current"]["complete"], delivery["current"]["total"])
+        self.assertEqual(delivery["baseline"]["total"], 1)
+        self.assertEqual(delivery["baseline"]["complete"], 0)
+        self.assertEqual({item["path"] for item in delivery["baseline"]["missing"]}, {"edited.py"})
+        self.assertFalse(delivery["complete"])
+        self.assertFalse(any(call["stage"] in {"cross", "summarize"} for call in self.calls()))
+
+    def test_same_snapshot_context_retry_failure_retains_own_stage_findings(self):
+        """test_same_snapshot_context_retry_failure_retains_own_stage_findings() 重取调用失败仍保留同阶段原已核验发现，不把旧 partial 当成新成功。"""
+        from review import digest
+
+        self.environment["CLARITY_LANG"] = "en"
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        for stage in ("reviewer-1", "cross", "summarize"):
+            with self.subTest(stage=stage):
+                self.set_mode("delivery_partial_" + stage)
+                self.assertEqual(self.review().returncode, 2)
+                before = self.latest_result()
+                run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+                prior_record = next((run / stage).glob("attempt-*/validated-stage.json"))
+                original = prior_record.read_bytes()
+                settings = json.loads(self.fixture_path.read_text())
+                settings.update(retry_stage=stage, retry_behavior="adapter_failure")
+                self.fixture_path.write_text(json.dumps(settings))
+                completed = self.review()
+                self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+                after = self.latest_result()
+                self.assertEqual(after["status"], "incomplete")
+                self.assertEqual(after["snapshot_id"], before["snapshot_id"])
+                self.assertEqual({item["id"] for item in after["findings"]}, {item["id"] for item in before["findings"]})
+                self.assertEqual(prior_record.read_bytes(), original)
+                retry = next(call for call in self.calls(settings["mode"]) if call["retry_behavior"] == "adapter_failure")
+                self.assertEqual(retry["own_stage_history"]["stage"], stage)
+                if stage == "reviewer-1":
+                    self.assertEqual(retry["previous_reviews"], [])
+                    self.assertEqual({item["id"] for item in retry["own_stage_history"]["findings"]}, {"empty-input:legacy.py"})
+                attempt = sorted((run / stage).glob("attempt-*"))[-1]
+                request = json.loads((attempt / "request.json").read_text())
+                self.assertEqual(request["base_prompt_sha256"], (run / stage / "base-prompt.sha256").read_text())
+                self.assertEqual(request["prompt_sha256"], digest((attempt / "review-prompt.txt").read_text()))
+                self.assertNotEqual(request["base_prompt_sha256"], request["prompt_sha256"])
+                self.assertFalse((attempt / "validated-stage.json").exists())
+
+    def test_same_snapshot_context_retry_clear_must_account_for_old_findings(self):
+        """test_same_snapshot_context_retry_clear_must_account_for_old_findings() 新 clear 没有保留或解除旧 ID 时拒绝，并持久保留旧引用。"""
+        self.environment["CLARITY_LANG"] = "en"
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        for stage in ("reviewer-1", "cross", "summarize"):
+            with self.subTest(stage=stage):
+                self.set_mode("delivery_partial_" + stage)
+                self.assertEqual(self.review().returncode, 2)
+                before = self.latest_result()
+                settings = json.loads(self.fixture_path.read_text())
+                settings.update(retry_stage=stage, retry_behavior="drop")
+                self.fixture_path.write_text(json.dumps(settings))
+                completed = self.review()
+                self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+                after = self.latest_result()
+                self.assertEqual(after["snapshot_id"], before["snapshot_id"])
+                self.assertEqual({item["id"] for item in after["findings"]}, {item["id"] for item in before["findings"]})
+                self.assertIn("omitted the disposition", after["incomplete_reason"])
+                run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+                record = json.loads(sorted((run / stage).glob("attempt-*/validated-stage.json"))[-1].read_text())
+                self.assertFalse(record["accounted"])
+                self.assertEqual(record["result"]["status"], "clear")
+                self.assertEqual(record["result"]["resolved"], [])
+
+    def test_same_snapshot_context_retry_resolution_and_full_delivery_can_continue(self):
+        """test_same_snapshot_context_retry_resolution_and_full_delivery_can_continue() 明确反证解除旧 ID 且本轮全文已交付，才按原流程继续审核。"""
+        self.environment["CLARITY_LANG"] = "en"
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        for stage in ("reviewer-1", "cross", "summarize"):
+            with self.subTest(stage=stage):
+                self.set_mode("delivery_partial_" + stage)
+                self.assertEqual(self.review().returncode, 2)
+                before = self.latest_result()
+                settings = json.loads(self.fixture_path.read_text())
+                settings.update(retry_stage=stage, retry_behavior="resolved")
+                self.fixture_path.write_text(json.dumps(settings))
+                completed = self.review()
+                self.assertEqual(completed.returncode, 1 if stage == "reviewer-1" else 0, completed.stdout + completed.stderr)
+                after = self.latest_result()
+                self.assertEqual(after["snapshot_id"], before["snapshot_id"])
+                self.assertEqual({item["id"] for item in after["findings"]},
+                                 {"reviewer-2:empty-input:legacy.py"} if stage == "reviewer-1" else set())
+                run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+                receipt = json.loads((run / stage / "context-delivery.json").read_text())
+                self.assertTrue(receipt["delivery"]["complete"])
+                self.assertEqual(receipt["base_prompt_sha256"], (run / stage / "base-prompt.sha256").read_text())
+                self.assertEqual(receipt["prompt_sha256"], (run / stage / "prompt.sha256").read_text())
+                self.assertNotEqual(receipt["base_prompt_sha256"], receipt["prompt_sha256"])
+                record = json.loads(sorted((run / stage).glob("attempt-*/validated-stage.json"))[-1].read_text())
+                self.assertTrue(record["accounted"])
+                self.assertTrue(record["result"]["resolved"])
+                calls = len(self.calls())
+                self.assertEqual(self.review().returncode, completed.returncode)
+                self.assertEqual(len(self.calls()), calls)
+
+    def test_same_snapshot_context_retries_preserve_new_valid_findings_until_explicit_resolution(self):
+        """test_same_snapshot_context_retries_preserve_new_valid_findings_until_explicit_resolution() 连续重取保留漏交代旧 ID 时的新有效发现，后续调用失败也不能丢失。"""
+        self.environment["CLARITY_LANG"] = "en"
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.write("second.py", BROKEN)
+        self.git("add", "edited.py", "second.py")
+        self.set_mode("delivery_partial_reviewer-1")
+        settings = json.loads(self.fixture_path.read_text())
+        settings["withhold_retry_finding"] = True
+        self.fixture_path.write_text(json.dumps(settings))
+        self.assertEqual(self.review().returncode, 2)
+        initial = self.latest_result()
+        self.assertEqual(len(initial["findings"]), 3)
+        expected = {"reviewer-1:empty-input:legacy.py", "reviewer-1:empty-input:second.py",
+                    "reviewer-2:empty-input:legacy.py", "reviewer-2:empty-input:second.py"}
+        for behavior in ("replace_with_new", "adapter_failure"):
+            settings["retry_behavior"] = behavior
+            self.fixture_path.write_text(json.dumps(settings))
+            completed = self.review()
+            self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+            report = self.latest_result()
+            self.assertEqual(report["snapshot_id"], initial["snapshot_id"])
+            self.assertEqual({item["id"] for item in report["findings"]}, expected)
+            self.assertTrue(all(item["code_quote"] == "    return values[0]" for item in report["findings"]))
+        last = next(call for call in reversed(self.calls()) if call["retry_behavior"] == "adapter_failure")
+        self.assertEqual({item["id"] for item in last["own_stage_history"]["findings"]},
+                         {"empty-input:legacy.py", "empty-input:second.py"})
+        settings["retry_behavior"] = "resolved"
+        self.fixture_path.write_text(json.dumps(settings))
+        completed = self.review()
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        report = self.latest_result()
+        self.assertEqual(report["snapshot_id"], initial["snapshot_id"])
+        self.assertEqual({item["id"] for item in report["findings"]},
+                         {"reviewer-2:empty-input:legacy.py", "reviewer-2:empty-input:second.py"})
+
+    def test_context_cache_requires_matching_complete_delivery_receipt(self):
+        """test_context_cache_requires_matching_complete_delivery_receipt() 损坏或自相矛盾的回执不能绕过交付 gate，只有完整同版证据可复用。"""
+        from review import Incomplete, require_context_delivery
+
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        self.assertEqual(self.review().returncode, 1)
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        calls = self.calls()
+        first = next(call for call in calls if call["stage"] == "reviewer-1")
+        context = {version: {path: {"text": text,
+                                    "oid": first["context_manifest"][group][path]["oid"],
+                                    "mode": first["context_manifest"][group][path]["mode"]}
+                             for path, text in first["context"][version].items()}
+                   for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files"))}
+        require_context_delivery(run, "reviewer-1", context)
+        self.assertEqual(self.review().returncode, 1)
+        self.assertEqual(len(self.calls()), len(calls))
+        for mismatch in ("missing", "prompt", "output", "partial", "minimal", "invalid_audit",
+                         "reported_gap", "audit_errors", "zero_counts", "boolean_counts"):
+            with self.subTest(mismatch=mismatch):
+                receipt_path = run / "reviewer-1/context-delivery.json"
+                if mismatch == "missing":
+                    receipt_path.unlink()
+                else:
+                    receipt = json.loads(receipt_path.read_text())
+                    delivery = receipt["delivery"]
+                    if mismatch in {"prompt", "output"}:
+                        receipt[mismatch + "_sha256"] = "0" * 64
+                    elif mismatch == "partial":
+                        delivery["complete"] = False
+                    elif mismatch == "minimal":
+                        receipt["delivery"] = {"complete": True}
+                    elif mismatch == "invalid_audit":
+                        delivery["audit_valid"] = False
+                    elif mismatch == "reported_gap":
+                        total = len(context["current"]["edited.py"]["text"])
+                        delivery["current"]["missing"] = [{"path": "edited.py", "total_chars": total,
+                            "delivered_chars": 1, "missing_ranges": [{"start": 1, "end": total}]}]
+                    elif mismatch == "audit_errors":
+                        delivery["errors"] = [{"line": 1, "reason": "invalid_audit_record"}]
+                    elif mismatch == "zero_counts":
+                        delivery["current"] = {"total": 0, "complete": 0, "missing": []}
+                        delivery["baseline"] = {"total": 0, "complete": 0, "missing": []}
+                    elif mismatch == "boolean_counts":
+                        self.assertEqual(len(context["baseline"]), 1)
+                        delivery["baseline"] = {"total": True, "complete": True, "missing": []}
+                    receipt_path.write_text(json.dumps(receipt))
+                with self.assertRaises((Incomplete, FileNotFoundError)):
+                    require_context_delivery(run, "reviewer-1", context)
+                before = {stage: sum(call["stage"] == stage for call in self.calls())
+                          for stage in ("health", "reviewer-1", "reviewer-2", "cross", "summarize")}
+                completed = self.review()
+                self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+                after = {stage: sum(call["stage"] == stage for call in self.calls()) for stage in before}
+                self.assertEqual(after, {**before, "reviewer-1": before["reviewer-1"] + 1})
+                receipt = json.loads(receipt_path.read_text())
+                self.assertEqual(receipt["prompt_sha256"], (run / "reviewer-1/prompt.sha256").read_text())
+                self.assertTrue(receipt["delivery"]["complete"])
+                self.assertTrue(receipt["delivery"]["audit_valid"])
+                require_context_delivery(run, "reviewer-1", context)
 
     def test_independent_initial_inputs_then_cross_review_preserves_each_finding(self):
         self.write("second.py", BROKEN)

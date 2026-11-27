@@ -69,9 +69,21 @@ for line in sys.stdin:
         if "code_context" in packet:
             assert "current_files" not in packet and "baseline_changed_files" not in packet
             manifest = json.loads((context_root / packet["code_context"]["manifest"]).read_text())
-            context = {version: {path: (context_root / item["view_path"]).read_bytes().decode("utf-8")
-                                 for path, item in manifest[group].items()}
-                       for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files"))}
+            context = {"current": {}, "baseline": {}}
+            context_audit = []
+            for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files")):
+                for path, item in manifest[group].items():
+                    text = (context_root / item["view_path"]).read_bytes().decode("utf-8")
+                    context[version][path] = text
+                    context_audit.append({"tool": "read_file", "version": version, "path": path,
+                                          "start_line": 1, "start_column": 1, "returned_chars": len(text),
+                                          "truncated": False})
+            log_path = os.environ.get("CLARITY_CONTEXT_LOG")
+            if log_path is None:
+                server = next(server for server in mcp_servers if server["name"] == "clarity")
+                arguments = server["args"]
+                log_path = arguments[arguments.index("--log") + 1]
+            Path(log_path).write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in context_audit))
             first_path = next(iter(context["current"]))
             emit({"jsonrpc": "2.0", "method": "session/update", "params": {
                 "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call",
@@ -223,6 +235,40 @@ class AcpHostFlowTests(unittest.TestCase):
             self.assertTrue(any(event.get('category') == 'tool' for event in events))
             self.assertTrue(any(event['type'] == 'answer/final' for event in events))
 
+    def test_context_delivery_audits_all_current_and_changed_baseline_text(self):
+        """test_context_delivery_audits_all_current_and_changed_baseline_text() 多文件全文与改变基线均有真实交付审计，不能靠首个读取活动获得通过。"""
+        self.environment['CLARITY_AGENT'] = 'codex'
+        self.run_command(['make', 'review'])
+        current = {'identity.py': 'def identity(value):\n    return value + 1\n',
+                   'peer.py': 'def peer(value):\n    return value - 1\n'}
+        for name, text in current.items():
+            (self.host / name).write_text(text)
+        self.git(self.host, 'add', *current)
+        self.run_command(['make', 'review-staged'])
+        report, directory = self.result()
+        self.assertEqual(report['status'], 'clear')
+        expected = {'current': current, 'baseline': {'identity.py': 'def identity(value):\n    return value\n'}}
+        calls = [call for call in self.calls() if call['method'] == 'session/prompt'
+                 and call.get('snapshot_id') == report['snapshot_id'] and not call['health']]
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(call['context'] == expected for call in calls))
+        expected_ranges = {(version, path, len(text)) for version, files in expected.items()
+                           for path, text in files.items()}
+        for stage in ('reviewer-1', 'reviewer-2', 'cross', 'summarize'):
+            delivery = json.loads((directory / stage / 'context-delivery.json').read_text())['delivery']
+            self.assertTrue(delivery['complete'])
+            self.assertTrue(delivery['audit_valid'])
+            self.assertEqual(delivery['current'], {'total': 2, 'complete': 2, 'missing': []})
+            self.assertEqual(delivery['baseline'], {'total': 1, 'complete': 1, 'missing': []})
+            logs = list((directory / stage).glob('attempt-*/context-access.jsonl'))
+            self.assertEqual(len(logs), 1)
+            audit = [json.loads(line) for line in logs[0].read_text().splitlines()]
+            self.assertEqual({(row['version'], row['path'], row['returned_chars']) for row in audit}, expected_ranges)
+            self.assertTrue(all(row['tool'] == 'read_file' and row['start_line'] == 1
+                                and row['start_column'] == 1 and row['truncated'] is False for row in audit))
+        self.assertFalse((directory / 'health/context-delivery.json').exists())
+        self.assertFalse(list((directory / 'health').glob('attempt-*/context-access.jsonl')))
+
     def test_custom_acp_agent_retains_closed_inline_review_without_context_tools(self):
         """test_custom_acp_agent_retains_closed_inline_review_without_context_tools() 核对已有 custom 调用仍在空目录按全文审核，不能自动获得原生取材权限。"""
         self.environment['CLARITY_AGENT'] = 'custom'
@@ -243,6 +289,9 @@ class AcpHostFlowTests(unittest.TestCase):
             self.assertEqual(call['mcp_servers'], [])
             self.assertIn('Do not call tools', call['prompt'])
         self.assertEqual((self.host / '.git/index').read_bytes(), self.index)
+        _, directory = self.result()
+        self.assertFalse(list(directory.glob('*/context-delivery.json')))
+        self.assertFalse(list(directory.glob('*/attempt-*/context-access.jsonl')))
 
     def test_context_native_terminal_request_cannot_publish_a_clear_answer(self):
         """test_context_native_terminal_request_cannot_publish_a_clear_answer() 原生执行请求仍被拒绝，合法 clear 正文不能掩盖越界请求。"""
