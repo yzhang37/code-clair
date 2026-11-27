@@ -196,33 +196,35 @@ def _text_content(blocks, *, acp=False):
 
 
 def _completed_text(call):
-    """_completed_text() 核对标准 ACP 展示正文及明确 MCP 结果副本，拒绝互相矛盾的交付证据。"""
-    displayed = _text_content(call["content"], acp=True) if call.get("content") not in (None, []) else None
-    raw_text = None
+    """_completed_text() 优先读取已识别的原始工具结果，仅在 rawOutput 缺失时使用 ACP 文本。
+
+    适配器可将 ACP.content 摘要或渲染成提示，不能让显示文本覆盖原始空文、错误或
+    截断结果。
+    同一 MCP 原始结果的 text JSON 与 structuredContent 仍须严格一致；未知原始
+    结构不递归猜正文。
+    """
     raw = call.get("rawOutput")
-    result = None
+    if raw is None:
+        return _text_content(call["content"], acp=True) if call.get("content") not in (None, []) else None
     if isinstance(raw, dict) and "result" in raw and set(raw) <= {"result", "error"}:
         if raw.get("error") is not None or raw["result"] is None:
             return None
         result = raw["result"]
     elif isinstance(raw, dict) and "content" in raw:
         result = raw
-    if result is not None:
-        if not isinstance(result, dict):
-            raise ValueError("Invalid MCP tool result")
-        if type(result.get("isError", False)) is not bool:
-            raise ValueError("Invalid MCP tool error flag")
-        if result.get("isError", False):
-            return None
-        if result.get("content") not in (None, []):
-            raw_text = _text_content(result["content"])
-        structured = result.get("structuredContent")
-        text_value = raw_text if raw_text is not None else displayed
-        if structured is not None and text_value is not None and not _same_json(_load_json(text_value), structured):
-            raise ValueError("MCP result copies disagree")
-    if displayed is not None and raw_text is not None and displayed != raw_text:
-        raise ValueError("ACP displayed and raw tool text disagree")
-    return displayed if displayed is not None else raw_text
+    else:
+        return None
+    if not isinstance(result, dict):
+        raise ValueError("Invalid MCP tool result")
+    if type(result.get("isError", False)) is not bool:
+        raise ValueError("Invalid MCP tool error flag")
+    if result.get("isError", False):
+        return None
+    raw_text = _text_content(result["content"]) if result.get("content") not in (None, []) else None
+    structured = result.get("structuredContent")
+    if structured is not None and raw_text is not None and not _same_json(_load_json(raw_text), structured):
+        raise ValueError("MCP result copies disagree")
+    return raw_text
 
 
 def _native_target(raw_path, cwd, context):

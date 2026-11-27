@@ -1,6 +1,7 @@
 """test_review_context.py 核对冻结正文、只读路径边界和可完整续读的有界查询。"""
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -851,12 +852,14 @@ class ReviewContextTests(unittest.TestCase):
         bad_display["update"]["content"] = [{"type": "content", "content": {"type": "text", "text": "fake"}}]
         wrapped = copy.deepcopy(event)
         wrapped["update"]["rawOutput"] = {"nested": event["update"]["rawOutput"]}
-        for value in (bad_structured, bad_display):
-            with self.subTest(value=value):
-                receipt = assess_delivery(context, log, events_path=self.write_events([value]))
-                self.assertFalse(receipt["complete"])
-                self.assertFalse(receipt["transport_confirmed"])
-                self.assertFalse(receipt["audit_valid"])
+        receipt = assess_delivery(context, log, events_path=self.write_events([bad_structured]))
+        self.assertFalse(receipt["complete"])
+        self.assertFalse(receipt["transport_confirmed"])
+        self.assertFalse(receipt["audit_valid"])
+        receipt = assess_delivery(context, log, events_path=self.write_events([bad_display]))
+        self.assertTrue(receipt["complete"])
+        self.assertTrue(receipt["transport_confirmed"])
+        self.assertTrue(receipt["audit_valid"])
         receipt = assess_delivery(context, log, events_path=self.write_events([wrapped]))
         self.assertFalse(receipt["complete"])
         self.assertTrue(receipt["audit_valid"])
@@ -986,6 +989,99 @@ class ReviewContextTests(unittest.TestCase):
         events.write_text("bad-event\n")
         with self.assertRaises(ModelFailure):
             feedback('{"ok": true}')
+
+    def test_transport_native_eof_raw_empty_with_pretty_display_does_not_poison_other_reads(self):
+        context = {"current": {"README.md": frozen("line\n" * 171), "good.py": frozen("retained")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.record_native_read("good.py", "current", "retained")
+        eof = self.native_event("eof", "current/README.md", "")
+        eof["update"]["rawInput"]["offset"] = 172
+        notice = json.dumps(eof["update"]["rawOutput"], indent=2)
+        self.assertEqual(len(notice), 73)
+        self.assertEqual(hashlib.sha256(notice.encode()).hexdigest(),
+                         "f49156b03fae8a67de6ba81192531c88080c90f79c154bbdada42f1a2f118297")
+        eof["update"]["content"] = [{"type": "content", "content": {"type": "text", "text": notice}}]
+        self.assertEqual(eof["update"]["rawOutput"]["content"][0]["text"], "")
+        self.assertEqual(len(eof["update"]["content"][0]["content"]["text"]), 73)
+        good = self.native_event("good", "current/good.py", "retained")
+        receipt = assess_delivery(context, log, events_path=self.write_events([eof, good]))
+        self.assertTrue(receipt["audit_valid"])
+        self.assertTrue(receipt["transport_confirmed"])
+        self.assertFalse(receipt["complete"])
+        self.assertEqual(receipt["current"]["complete"], 1)
+        self.assertEqual([item["path"] for item in receipt["current"]["missing"]], ["README.md"])
+
+    def test_transport_native_raw_full_text_overrides_display_notice_but_partial_does_not_count(self):
+        text = "甲\r\n乙😀"
+        context = {"current": {"a.py": frozen(text)}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.record_native_read("a.py", "current", text)
+        event = self.native_event("call", "current/a.py", text)
+        event["update"]["content"] = [{"type": "content", "content": {"type": "text", "text": "Read result display notice"}}]
+        self.assertTrue(assess_delivery(context, log, events_path=self.write_events([event]))["complete"])
+        for raw_text in ("", "甲", text.replace("\r\n", "\n"), "different source"):
+            with self.subTest(raw_text=raw_text):
+                event["update"]["rawOutput"]["content"][0]["text"] = raw_text
+                receipt = assess_delivery(context, log, events_path=self.write_events([event]))
+                self.assertTrue(receipt["audit_valid"])
+                self.assertFalse(receipt["complete"])
+                self.assertEqual(receipt["current"]["complete"], 0)
+
+    def test_transport_display_cannot_replace_raw_error_empty_or_opaque_result(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        body = store.read_file("a.py")
+        event = self.mcp_event("call", {"path": "a.py"}, body)
+        event["update"]["content"] = [{"type": "content", "content": {"type": "text", "text": json.dumps(body)}}]
+        raw_results = [
+            {"result": None, "error": {"message": "failed"}},
+            {"result": {"content": [{"type": "text", "text": "error"}], "isError": True}, "error": None},
+            {"result": {"content": []}, "error": None},
+            {"nested": copy.deepcopy(event["update"]["rawOutput"])},
+            {"content": [{"type": "text", "text": "not the JSON source result"}]},
+        ]
+        for raw in raw_results:
+            with self.subTest(raw=raw):
+                event["update"]["rawOutput"] = raw
+                receipt = assess_delivery(context, log, events_path=self.write_events([event]))
+                self.assertTrue(receipt["audit_valid"])
+                self.assertFalse(receipt["complete"])
+                self.assertEqual(receipt["current"]["complete"], 0)
+
+    def test_transport_raw_missing_uses_exact_standard_acp_fallback(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        body = store.read_file("a.py")
+        store.record_native_read("a.py", "current", "body")
+        native = self.native_event("native", "current/a.py", "body")
+        mcp = self.mcp_event("mcp", {"path": "a.py"}, body)
+        mcp["update"]["content"] = [{"type": "content", "content": {"type": "text", "text": json.dumps(body)}}]
+        for event in (native, mcp):
+            for absent in (True, False):
+                with self.subTest(native=event is native, absent=absent):
+                    candidate = copy.deepcopy(event)
+                    if absent:
+                        candidate["update"].pop("rawOutput")
+                    else:
+                        candidate["update"]["rawOutput"] = None
+                    self.assertTrue(assess_delivery(context, log, events_path=self.write_events([candidate]))["complete"])
+
+    def test_transport_raw_mcp_conflict_is_not_overridden_by_valid_display(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        body = store.read_file("a.py")
+        event = self.mcp_event("call", {"path": "a.py"}, body)
+        event["update"]["content"] = [{"type": "content", "content": {"type": "text", "text": json.dumps(body)}}]
+        event["update"]["rawOutput"]["result"]["structuredContent"] = {**body, "text": "fake"}
+        receipt = assess_delivery(context, log, events_path=self.write_events([event]))
+        self.assertFalse(receipt["audit_valid"])
+        self.assertFalse(receipt["complete"])
+        self.assertFalse(receipt["transport_confirmed"])
 
 
 if __name__ == "__main__":
