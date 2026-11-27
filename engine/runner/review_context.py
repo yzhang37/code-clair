@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
+from collections.abc import Callable
 import hashlib
 import json
 import os
 from pathlib import Path, PureWindowsPath
 import stat
+
+from model_common import ModelFailure, _load_json
 
 
 MAX_RESULTS = 100
@@ -15,6 +19,9 @@ MAX_CHARS = 16_000
 MAX_QUERY_CHARS = 1_000
 MAX_PATH_CHARS = 4_096
 EXCERPT_CHARS = 240
+MAX_REPLY_FEEDBACK_GAPS = 20
+# 同会话反馈总预算为 8000 字符；预留 300 给外层已验证发现的记账提示，避免补充提示使回合超限。
+MAX_REPLY_FEEDBACK_CHARS = 7_700
 VERSIONS = {"current": "current_files", "baseline": "baseline_changed_files"}
 
 
@@ -125,6 +132,14 @@ def _audit_object(pairs):
     return record
 
 
+def _line_starts(text):
+    """_line_starts() 保留既有分行边界，累计每行和文件尾在 Unicode 原文中的字符偏移。"""
+    starts = [0]
+    for line in text.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    return starts
+
+
 def assess_delivery(context, log_path):
     """assess_delivery() 用成功原文读取的审计区间核对每版正文是否完整交付。
 
@@ -151,9 +166,7 @@ def assess_delivery(context, log_path):
                 _relative_path(path)
                 if not isinstance(record, dict) or not isinstance(record.get("text"), str):
                     raise ValueError("Invalid frozen context text")
-                starts = [0]
-                for line in record["text"].splitlines(keepends=True):
-                    starts.append(starts[-1] + len(line))
+                starts = _line_starts(record["text"])
                 files[version][path] = {"starts": starts, "length": len(record["text"]), "intervals": []}
     except ValueError:
         receipt["errors"].append({"line": None, "reason": "invalid_context"})
@@ -231,6 +244,92 @@ def assess_delivery(context, log_path):
     receipt["complete"] = receipt["audit_valid"] and all(receipt[version]["complete"] == receipt[version]["total"]
                                                           for version in VERSIONS)
     return receipt
+
+
+def make_reply_feedback(context, log_path, response_schema) -> Callable[[str], str | None]:
+    """make_reply_feedback() 为同一审核会话生成一次草稿格式或正文交付缺口的反馈回调。
+
+    回调复用正式入口的严格整份 JSON 读取、对象限制和 schema 校验，只在结构与正文
+    交付均满足时返回 None；这不验证发现、引用或审核结论，最终仍交原有外层校验器。
+    审计不可用是技术故障，抛出 ModelFailure，不让模型通过改写日志补认交付。
+    缺口坐标沿用交付核对的原文分行与 Unicode 偏移，行列从 1 开始、终点不包含在内。
+    反馈最多展示 20 个缺口且总长不超过 7700 字符，不附正文或 schema；过长路径整项
+    略去而不截断标识，仍报告总缺口，避免反馈再次占满会话上下文。
+    """
+    try:
+        import jsonschema
+    except ImportError as error:
+        raise ModelFailure("Response schema validation dependencies are unavailable") from error
+    if not isinstance(response_schema, dict):
+        raise ModelFailure("Reply feedback requires an object response schema")
+    try:
+        jsonschema.Draft202012Validator.check_schema(response_schema)
+        validator = jsonschema.Draft202012Validator(response_schema)
+    except jsonschema.SchemaError as error:
+        raise ModelFailure("Reply feedback response schema is invalid") from error
+
+    def feedback(raw_reply: str) -> str | None:
+        """feedback() 重读本阶段审计后核对完整草稿，不提取代码块或把草稿发现当成已验证结果。"""
+        delivery = assess_delivery(context, log_path)
+        if not delivery["audit_valid"]:
+            raise ModelFailure("Context audit is invalid; source-delivery feedback cannot be generated")
+        valid_format = True
+        try:
+            result = _load_json(raw_reply)
+            if not isinstance(result, dict):
+                valid_format = False
+            else:
+                validator.validate(result)
+        except (ValueError, TypeError, RecursionError, jsonschema.ValidationError):
+            valid_format = False
+        if valid_format and delivery["complete"]:
+            return None
+
+        parts = ["The first reply is not an accepted complete review."]
+        if not valid_format:
+            parts.append("The whole draft failed strict JSON/object/response-schema validation.")
+        total_gaps = sum(len(item["missing_ranges"]) for version in VERSIONS for item in delivery[version]["missing"])
+        missing_files = sum(len(delivery[version]["missing"]) for version in VERSIONS)
+        if total_gaps:
+            parts.append(f"Source delivery is incomplete: {total_gaps} missing ranges across {missing_files} file versions.")
+        else:
+            parts.append("Source delivery is complete; correct the reply format.")
+        footer = ("Continue in this same Agent session. Obtain every missing current/baseline source range, "
+                  "including gaps omitted below; use the original paths and one-based Unicode start_line/start_column "
+                  "with read_file (Codex MCP) or clarity_read_file (Pi) and follow its next cursors. "
+                  "Actual read caps: line_count <= 200 and char_limit <= 16000; Codex list_files limit <= 100. "
+                  "Return one strict JSON object matching the supplied "
+                  "response schema, without code fences or surrounding prose. Original review instructions and "
+                  "final outer validation still apply.")
+        rows = []
+        header = f"Showing {MAX_REPLY_FEEDBACK_GAPS} of {total_gaps} missing ranges; end coordinates are exclusive:"
+        used = len("\n".join(parts + [header, footer]))
+        for version in VERSIONS:
+            for item in delivery[version]["missing"]:
+                if len(rows) == MAX_REPLY_FEEDBACK_GAPS:
+                    break
+                path = item["path"]
+                starts = _line_starts(context[version][path]["text"])
+                quoted_path = json.dumps(path, ensure_ascii=False).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+                for gap in item["missing_ranges"]:
+                    if len(rows) == MAX_REPLY_FEEDBACK_GAPS:
+                        break
+                    start_index = bisect_right(starts, gap["start"]) - 1
+                    end_index = bisect_right(starts, gap["end"]) - 1
+                    row = (f"- version={version} path={quoted_path} "
+                           f"start_line={start_index + 1} start_column={gap['start'] - starts[start_index] + 1} "
+                           f"end_line={end_index + 1} end_column={gap['end'] - starts[end_index] + 1} "
+                           f"missing_chars={gap['end'] - gap['start']}")
+                    if used + len(row) + 1 <= MAX_REPLY_FEEDBACK_CHARS:
+                        rows.append(row)
+                        used += len(row) + 1
+        if total_gaps:
+            parts.append(f"Showing {len(rows)} of {total_gaps} missing ranges; end coordinates are exclusive:")
+            parts.extend(rows)
+        parts.append(footer)
+        return "\n".join(parts)
+
+    return feedback
 
 
 class ContextStore:

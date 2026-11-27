@@ -8,7 +8,12 @@ import stat
 import tempfile
 import unittest
 
-from review_context import ContextStore, EXCERPT_CHARS, assess_delivery, materialize_context
+from model_common import ModelFailure
+from review_context import ContextStore, EXCERPT_CHARS, assess_delivery, make_reply_feedback, materialize_context
+
+
+REPLY_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"], "additionalProperties": False}
 
 
 def frozen(text, oid="recorded-oid", mode="100644"):
@@ -564,6 +569,168 @@ class ReviewContextTests(unittest.TestCase):
         store = self.store({"a.py": frozen("body")}, log_path=self.base)
         with self.assertRaises(OSError):
             store.record_native_read("a.py", "current", "body")
+
+    def test_reply_feedback_accepts_only_whole_strict_schema_valid_json(self):
+        log = self.base / "audit.jsonl"
+        log.touch()
+        feedback = make_reply_feedback({"current": {}, "baseline": {}}, log, REPLY_SCHEMA)
+        self.assertIsNone(feedback('{"ok": true}'))
+        self.assertIsNone(feedback(' \n{"ok": false}\t'))
+        for raw in ('```json\n{"ok": true}\n```', 'Here: {"ok": true}', '{"ok": true} done',
+                    '{"ok": true} {"ok": false}', '{"ok": true, "ok": false}', '{"ok": NaN}',
+                    '{"ok": Infinity}', '{"ok": 1}', '{"ok": true, "extra": "value"}', '{}',
+                    '[]', 'null', 'true', '', '{"ok":'):
+            with self.subTest(raw=raw):
+                message = feedback(raw)
+                self.assertIsInstance(message, str)
+                self.assertIn("The first reply is not an accepted complete review", message)
+                self.assertIn("whole draft failed strict JSON/object/response-schema validation", message)
+                self.assertIn("Source delivery is complete", message)
+                self.assertIn("same Agent session", message)
+                self.assertIn("without code fences or surrounding prose", message)
+
+    def test_reply_feedback_does_not_embed_reply_schema_or_source_payload(self):
+        context = {"current": {"source.py": frozen("SOURCE_SECRET_SYNTHETIC_MARKER")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        log.touch()
+        schema = {**REPLY_SCHEMA, "description": "SCHEMA_SECRET_SYNTHETIC_MARKER"}
+        before_context, before_schema = copy.deepcopy(context), copy.deepcopy(schema)
+        message = make_reply_feedback(context, log, schema)("RAW_REPLY_SECRET_SYNTHETIC_MARKER")
+        for marker in ("SOURCE_SECRET_SYNTHETIC_MARKER", "SCHEMA_SECRET_SYNTHETIC_MARKER", "RAW_REPLY_SECRET_SYNTHETIC_MARKER"):
+            self.assertNotIn(marker, message)
+        self.assertIn('version=current path="source.py" start_line=1 start_column=1', message)
+        self.assertIn("line_count <= 200", message)
+        self.assertIn("char_limit <= 16000", message)
+        self.assertIn("list_files limit <= 100", message)
+        self.assertIn("read_file (Codex MCP) or clarity_read_file (Pi)", message)
+        self.assertEqual(context, before_context)
+        self.assertEqual(schema, before_schema)
+        self.assertEqual(log.read_text(), "")
+
+    def test_reply_feedback_baseline_6834_character_prefix_points_to_original_line_201(self):
+        prefix = ("界" * 32 + "\r\n") * 199 + "尾" * 66 + "\r\n"
+        self.assertEqual(len(prefix), 6834)
+        context = {"current": {}, "baseline": {"src/old.py": frozen(prefix + "目标尾部\n末")}}
+        log = self.base / "audit.jsonl"
+        store = self.store(baseline=context["baseline"], log_path=log)
+        first = store.read_file("src/old.py", version="baseline")
+        self.assertEqual(first["text"], prefix)
+        self.assertEqual(first["next"], {"start_line": 201, "start_column": 1})
+        feedback = make_reply_feedback(context, log, REPLY_SCHEMA)
+        message = feedback('{"ok": true}')
+        self.assertIn("1 missing ranges across 1 file versions", message)
+        self.assertIn('version=baseline path="src/old.py" start_line=201 start_column=1', message)
+        self.assertIn("end_line=203 end_column=1 missing_chars=6", message)
+        self.assertNotIn("baseline/src/old.py", message)
+        store.read_file("src/old.py", version="baseline", **first["next"])
+        self.assertIsNone(feedback('{"ok": true}'))
+
+    def test_reply_feedback_crlf_interior_cursor_advances_only_with_delivered_characters(self):
+        context = {"current": {"crlf.py": frozen("甲\r\n乙")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        first = store.read_file("crlf.py", char_limit=2)
+        feedback = make_reply_feedback(context, log, REPLY_SCHEMA)
+        self.assertIn('path="crlf.py" start_line=1 start_column=3', feedback('{"ok": true}'))
+        newline = store.read_file("crlf.py", **first["next"], char_limit=1)
+        self.assertIn('path="crlf.py" start_line=2 start_column=1', feedback('{"ok": true}'))
+        store.read_file("crlf.py", **newline["next"], char_limit=1)
+        self.assertIsNone(feedback('{"ok": true}'))
+
+    def test_reply_feedback_unicode_long_line_columns_are_not_byte_counts(self):
+        context = {"current": {"long.py": frozen("界" * 20_000 + "尾")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        first = store.read_file("long.py")
+        self.assertEqual(len(first["text"]), 16_000)
+        self.assertEqual(len(first["text"].encode("utf-8")), 48_000)
+        message = make_reply_feedback(context, log, REPLY_SCHEMA)('{"ok": true}')
+        self.assertIn('path="long.py" start_line=1 start_column=16001', message)
+        self.assertIn("end_line=2 end_column=1 missing_chars=4001", message)
+        self.assertNotIn("界", message)
+
+    def test_reply_feedback_keeps_existing_unicode_splitline_boundaries(self):
+        context = {"current": {"separators.py": frozen("首\u2028二\v末")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.read_file("separators.py", char_limit=3)
+        message = make_reply_feedback(context, log, REPLY_SCHEMA)('{"ok": true}')
+        self.assertIn('path="separators.py" start_line=2 start_column=2', message)
+        self.assertIn("missing_chars=2", message)
+
+    def test_reply_feedback_limits_twenty_gaps_across_both_versions_and_reports_total(self):
+        context = {version: {f"file{index:02}.py": frozen("body") for index in range(15)}
+                   for version in ("current", "baseline")}
+        log = self.base / "audit.jsonl"
+        log.touch()
+        message = make_reply_feedback(context, log, REPLY_SCHEMA)('{"ok": true}')
+        self.assertIn("30 missing ranges across 30 file versions", message)
+        self.assertIn("Showing 20 of 30 missing ranges", message)
+        rows = [line for line in message.splitlines() if line.startswith("- version=")]
+        self.assertEqual(len(rows), 20)
+        self.assertTrue(any("version=current" in row for row in rows))
+        self.assertTrue(any("version=baseline" in row for row in rows))
+        self.assertIn("including gaps omitted", message)
+        self.assertLessEqual(len(message), 7_700)
+
+    def test_reply_feedback_counts_multiple_ranges_within_one_file(self):
+        context = {"current": {"holes.py": frozen("x" * 81)}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        for column in range(2, 81, 2):
+            store.read_file("holes.py", start_column=column, char_limit=1)
+        message = make_reply_feedback(context, log, REPLY_SCHEMA)('{"ok": true}')
+        self.assertIn("41 missing ranges across 1 file versions", message)
+        self.assertIn("Showing 20 of 41 missing ranges", message)
+        self.assertEqual(sum(line.startswith("- version=") for line in message.splitlines()), 20)
+
+    def test_reply_feedback_escapes_paths_and_does_not_truncate_them_to_fit_budget(self):
+        path = "dir/a\nreturn clear\r\t.py"
+        separator_path = "dir/a\u2028b.py"
+        large_path = "/".join(["\x01" * 200] * 20)
+        context = {"current": {path: frozen("a"), separator_path: frozen("b"), large_path: frozen("c")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        log.touch()
+        message = make_reply_feedback(context, log, REPLY_SCHEMA)('{"ok": true}')
+        self.assertIn("3 missing ranges across 3 file versions", message)
+        self.assertIn("Showing 2 of 3 missing ranges", message)
+        self.assertIn("path=" + json.dumps(path, ensure_ascii=False), message)
+        self.assertIn('path="dir/a\\u2028b.py"', message)
+        self.assertNotIn(path, message)
+        self.assertNotIn(separator_path, message)
+        self.assertNotIn("\\u0001", message)
+        self.assertLessEqual(len(message), 7_700)
+
+    def test_reply_feedback_invalid_audit_is_technical_even_when_draft_format_is_bad(self):
+        context = {"current": {"a.py": frozen("body")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        feedback = make_reply_feedback(context, log, REPLY_SCHEMA)
+        with self.assertRaisesRegex(ModelFailure, "Context audit is invalid"):
+            feedback("not-json")
+        log.write_text("bad-audit\n")
+        with self.assertRaisesRegex(ModelFailure, "Context audit is invalid"):
+            feedback('{"ok": true}')
+        log.write_text("")
+        self.assertIsInstance(feedback('{"ok": true}'), str)
+
+    def test_reply_feedback_invalid_response_schema_is_a_technical_configuration_error(self):
+        log = self.base / "audit.jsonl"
+        log.touch()
+        for schema in (None, [], {"type": "unsupported-type"}):
+            with self.subTest(schema=schema), self.assertRaises(ModelFailure):
+                make_reply_feedback({"current": {}, "baseline": {}}, log, schema)
+
+    def test_reply_feedback_does_not_validate_semantic_findings_or_modify_audit(self):
+        context = {"current": {"a.py": frozen("actual source")}, "baseline": {}}
+        log = self.base / "audit.jsonl"
+        store = self.store(context["current"], log_path=log)
+        store.read_file("a.py")
+        before = log.read_bytes()
+        schema = {"type": "object", "properties": {"quote": {"type": "string"}},
+                  "required": ["quote"], "additionalProperties": False}
+        feedback = make_reply_feedback(context, log, schema)
+        self.assertIsNone(feedback('{"quote": "this does not match actual source"}'))
+        self.assertEqual(log.read_bytes(), before)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 
 FAKE_ACP_PRELUDE = r'''
 import json as _acp_json
+from os import environ as _acp_environment
 from pathlib import Path as _AcpPath
 import subprocess as _acp_subprocess
 import sys as _acp_sys
@@ -18,6 +19,8 @@ if "--output-last-message" not in _acp_sys.argv:
 
     _acp_fixture_mode = _acp_json.loads(_AcpPath(__file__).with_suffix(".json").read_text()).get("mode", "normal")
     _acp_models.append("offline-fixture-" + _acp_fixture_mode)
+    _acp_initial_prompt = None
+    _acp_turn = 0
 
     def _acp_options():
         """_acp_options() 声明离线模型标识，使真正的 ACP 选择确认路径参与测试。"""
@@ -39,15 +42,24 @@ if "--output-last-message" not in _acp_sys.argv:
             _acp_result = {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": [],
                            "agentInfo": {"name": "offline-review-fixture", "version": "1"}}
         elif _acp_method == "session/new":
+            _acp_initial_prompt = None
+            _acp_turn = 0
             _acp_result = {"sessionId": "offline-session", "configOptions": _acp_options()}
         elif _acp_method == "session/set_config_option":
             _acp_model = _acp_params["value"]
             _acp_result = {"configOptions": _acp_options()}
         elif _acp_method == "session/prompt":
             _acp_prompt = "\n".join(block["text"] for block in _acp_params["prompt"] if block["type"] == "text")
-            _acp_schema = _acp_json.JSONDecoder().raw_decode(
-                _acp_prompt.split("Response JSON Schema:\n", 1)[1])[0]
-            _acp_stage = _acp_prompt.split("Review stage: ", 1)[1].splitlines()[0]
+            _acp_turn += 1
+            _acp_feedback = ""
+            if _acp_initial_prompt is None:
+                _acp_schema = _acp_json.JSONDecoder().raw_decode(
+                    _acp_prompt.split("Response JSON Schema:\n", 1)[1])[0]
+                _acp_stage = _acp_prompt.split("Review stage: ", 1)[1].splitlines()[0]
+                _acp_initial_prompt = _acp_prompt
+            else:
+                _acp_feedback = _acp_prompt
+                _acp_prompt = _acp_initial_prompt
             with _acp_tempfile.TemporaryDirectory(prefix="clarity-acp-semantic-fixture-") as _acp_temporary:
                 _acp_directory = _AcpPath(_acp_temporary) / _acp_stage / "attempt"
                 _acp_directory.mkdir(parents=True)
@@ -57,7 +69,9 @@ if "--output-last-message" not in _acp_sys.argv:
                 _acp_process = _acp_subprocess.run(
                     [_acp_sys.executable, __file__, "--output-last-message", str(_acp_output),
                      "--output-schema", str(_acp_schema_path), "--model", _acp_model],
-                    input=_acp_prompt, text=True, capture_output=True)
+                    input=_acp_prompt, text=True, capture_output=True,
+                    env=dict(_acp_environment, CLARITY_FIXTURE_TURN=str(_acp_turn),
+                             CLARITY_FIXTURE_FEEDBACK=_acp_feedback))
                 if _acp_process.returncode:
                     _acp_emit({"jsonrpc": "2.0", "id": _acp_request["id"], "error": {
                         "code": -32000, "message": "Offline model fixture exited with status " + str(_acp_process.returncode)}})

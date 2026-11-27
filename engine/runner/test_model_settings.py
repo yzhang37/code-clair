@@ -74,6 +74,7 @@ class ModelSettingsTests(unittest.TestCase):
         """test_context_codex_uses_projected_view_and_readonly_mcp_without_enabling_shell() 核对取材方式改变而规则隔离保持。"""
         context = {"current": {"pkg/value.py": {"text": "value = 1\n", "oid": "frozen", "mode": "100644"}},
                    "baseline": {}}
+        feedback = lambda text: None
         observed = {}
 
         def materialize(provided, root):
@@ -94,6 +95,7 @@ class ModelSettingsTests(unittest.TestCase):
             self.assertEqual((view / "current/pkg/value.py").read_text(), "value = 1\n")
             self.assertEqual((view / "current/pkg/value.py").stat().st_mode & 0o777, 0o444)
             self.assertTrue(options["allow_tools"])
+            self.assertIs(options["reply_feedback"], feedback)
             self.assertEqual(options["instructions"], _CONTEXT_INSTRUCTIONS)
             self.assertEqual(options["max_request_chars"], 1_048_576)
             self.assertIsNone(options["startup_metadata_path"])
@@ -118,7 +120,7 @@ class ModelSettingsTests(unittest.TestCase):
                 patch("acp_model.AcpModel") as adapter:
             adapter.return_value.run.side_effect = inspect
             result = ModelClient({"agent": "codex", "agent_command": ["adapter"], "codex_bin": "owner-codex"}).run(
-                "prompt", {}, Path(temporary) / "stage/attempt", context=context)
+                "prompt", {}, Path(temporary) / "stage/attempt", context=context, reply_feedback=feedback)
         self.assertEqual(result, {"accepted": True})
         self.assertIs(observed["context"], context)
         self.assertFalse(observed["view"].exists())
@@ -170,11 +172,20 @@ class ModelSettingsTests(unittest.TestCase):
                 options = adapter.call_args.kwargs
             self.assertEqual(result, {"accepted": True})
             self.assertFalse(options["allow_tools"])
+            self.assertIsNone(options["reply_feedback"])
             self.assertIsNone(options["cwd"])
             self.assertIsNone(options["mcp_servers"])
             self.assertEqual(options["instructions"], _INSTRUCTIONS)
             self.assertEqual(options["startup_metadata_path"], ("piAcp", "startupInfo") if agent == "pi" else None)
             self.assertNotIn("CLARITY_CONTEXT_ROOT", options["environment"])
+
+    def test_feedback_without_code_context_is_rejected_before_starting_agent(self):
+        with patch("model.tempfile.TemporaryDirectory") as temporary, patch("acp_model.AcpModel") as adapter:
+            with self.assertRaisesRegex(ModelFailure, "requires a frozen code context"):
+                ModelClient({"agent": "pi", "agent_command": ["adapter"]}).run(
+                    "prompt", {}, Path("stage/attempt"), reply_feedback=lambda text: "Retry")
+        temporary.assert_not_called()
+        adapter.assert_not_called()
 
     def test_custom_context_is_rejected_before_projection_or_agent_invocation(self):
         """test_custom_context_is_rejected_before_projection_or_agent_invocation() 将新能力严格限制到获准的两个 Agent。"""

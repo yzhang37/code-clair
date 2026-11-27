@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 import copy
 import json
@@ -166,7 +167,8 @@ class AcpModel:
                  *, environment: dict[str, str] | None = None, cwd: Path | None = None,
                  mcp_servers: list[dict] | None = None, allow_tools: bool = False,
                  instructions: str | None = None, max_request_chars: int | None = None,
-                 startup_metadata_path: tuple[str, ...] | None = None):
+                 startup_metadata_path: tuple[str, ...] | None = None,
+                 reply_feedback: Callable[[str], str | None] | None = None):
         """__init__() 保存已选择的 Agent 启动方式，供应商认证和原生协议由现成适配器负责。"""
         if (not isinstance(command, list) or not command
                 or any(not isinstance(item, str) or not item or "\0" in item for item in command)):
@@ -193,6 +195,8 @@ class AcpModel:
                                                   or any(not isinstance(key, str) or not key or "\0" in key
                                                          for key in startup_metadata_path)):
             raise ValueError("startup_metadata_path must be a nonempty tuple of metadata field names or null")
+        if reply_feedback is not None and (not callable(reply_feedback) or not allow_tools or cwd is None):
+            raise ValueError("reply_feedback requires a callable, context tools and a supplied frozen view directory")
         self.command = list(command)
         self.model = model
         self.timeout = timeout
@@ -204,12 +208,21 @@ class AcpModel:
             _CONTEXT_INSTRUCTIONS if allow_tools else _INSTRUCTIONS)
         self.max_request_chars = max_request_chars
         self.startup_metadata_path = startup_metadata_path
+        self.reply_feedback = reply_feedback
+
+    def _check_request_chars(self, request):
+        """_check_request_chars() 对完整待发文本应用启动层已核实的字符上限，超限时不截断审核证据。"""
+        if self.max_request_chars is not None and len(request) > self.max_request_chars:
+            raise ModelFailure(f"ACP review request contains {len(request)} characters, exceeding configured "
+                               f"limit {self.max_request_chars}; the stage is incomplete")
 
     async def _exchange(self, process, work_root, client, request):
         """_exchange() 完成握手、新建会话和一次审核，只接受正常结束的最终文字回答。
 
         模型仅在明确选择时覆盖；选择使用 Agent 公布的配置项，不把某一家模型名写入协议层。
         SDK 负责 ACP 帧和消息类型，本文本、完成状态及后续结果校验决定能否收取回答。
+        上下文调用方可把首轮非空正文的格式或交付缺口原样反馈一次；两轮共用原生会话和外层总超时。
+        第二轮正文仍交由原有 JSON、结构及调用方交付校验决定结果，不把反馈发出当成缺口已补齐。
         """
         from acp import PROTOCOL_VERSION, connect_to_agent
         from acp.schema import ClientCapabilities, Implementation, McpServerStdio, TextContentBlock
@@ -242,24 +255,38 @@ class AcpModel:
                            for option in selected.config_options):
                     raise ModelFailure("ACP agent did not confirm the selected model")
                 client.record("session/model", model=self.model)
-            # 启动提示不是审核回答；只在本次 prompt 发出后收取 agent_message_chunk。
-            client.receiving = True
-            response = await connection.prompt(
-                session_id=session.session_id, prompt=[TextContentBlock(text=request)],
-            )
-            client.receiving = False
-            client.record("session/prompt", response=response.model_dump(mode="json", by_alias=True, exclude_none=True))
-            if client.violation:
-                raise ModelFailure(client.violation)
-            if response.stop_reason != "end_turn":
-                raise ModelFailure("ACP agent did not finish the review turn")
-            if client.after_tool or not client.parts or not "".join(client.parts).strip():
-                raise ModelFailure("ACP agent completed without a review answer")
-            if process.returncode not in (None, 0):
-                raise ModelFailure("ACP agent exited unsuccessfully")
-            text = "".join(client.parts)
-            client.record("answer/final", message_id=client.message_id, text=text)
-            return text
+            for turn in range(2 if self.reply_feedback is not None else 1):
+                # 只重置本轮正文；会话、已消费的启动通知与违规事实不能因反馈而重新开始。
+                client.parts = []
+                client.message_id = None
+                client.after_tool = False
+                client.receiving = True
+                response = await connection.prompt(
+                    session_id=session.session_id, prompt=[TextContentBlock(text=request)],
+                )
+                client.receiving = False
+                client.record("session/prompt", response=response.model_dump(mode="json", by_alias=True, exclude_none=True))
+                if client.violation:
+                    raise ModelFailure(client.violation)
+                if response.stop_reason != "end_turn":
+                    raise ModelFailure("ACP agent did not finish the review turn")
+                if client.after_tool or not client.parts or not "".join(client.parts).strip():
+                    raise ModelFailure("ACP agent completed without a review answer")
+                if process.returncode not in (None, 0):
+                    raise ModelFailure("ACP agent exited unsuccessfully")
+                text = "".join(client.parts)
+                if turn == 0 and self.reply_feedback is not None:
+                    feedback = self.reply_feedback(text)
+                    if feedback is not None and not isinstance(feedback, str):
+                        raise ModelFailure("ACP reply feedback must be text or null")
+                    if feedback is not None and feedback.strip():
+                        client.record("answer/provisional", message_id=client.message_id, text=text)
+                        client.record("answer/feedback", text=feedback)
+                        self._check_request_chars(feedback)
+                        request = feedback
+                        continue
+                client.record("answer/final", message_id=client.message_id, text=text)
+                return text
         finally:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(connection.close(), timeout=1)
@@ -314,9 +341,7 @@ class AcpModel:
             request = ("Review stage: " + stage_dir.parent.name + "\n" + self.instructions + "\nResponse JSON Schema:\n" +
                        json.dumps(schema, ensure_ascii=False, allow_nan=False) + "\n\n" + prompt)
             # 启动层只为已核实有字符上限的 Agent 设置此界限；完整包装也计入，超限不截断审核证据。
-            if self.max_request_chars is not None and len(request) > self.max_request_chars:
-                raise ModelFailure(f"ACP review request contains {len(request)} characters, exceeding configured "
-                                   f"limit {self.max_request_chars}; the stage is incomplete")
+            self._check_request_chars(request)
             with (stage_dir / "events.jsonl").open("x", encoding="utf-8") as events, \
                     (stage_dir / "stderr.log").open("xb") as errors:
                 os.chmod(events.name, 0o600)

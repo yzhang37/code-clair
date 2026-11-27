@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 from acp_model import AcpModel, _ReviewClient, _stop_process
@@ -161,6 +161,84 @@ for line in sys.stdin:
 '''
 
 
+FEEDBACK_SERVER = r'''
+import json, sys, time
+from pathlib import Path
+
+mode, capture = sys.argv[1], Path(sys.argv[2])
+session_id = "feedback-session"
+startup = "Declared startup.\n"
+turn = 0
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+def update(kind, **fields):
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session_id, "update": {"sessionUpdate": kind, **fields}}})
+
+def reply(identifier, result):
+    send({"jsonrpc": "2.0", "id": identifier, "result": result})
+
+for line in sys.stdin:
+    request = json.loads(line)
+    with capture.open("a") as saved:
+        saved.write(json.dumps(request) + "\n")
+    method, identifier = request.get("method"), request.get("id")
+    if method == "initialize":
+        reply(identifier, {"protocolVersion": 1, "agentCapabilities": {}})
+    elif method == "session/new":
+        reply(identifier, {"sessionId": session_id, "_meta": {"fixture": {"startup": startup}}})
+    elif method == "session/prompt":
+        turn += 1
+        if turn == 1:
+            update("agent_message_chunk", content={"type": "text", "text": startup})
+        if mode == "provider_error":
+            send({"jsonrpc": "2.0", "id": identifier,
+                  "error": {"code": -32000, "message": "Synthetic provider failure"}})
+            continue
+        if mode in {"permission", "read", "write", "terminal"} or (mode == "second_permission" and turn == 2):
+            action = "permission" if mode == "second_permission" else mode
+            params = {"sessionId": session_id}
+            if action == "permission":
+                method = "session/request_permission"
+                params.update(toolCall={"toolCallId": "forbidden", "title": "Forbidden action", "kind": "execute"},
+                              options=[{"optionId": "yes", "name": "Allow", "kind": "allow_once"}])
+            elif action in {"read", "write"}:
+                method = "fs/read_text_file" if action == "read" else "fs/write_text_file"
+                params["path"] = "/not-provided"
+                if action == "write":
+                    params["content"] = "not allowed"
+            else:
+                method = "terminal/create"
+                params["command"] = "not-provided"
+            send({"jsonrpc": "2.0", "id": "forbidden", "method": method, "params": params})
+            answer = json.loads(sys.stdin.readline())
+            with capture.open("a") as saved:
+                saved.write(json.dumps(answer) + "\n")
+        update("tool_call", toolCallId=f"read-{turn}", title=f"Frozen body {turn}", status="completed",
+               rawOutput={"body": f"source-body-{turn}"})
+        if mode == "total_timeout":
+            time.sleep(0.45)
+        if mode == "repeat_startup" and turn == 2:
+            update("agent_message_chunk", content={"type": "text", "text": startup})
+        if mode == "nontext":
+            update("agent_message_chunk", content={"type": "resource_link", "uri": "file:///not-provided", "name": "file"})
+        if mode == "other_session":
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "another-session", "update": {"sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "{}"}}}})
+        body = '{"accepted":false}' if turn == 1 else '{"accepted":true}'
+        if mode == "empty":
+            body = ""
+        if (mode == "fenced_first" and turn == 1) or (mode == "fenced_final" and turn == 2):
+            body = "```json\n" + body + "\n```"
+        for text in (body[:6], body[6:]):
+            update("agent_message_chunk", content={"type": "text", "text": text})
+        reply(identifier, {"stopReason": mode if mode in {"refusal", "max_tokens", "cancelled"} else "end_turn"})
+'''
+
+
 @unittest.skipUnless(AVAILABLE, "ACP client dependencies are not installed")
 class AcpModelTests(unittest.TestCase):
     def setUp(self):
@@ -178,6 +256,15 @@ class AcpModelTests(unittest.TestCase):
         client = AcpModel([sys.executable, str(self.server), mode, str(self.capture)], model, timeout, **kwargs)
         result = client.run("Transport-only fixture prompt", SCHEMA, stage)
         return result, stage
+
+    def invoke_feedback(self, mode="success", callback=None, timeout=3, **kwargs):
+        self.server.write_text(FEEDBACK_SERVER)
+        return self.invoke(mode, timeout=timeout, cwd=self.root, allow_tools=True,
+                           startup_metadata_path=("fixture", "startup"), reply_feedback=callback, **kwargs)
+
+    def captured_prompts(self):
+        return [message for line in self.capture.read_text().splitlines()
+                if (message := json.loads(line)).get("method") == "session/prompt"]
 
     def test_sdk_handshake_collects_only_current_answer_and_saves_artifacts(self):
         result, stage = self.invoke()
@@ -332,6 +419,101 @@ class AcpModelTests(unittest.TestCase):
             with self.subTest(attempt=attempt):
                 self.assertEqual(client.run("Closed stage", SCHEMA, self.root / "private_session" / attempt),
                                  {"accepted": True})
+
+    def test_feedback_reuses_native_session_and_keeps_turn_evidence_separate(self):
+        feedback = "Read the missing frozen baseline body, then return the original response schema.\n"
+        callback = Mock(return_value=feedback)
+        result, stage = self.invoke_feedback(callback=callback)
+        self.assertEqual(result, {"accepted": True})
+        callback.assert_called_once_with('{"accepted":false}')
+        messages = [json.loads(line) for line in self.capture.read_text().splitlines()]
+        self.assertEqual([message.get("method") for message in messages],
+                         ["initialize", "session/new", "session/prompt", "session/prompt"])
+        prompts = self.captured_prompts()
+        self.assertEqual([message["params"]["sessionId"] for message in prompts], ["feedback-session"] * 2)
+        self.assertEqual(prompts[1]["params"]["prompt"], [{"type": "text", "text": feedback}])
+        self.assertEqual((stage / "output.json").read_text(), '{"accepted":true}')
+        events = [json.loads(line) for line in (stage / "events.jsonl").read_text().splitlines()]
+        self.assertEqual(sum(event["type"] == "adapter/startup" for event in events), 1)
+        self.assertEqual([event["update"]["rawOutput"]["body"] for event in events
+                          if event.get("category") == "tool"], ["source-body-1", "source-body-2"])
+        self.assertIn({"type": "answer/provisional", "message_id": None, "text": '{"accepted":false}'}, events)
+        self.assertIn({"type": "answer/feedback", "text": feedback}, events)
+        self.assertEqual(events[-1], {"type": "answer/final", "message_id": None, "text": '{"accepted":true}'})
+
+    def test_feedback_default_or_no_gap_keeps_a_single_turn(self):
+        for mode, callback in (("success", None), ("no_gap", Mock(return_value=None)),
+                               ("empty_feedback", Mock(return_value="")), ("blank_feedback", Mock(return_value=" \n"))):
+            with self.subTest(mode=mode):
+                result, _ = self.invoke_feedback(mode, callback=callback)
+                self.assertEqual(result, {"accepted": False})
+                if callback is not None:
+                    callback.assert_called_once_with('{"accepted":false}')
+        self.assertEqual(len(self.captured_prompts()), 4)
+
+    def test_feedback_may_correct_first_raw_format_but_final_format_stays_strict(self):
+        callback = Mock(return_value="Return only the original schema JSON object.")
+        result, _ = self.invoke_feedback("fenced_first", callback=callback)
+        self.assertEqual(result, {"accepted": True})
+        callback.assert_called_once_with('```json\n{"accepted":false}\n```')
+        final_callback = Mock(return_value="A gap remains.")
+        with self.assertRaises(ModelFailure):
+            self.invoke_feedback("fenced_final", callback=final_callback)
+        final_callback.assert_called_once_with('{"accepted":false}')
+        self.assertEqual((self.root / "fenced_final" / "attempt" / "output.json").read_text(),
+                         '```json\n{"accepted":true}\n```')
+        self.assertEqual(len(self.captured_prompts()), 4)
+
+    def test_feedback_does_not_reset_startup_consumption_or_allow_third_prompt(self):
+        callback = Mock(return_value="Read the remaining source.")
+        with self.assertRaises(ModelFailure):
+            self.invoke_feedback("repeat_startup", callback=callback)
+        callback.assert_called_once_with('{"accepted":false}')
+        self.assertEqual(len(self.captured_prompts()), 2)
+
+    def test_feedback_never_repairs_protocol_host_permission_or_stop_failures(self):
+        modes = ("permission", "read", "write", "terminal", "refusal", "max_tokens", "cancelled",
+                 "empty", "nontext", "other_session", "provider_error")
+        for mode in modes:
+            callback = Mock(return_value="Do not use for a failed turn.")
+            with self.subTest(mode=mode), self.assertRaises(ModelFailure):
+                self.invoke_feedback(mode, callback=callback)
+            callback.assert_not_called()
+        self.assertEqual(len(self.captured_prompts()), len(modes))
+        callback = Mock(return_value="Read remaining source.")
+        with self.assertRaisesRegex(ModelFailure, "requested tool permission"):
+            self.invoke_feedback("second_permission", callback=callback)
+        callback.assert_called_once()
+        self.assertEqual(len(self.captured_prompts()), len(modes) + 2)
+
+    def test_feedback_shares_the_original_total_timeout(self):
+        callback = Mock(return_value="Read the missing source.")
+        started = time.monotonic()
+        with self.assertRaisesRegex(ModelFailure, "timed out"):
+            self.invoke_feedback("total_timeout", callback=callback, timeout=0.75)
+        self.assertLess(time.monotonic() - started, 2)
+        callback.assert_called_once_with('{"accepted":false}')
+        self.assertEqual(len(self.captured_prompts()), 2)
+
+    def test_feedback_request_uses_the_same_character_cap_without_truncation(self):
+        limit = 5000
+        text = "验证" * (limit // 2)
+        result, _ = self.invoke_feedback("at_cap", callback=lambda reply: text, max_request_chars=limit)
+        self.assertEqual(result, {"accepted": True})
+        self.assertEqual(self.captured_prompts()[1]["params"]["prompt"][0]["text"], text)
+        with self.assertRaisesRegex(ModelFailure, f"contains {limit + 1} characters.*limit {limit}"):
+            self.invoke_feedback("over_cap", callback=lambda reply: text + "x", max_request_chars=limit)
+        self.assertEqual(len(self.captured_prompts()), 3)
+
+    def test_feedback_callback_is_context_only_and_rejects_nontext_results(self):
+        for options in ({"reply_feedback": lambda text: None},
+                        {"reply_feedback": lambda text: None, "cwd": self.root},
+                        {"reply_feedback": "invalid", "cwd": self.root, "allow_tools": True}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                AcpModel([sys.executable], **options)
+        with self.assertRaisesRegex(ModelFailure, "must be text or null"):
+            self.invoke_feedback(callback=lambda text: 1)
+        self.assertEqual(len(self.captured_prompts()), 1)
 
     def test_custom_instructions_are_saved_and_sent(self):
         _, stage = self.invoke(instructions="Use the supplied frozen evidence.")

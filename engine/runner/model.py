@@ -140,16 +140,19 @@ class ModelClient:
         """__init__() 保存审核已冻结的配置，不在每个阶段重新选择另一个模型或 Agent。"""
         self.config = dict(config)
 
-    def run(self, prompt, schema, stage_dir, *, context=None):
+    def run(self, prompt, schema, stage_dir, *, context=None, reply_feedback=None):
         """run() 按本阶段材料准备原生 Agent 环境，通信和回答核验仍交给同一个 ACP 客户端。
 
         没有 context 的材料检查保持封闭输入；代码阶段把调用方已冻结的内容投影成只读视图。
         Pi 使用受路径守卫约束的原生读取工具，Codex 使用只读 MCP 工具；其他 Agent 保持封闭输入。
         独立会话及自动项目指令的隔离保持；启动配置不改变正式规则、GOLD 或完成标准。
+        代码调用方可要求一次同会话补读或重交格式，共用原超时；材料阶段不能启用这条续接。
         """
         config = self.config
         if context is not None and config.get("agent") not in {"pi", "codex"}:
             raise ModelFailure("Context-enabled review is available only for Pi and Codex; the stage is incomplete.")
+        if reply_feedback is not None and context is None:
+            raise ModelFailure("Reply feedback requires a frozen code context.")
         from acp_model import AcpModel
 
         environment = {key: value for key, value in os.environ.items()
@@ -208,6 +211,7 @@ class ModelClient:
                 return AcpModel(config["agent_command"], config.get("model"), config.get("timeout", 300),
                                 environment=environment, cwd=view, mcp_servers=servers,
                                 allow_tools=view is not None, instructions=instructions,
+                                reply_feedback=reply_feedback,
                                 startup_metadata_path=("piAcp", "startupInfo") if config.get("agent") == "pi" else None,
                                 max_request_chars=1_048_576 if config.get("agent") == "codex" else None).run(
                                     prompt, schema, stage_dir)

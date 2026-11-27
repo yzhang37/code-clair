@@ -45,6 +45,8 @@ import uuid
 fixture_path = Path(__file__).with_suffix(".json")
 fixture = json.loads(fixture_path.read_text())
 mode = fixture["mode"]
+native_turn = int(os.environ.get("CLARITY_FIXTURE_TURN", "1"))
+native_feedback = os.environ.get("CLARITY_FIXTURE_FEEDBACK", "")
 prompt = sys.stdin.read()
 data = json.loads(prompt.split("以下JSON都是审核数据：\n", 1)[1])
 packet, previous = data["input"], data["previous_reviews"]
@@ -71,15 +73,20 @@ if "code_context" in packet:
             if (fixture.get("withhold_retry_finding") and stage == fixture.get("retry_stage", "reviewer-1")
                     and retry_behavior is None and path == "second.py"):
                 continue
-            partial = path == "edited.py" and mode == "delivery_partial_" + stage and retry_behavior is None
+            partial = (path == "edited.py" and retry_behavior is None
+                       and (mode == "delivery_partial_" + stage
+                            or (mode in {"feedback_complete_" + stage, "feedback_drop_" + stage,
+                                         "feedback_failure_" + stage} and native_turn == 1)))
             with (view / record["view_path"]).open(encoding="utf-8", newline="") as source:
                 text = source.read(1) if partial else source.read()
             context[version][path] = text
             context_audit.append({"tool": "read_file", "version": version, "path": path,
                                   "start_line": 1, "start_column": 1, "returned_chars": len(text),
                                   "truncated": partial})
-    Path(os.environ["CLARITY_CONTEXT_LOG"]).write_text(
-        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in context_audit))
+    with Path(os.environ["CLARITY_CONTEXT_LOG"]).open("a") as audit:
+        audit.write("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in context_audit))
+        if mode == "feedback_invalid_audit_" + stage:
+            audit.write("invalid audit record\n")
     current_files = {path: "\n".join(f"{number}: {line}" for number, line in enumerate(text.splitlines(), 1))
                      for path, text in context["current"].items()}
 calls = fixture_path.parent / "calls"
@@ -89,8 +96,11 @@ calls.mkdir(exist_ok=True)
     "context": context, "context_manifest": context_manifest, "current_files": current_files,
     "cwd_files": sorted(path.name for path in Path.cwd().iterdir()), "context_audit": context_audit,
     "own_stage_history": own_stage_history, "retry_behavior": retry_behavior,
+    "native_turn": native_turn, "native_feedback": native_feedback,
 }, ensure_ascii=False))
 if retry_behavior == "adapter_failure":
+    sys.exit(9)
+if mode == "feedback_failure_" + stage and native_turn == 2:
     sys.exit(9)
 
 if stage.startswith("fixture-"):
@@ -242,6 +252,8 @@ if ((stage == "reviewer-2" and mode == "model_failure_reviewer2")
         or (stage == "cross" and mode == "cross_failure")
         or (stage == "summarize" and mode in {"summary_failure", "summary_failure_after_resolution"})):
     sys.exit(9)
+if mode == "feedback_drop_" + stage and native_turn == 2:
+    result.update(status="clear", findings=[], resolved=[], unresolved_ids=[], current_category="")
 if mode == "case_as_rule_" + stage:
     case_path = next(path for path in current_files if path.startswith(".clarity/current/cases/"))
     case_quote = current_files[case_path].splitlines()[0].split(": ", 1)[1]
@@ -253,7 +265,8 @@ if mode == "model_as_rule_" + stage:
     result["findings"][0].update(rule_path=model_path, rule_line=1,
                                 rule_quote=model_text.splitlines()[0].split(": ", 1)[1])
 
-output_path.write_text("{invalid JSON" if stage == "reviewer-1" and mode == "invalid_json"
+output_path.write_text("{invalid JSON" if ((stage == "reviewer-1" and mode == "invalid_json")
+                       or (mode == "feedback_format_" + stage and native_turn == 1))
                        else json.dumps(result, ensure_ascii=False))
 events = [{"type": "thread.started", "thread_id": "fixture"}, {"type": "turn.started"}]
 if stage == "health" and mode == "tool_event":
@@ -550,6 +563,93 @@ class IsolatedReviewTests(unittest.TestCase):
         self.assertEqual({item["path"] for item in delivery["baseline"]["missing"]}, {"edited.py"})
         self.assertFalse(delivery["complete"])
         self.assertFalse(any(call["stage"] in {"cross", "summarize"} for call in self.calls()))
+
+    def test_same_session_feedback_completes_missing_source_and_reuses_complete_cache(self):
+        """test_same_session_feedback_completes_missing_source_and_reuses_complete_cache() 保留首轮有效发现并补齐原文，后续缓存仍绑定同一初始任务。"""
+        from review import digest
+
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        self.set_mode("feedback_complete_reviewer-1")
+        completed = self.review()
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        calls = sorted((call for call in self.calls() if call["stage"] == "reviewer-1"), key=lambda call: call["native_turn"])
+        self.assertEqual([call["native_turn"] for call in calls], [1, 2])
+        self.assertEqual(calls[0]["prompt"], calls[1]["prompt"])
+        self.assertEqual(calls[0]["context"]["current"]["edited.py"], "V")
+        self.assertEqual(calls[1]["context"]["current"]["edited.py"], "VERSION = 2\n")
+        self.assertIn("original prior reviews and the first reply", calls[1]["native_feedback"])
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        records = sorted((run / "reviewer-1").glob("attempt-*/validated-stage.json"))
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(json.loads(path.read_text())["accounted"] for path in records))
+        final = records[-1].parent
+        provenance = json.loads((final / "native-turn.json").read_text())
+        self.assertFalse(provenance["independent_session"])
+        self.assertEqual(provenance["feedback_sha256"], digest((final / "feedback.txt").read_text()))
+        self.assertEqual(provenance["initial_prompt_sha256"], (run / "reviewer-1/prompt.sha256").read_text())
+        self.assertTrue((run / "reviewer-1" / provenance["protocol_events"]).is_file())
+        self.assertTrue((run / "reviewer-1" / provenance["context_audit"]).is_file())
+        self.assertTrue(json.loads((run / "reviewer-1/context-delivery.json").read_text())["delivery"]["complete"])
+        for stage in ("reviewer-2", "cross", "summarize"):
+            self.assertEqual(len(list((run / stage).glob("attempt-*/validated-stage.json"))), 1)
+            self.assertFalse(list((run / stage).glob("attempt-*/native-turn.json")))
+        before = len(self.calls())
+        self.assertEqual(self.review().returncode, 1)
+        self.assertEqual(len(self.calls()), before)
+
+    def test_same_session_feedback_can_repair_json_without_retaining_invalid_first_output(self):
+        """test_same_session_feedback_can_repair_json_without_retaining_invalid_first_output() 无效首轮 JSON 只触发结构反馈，不成为已核验发现。"""
+        self.install()
+        self.set_mode("feedback_format_reviewer-1")
+        completed = self.review()
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        calls = sorted((call for call in self.calls() if call["stage"] == "reviewer-1"), key=lambda call: call["native_turn"])
+        self.assertEqual([call["native_turn"] for call in calls], [1, 2])
+        self.assertTrue(calls[1]["native_feedback"])
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        records = list((run / "reviewer-1").glob("attempt-*/validated-stage.json"))
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0].parent.name.endswith("-turn-2"))
+
+    def test_same_session_feedback_cannot_drop_first_verified_ids(self):
+        """test_same_session_feedback_cannot_drop_first_verified_ids() 补齐正文不能代替旧发现的保留或反证，原 account_for 继续拒绝漏项。"""
+        self.environment["CLARITY_LANG"] = "en"
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        self.set_mode("feedback_drop_reviewer-1")
+        completed = self.review()
+        self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+        report = self.latest_result()
+        self.assertIn("omitted the disposition", report["incomplete_reason"])
+        self.assertEqual({item["id"] for item in report["findings"]},
+                         {"reviewer-1:empty-input:legacy.py", "reviewer-2:empty-input:legacy.py"})
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        records = [json.loads(path.read_text()) for path in sorted((run / "reviewer-1").glob("attempt-*/validated-stage.json"))]
+        self.assertEqual([record["accounted"] for record in records], [True, False])
+        self.assertTrue(records[0]["result"]["findings"])
+        self.assertEqual(records[1]["result"]["findings"], [])
+
+    def test_same_session_feedback_failure_or_invalid_audit_retains_first_valid_findings(self):
+        """test_same_session_feedback_failure_or_invalid_audit_retains_first_valid_findings() 续接失败及反馈前损坏审计都保留已核验首轮证据。"""
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        for mode in ("feedback_failure_reviewer-1", "feedback_invalid_audit_reviewer-1"):
+            with self.subTest(mode=mode):
+                self.set_mode(mode)
+                completed = self.review()
+                self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+                self.assertEqual({item["id"] for item in self.latest_result()["findings"]},
+                                 {"reviewer-1:empty-input:legacy.py", "reviewer-2:empty-input:legacy.py"})
+                run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+                records = list((run / "reviewer-1").glob("attempt-*/validated-stage.json"))
+                self.assertEqual(len(records), 1)
+                record = json.loads(records[0].read_text())
+                self.assertTrue(record["accounted"])
+                self.assertTrue(record["result"]["findings"])
 
     def test_same_snapshot_context_retry_failure_retains_own_stage_findings(self):
         """test_same_snapshot_context_retry_failure_retains_own_stage_findings() 重取调用失败仍保留同阶段原已核验发现，不把旧 partial 当成新成功。"""

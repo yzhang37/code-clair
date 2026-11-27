@@ -485,37 +485,106 @@ def run_stage(model, directory, name, prompt, snapshot, expected, files, rules, 
                          "findings": history}, ensure_ascii=False) + "\n\n" + prompt)
     print("Clarity: " + name, file=sys.stderr, flush=True)
     attempt = stage / ("attempt-" + str(time.time_ns()))
+    result_attempt = attempt
+    first_result = None
+    first_error = None
+    feedback_sent = False
     if context is not None:
+        import jsonschema
+        from model_common import _load_json
+        from review_context import assess_delivery, make_reply_feedback
+
         attempt.mkdir()
         write_context_artifact(attempt / "review-prompt.txt", actual_prompt)
         write_context_artifact(attempt / "request.json", json.dumps(
             {"base_prompt_sha256": key, "prompt_sha256": digest(actual_prompt)}, ensure_ascii=False) + "\n")
         # 显式空记录区分尚未取材与记录丢失；空正文由清单交付，不能因没有读取字节而丢失其证据。
         (attempt / "context-access.jsonl").touch(mode=0o600, exist_ok=False)
-    output = (model.run(actual_prompt, schema(), attempt, context=context) if context is not None
+        prior = {item["id"]: item for item in previous_findings or []}
+        prior.update({item["id"]: item for item in history})
+        feedback_for_reply = make_reply_feedback(context, attempt / "context-access.jsonl", schema())
+
+        def retain_turn(result, location):
+            """retain_turn() 先保存原文核验通过的本轮发现，解除项仍须经过原 account_for。"""
+            error = None
+            try:
+                account_for(list(prior.values()), result)
+            except Incomplete as failure:
+                error = failure
+            records.append(record_context_result(location, key, actual_prompt, result, error is None))
+            if retained_results is not None:
+                retained_results[:] = records
+            return error
+
+        def save_turn(result):
+            """save_turn() 绑定本轮已核验输出与累计原文交付；partial 回执不能成为完整缓存。"""
+            save(delivery_file, {"base_prompt_sha256": key, "prompt_sha256": digest(actual_prompt),
+                                 "output_sha256": digest(result),
+                                 "delivery": assess_delivery(context, attempt / "context-access.jsonl")})
+            base_file.write_text(key, encoding="utf-8")
+            base_file.chmod(0o600)
+            save(output_file, result)
+            key_file.write_text(digest(actual_prompt))
+
+        def reply_feedback(text):
+            """reply_feedback() 在反馈前保留首轮有效发现，续接失败或审计损坏都不能抹去这些原文证据。
+
+            无效 JSON、结构或引用不进入已核验记录；反馈只补取材或原结构协议，不授权业务裁决。
+            第二回合沿用原会话，因此保存首提示及单独的反馈和协议引用，不冒充另一份独立初审。
+            """
+            nonlocal first_result, first_error, result_attempt, feedback_sent
+            try:
+                candidate = _load_json(text)
+                jsonschema.Draft202012Validator(schema()).validate(candidate)
+                first_result = validate(candidate, snapshot, expected, files, rules,
+                                        candidate_files=candidate_files, principles=principles)
+            except (ValueError, RecursionError, jsonschema.ValidationError, Incomplete, TypeError, KeyError):
+                first_result = None
+            if first_result is not None:
+                first_error = retain_turn(first_result, attempt)
+                prior.update({item["id"]: item for item in first_result["findings"]})
+            try:
+                feedback = feedback_for_reply(text)
+            except Exception:
+                if first_result is not None and first_error is None:
+                    save_turn(first_result)
+                raise
+            if feedback is not None and feedback.strip():
+                if first_result is not None and first_error is None:
+                    save_turn(first_result)
+                if prior:
+                    feedback += ("\nPreserve or explicitly resolve all verified finding IDs from the original prior "
+                                 "reviews and the first reply using the original response fields; "
+                                 "source delivery does not withdraw findings.")
+                if len(feedback) > 8000:
+                    raise ModelFailure("Context reply feedback exceeds the 8000-character limit")
+                result_attempt = stage / (attempt.name + "-turn-2")
+                result_attempt.mkdir()
+                write_context_artifact(result_attempt / "review-prompt.txt", actual_prompt)
+                write_context_artifact(result_attempt / "feedback.txt", feedback)
+                write_context_artifact(result_attempt / "native-turn.json", json.dumps({
+                    "turn": 2, "independent_session": False, "initial_prompt_sha256": digest(actual_prompt),
+                    "feedback_sha256": digest(feedback), "protocol_attempt": attempt.name,
+                    "protocol_events": attempt.name + "/events.jsonl",
+                    "context_audit": attempt.name + "/context-access.jsonl"}, ensure_ascii=False) + "\n")
+                feedback_sent = True
+            return feedback
+
+    output = (model.run(actual_prompt, schema(), attempt, context=context, reply_feedback=reply_feedback) if context is not None
               else model.run(prompt, schema(), attempt))
     result = validate(output, snapshot, expected, files, rules,
                       candidate_files=candidate_files, principles=principles)
     if context is not None:
-        from review_context import assess_delivery
-
-        prior = {item["id"]: item for item in previous_findings or []}
-        prior.update({item["id"]: item for item in history})
-        error = None
-        try:
-            account_for(list(prior.values()), result)
-        except Incomplete as failure:
-            error = failure
-        records.append(record_context_result(attempt, key, actual_prompt, result, error is None))
-        if retained_results is not None:
-            retained_results[:] = records
+        if first_result is not None and not feedback_sent:
+            if digest(result) != digest(first_result):
+                raise Incomplete("Native review turn differs from its recorded first reply")
+            error = first_error
+        else:
+            error = retain_turn(result, result_attempt)
         if error is not None:
             raise error
-        save(delivery_file, {"base_prompt_sha256": key, "prompt_sha256": digest(actual_prompt),
-                             "output_sha256": digest(result),
-                             "delivery": assess_delivery(context, attempt / "context-access.jsonl")})
-        base_file.write_text(key, encoding="utf-8")
-        base_file.chmod(0o600)
+        save_turn(result)
+        return result
     save(output_file, result)
     key_file.write_text(digest(actual_prompt))
     return result
