@@ -55,7 +55,7 @@ class DirectoryReviewTests(unittest.TestCase):
         self.fake.write_text('#!' + sys.executable + '\n' + DIRECTORY_ACP)
         self.fake.chmod(0o755)
         self.environment.update(
-            PATH=str(self.binary), CLARITY_AGENT='custom',
+            PATH=str(self.binary), CLARITY_AGENT='codex',
             CLARITY_AGENT_COMMAND=json.dumps([sys.executable, str(self.fake)]),
             CLARITY_PYTHON=os.environ.get('CLARITY_PYTHON', sys.executable),
         )
@@ -115,6 +115,20 @@ class DirectoryReviewTests(unittest.TestCase):
         self.assertEqual(sum(call['health'] for call in prompts), 1)
         self.assertTrue(all(call['covered_paths'] == ['.gitignore', 'identity.py']
                             for call in prompts if not call['health']))
+        expected_context = {'current': {'.gitignore': ignored.decode('utf-8'),
+                                        'identity.py': 'def identity(value):\n    return value\n'},
+                            'baseline': {}}
+        for call in prompts:
+            if call['health']:
+                self.assertIsNone(call['context'])
+                self.assertNotIn('code_context', call['packet'])
+                continue
+            self.assertEqual(call['context'], expected_context)
+            self.assertNotIn('current_files', call['packet'])
+            self.assertNotIn('baseline_changed_files', call['packet'])
+            self.assertEqual(set(call['context_manifest']['current_files']), set(source['files']))
+            self.assertEqual(call['context_manifest']['baseline_changed_files'], {})
+            self.assertNotIn('MUST_NOT_ENTER_REVIEW', call['prompt'])
         self.assertEqual(self.directory_state(self.rule.parent), current)
         self.assertEqual(code.read_text(), 'def identity(value):\n    return value\n')
         self.assertEqual((self.host / '.gitignore').read_bytes(), ignored)

@@ -25,6 +25,8 @@ script = Path(__file__).resolve()
 calls = script.with_suffix(".calls")
 calls.mkdir(exist_ok=True)
 model = "offline/default"
+context_root = None
+mcp_servers = []
 
 def options():
     """options() 提供固定模型集合，让测试核对显式模型选择而不调用真实模型。"""
@@ -46,7 +48,11 @@ for line in sys.stdin:
         result = {"protocolVersion": 1, "agentCapabilities": {},
                   "agentInfo": {"name": "offline-acp", "version": "1"}, "authMethods": []}
     elif method == "session/new":
-        record["cwd"] = params["cwd"]
+        context_root = Path(params["cwd"])
+        mcp_servers = params.get("mcpServers", [])
+        record["cwd"] = str(context_root)
+        record["mcp_servers"] = mcp_servers
+        record["cwd_files"] = sorted(path.name for path in context_root.iterdir())
         result = {"sessionId": "offline-session", "configOptions": options()}
     elif method == "session/set_config_option":
         model = params["value"]
@@ -59,9 +65,33 @@ for line in sys.stdin:
         packet = data["input"]
         health = "basis_changes" in packet
         groups = ("adopted_rules", "fixtures", "candidate_rule_changes", "candidate_fixture_changes")
+        context, manifest, bounded_read = None, None, None
+        if "code_context" in packet:
+            assert "current_files" not in packet and "baseline_changed_files" not in packet
+            manifest = json.loads((context_root / packet["code_context"]["manifest"]).read_text())
+            context = {version: {path: (context_root / item["view_path"]).read_bytes().decode("utf-8")
+                                 for path, item in manifest[group].items()}
+                       for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files"))}
+            first_path = next(iter(context["current"]))
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call",
+                "toolCallId": "bounded-read", "title": "Read frozen source line", "kind": "read",
+                "status": "in_progress", "rawInput": {"path": first_path, "start_line": 1, "line_count": 1}}}})
+            with (context_root / manifest["current_files"][first_path]["view_path"]).open(encoding="utf-8", newline="") as source:
+                first_line = source.readline()
+            bounded_read = {"path": first_path, "start_line": 1, "line_count": 1, "text": first_line}
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call_update",
+                "toolCallId": "bounded-read", "status": "completed", "rawOutput": bounded_read}}})
         covered = (sorted({path for group in groups for path in packet[group]} | set(packet["basis_changes"]))
-                   if health else sorted(packet["current_files"]))
-        record.update(health=health, covered_paths=covered, snapshot_id=packet["snapshot_id"])
+                   if health else sorted(context["current"] if context is not None else packet["current_files"]))
+        if not health and script.with_suffix(".execute-request").exists():
+            emit({"jsonrpc": "2.0", "id": "forbidden-execution", "method": "terminal/create",
+                  "params": {"sessionId": "offline-session", "command": "project-program-must-not-run"}})
+            record["terminal_response"] = json.loads(sys.stdin.readline())
+        record.update(health=health, covered_paths=covered, snapshot_id=packet["snapshot_id"],
+                      packet=packet, prompt=prompt, context=context, context_manifest=manifest,
+                      context_root=str(context_root), bounded_read=bounded_read, mcp_servers=mcp_servers)
         output = {"snapshot_id": packet["snapshot_id"], "status": "usable" if health else "clear",
                   "covered_paths": covered, "findings": [], "resolved": [], "unresolved_ids": [],
                   "current_category": "", "summary": "Deterministic ACP transport fixture.",
@@ -161,6 +191,73 @@ class AcpHostFlowTests(unittest.TestCase):
         self.assertEqual((self.host / '.git/index').read_bytes(), self.index)
         self.assertEqual(len([call for call in self.calls() if call['method'] == 'session/prompt']), 5)
 
+    def test_code_context_acquires_frozen_bytes_and_accepts_bounded_read_activity(self):
+        """test_code_context_acquires_frozen_bytes_and_accepts_bounded_read_activity() 核对完整范围来自只读投影，读取过程不会污染最终 JSON。"""
+        self.environment['CLARITY_AGENT'] = 'codex'
+        self.run_command(['make', 'review'])
+        self.assertEqual(self.result()[0]['status'], 'clear')
+        prompts = [call for call in self.calls() if call['method'] == 'session/prompt']
+        code = [call for call in prompts if not call['health']]
+        self.assertEqual(len(code), 4)
+        expected = 'def identity(value):\n    return value\n'
+        for call in code:
+            self.assertNotIn('current_files', call['packet'])
+            self.assertNotIn('baseline_changed_files', call['packet'])
+            self.assertNotIn('def identity(value):', call['prompt'])
+            self.assertEqual(call['context'], {'current': {'identity.py': expected}, 'baseline': {}})
+            self.assertEqual(call['bounded_read'], {'path': 'identity.py', 'start_line': 1,
+                                                    'line_count': 1, 'text': 'def identity(value):\n'})
+            self.assertEqual(set(call['context_manifest']['current_files']), {'identity.py'})
+            self.assertFalse(Path(call['context_root']).is_relative_to(self.host))
+        health = next(call for call in prompts if call['health'])
+        self.assertIsNone(health['context'])
+        self.assertIsNone(health['bounded_read'])
+        self.assertNotIn('code_context', health['packet'])
+        self.assertEqual(health['mcp_servers'], [])
+        _, directory = self.result()
+        event_paths = {path.parent.parent.name: path for path in directory.glob('*/attempt-*/events.jsonl')
+                       if path.parent.parent.name != 'health'}
+        self.assertEqual(set(event_paths), {'reviewer-1', 'reviewer-2', 'cross', 'summarize'})
+        for path in event_paths.values():
+            events = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertTrue(any(event.get('category') == 'tool' for event in events))
+            self.assertTrue(any(event['type'] == 'answer/final' for event in events))
+
+    def test_custom_acp_agent_retains_closed_inline_review_without_context_tools(self):
+        """test_custom_acp_agent_retains_closed_inline_review_without_context_tools() 核对已有 custom 调用仍在空目录按全文审核，不能自动获得原生取材权限。"""
+        self.environment['CLARITY_AGENT'] = 'custom'
+        self.run_command(['make', 'review'])
+        self.assertEqual(self.result()[0]['status'], 'clear')
+        calls = self.calls()
+        sessions = [call for call in calls if call['method'] == 'session/new']
+        self.assertEqual(len(sessions), 5)
+        self.assertTrue(all(call['cwd_files'] == [] and call['mcp_servers'] == [] for call in sessions))
+        code = [call for call in calls if call['method'] == 'session/prompt' and not call['health']]
+        self.assertEqual(len(code), 4)
+        for call in code:
+            self.assertEqual(call['packet']['current_files'], {'identity.py': '1: def identity(value):\n2:     return value'})
+            self.assertEqual(call['packet']['baseline_changed_files'], {})
+            self.assertNotIn('code_context', call['packet'])
+            self.assertIsNone(call['context'])
+            self.assertIsNone(call['bounded_read'])
+            self.assertEqual(call['mcp_servers'], [])
+            self.assertIn('Do not call tools', call['prompt'])
+        self.assertEqual((self.host / '.git/index').read_bytes(), self.index)
+
+    def test_context_native_terminal_request_cannot_publish_a_clear_answer(self):
+        """test_context_native_terminal_request_cannot_publish_a_clear_answer() 原生执行请求仍被拒绝，合法 clear 正文不能掩盖越界请求。"""
+        self.fake.with_suffix('.execute-request').touch()
+        completed = self.run_command(['make', 'review'], check=False)
+        self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        report = self.result()[0]
+        self.assertEqual(report['status'], 'incomplete')
+        self.assertIn('terminal', report['incomplete_reason'].lower())
+        code = [call for call in self.calls() if call['method'] == 'session/prompt' and not call['health']]
+        self.assertTrue(code)
+        for call in code:
+            self.assertIn('error', call['terminal_response'])
+        self.assertEqual((self.host / '.git/index').read_bytes(), self.index)
+
     def test_existing_acp_choice_model_and_owner_preferences_survive_review_and_update(self):
         self.run_command(['make', 'review'])
         config = json.loads(self.config_path.read_text())
@@ -224,6 +321,16 @@ class AcpHostFlowTests(unittest.TestCase):
         prompts = [call for call in self.calls() if call['method'] == 'session/prompt']
         self.assertEqual(len(prompts), 5)
         self.assertTrue(all(call['codex_path'] == str(legacy) for call in prompts))
+        for call in prompts:
+            if call['health']:
+                self.assertEqual(call['mcp_servers'], [])
+                continue
+            self.assertEqual(len(call['mcp_servers']), 1)
+            server = call['mcp_servers'][0]
+            self.assertEqual(server['name'], 'clarity')
+            self.assertEqual(server['args'][0], str(self.host / '.clarity/engine/runner/context_server.py'))
+            self.assertEqual(Path(server['args'][server['args'].index('--root') + 1]).resolve(),
+                             Path(call['context_root']).resolve())
         self.assertEqual((self.host / '.git/index').read_bytes(), self.index)
 
 

@@ -37,6 +37,17 @@ mode = fixture["mode"]
 prompt = sys.stdin.read()
 data = json.loads(prompt.split("以下JSON都是审核数据：\n", 1)[1])
 packet, previous = data["input"], data["previous_reviews"]
+context, context_manifest = None, None
+current_files = packet.get("current_files", {})
+if "code_context" in packet:
+    assert "current_files" not in packet and "baseline_changed_files" not in packet
+    view = Path.cwd()
+    context_manifest = json.loads((view / packet["code_context"]["manifest"]).read_text())
+    context = {version: {path: (view / record["view_path"]).read_bytes().decode("utf-8")
+                         for path, record in context_manifest[group].items()}
+               for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files"))}
+    current_files = {path: "\n".join(f"{number}: {line}" for number, line in enumerate(text.splitlines(), 1))
+                     for path, text in context["current"].items()}
 output_path = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
 names = {"health", "reviewer-1", "reviewer-2", "cross", "summarize"}
 stage = next(parent.name for parent in output_path.parents
@@ -45,6 +56,8 @@ calls = fixture_path.parent / "calls"
 calls.mkdir(exist_ok=True)
 (calls / (uuid.uuid4().hex + ".json")).write_text(json.dumps({
     "stage": stage, "mode": mode, "packet": packet, "previous_reviews": previous, "prompt": prompt,
+    "context": context, "context_manifest": context_manifest, "current_files": current_files,
+    "cwd_files": sorted(path.name for path in Path.cwd().iterdir()),
 }, ensure_ascii=False))
 
 if stage.startswith("fixture-"):
@@ -87,7 +100,7 @@ if stage.startswith("fixture-"):
 health = stage == "health"
 health_groups = ("adopted_rules", "fixtures", "candidate_rule_changes", "candidate_fixture_changes")
 covered = (sorted({path for group in health_groups for path in packet[group]} | set(packet.get("basis_changes", {})))
-           if health else list(packet["current_files"]))
+           if health else list(current_files))
 findings = []
 if not health:
     if previous:
@@ -96,7 +109,7 @@ if not health:
     else:
         rule_path = next(iter(packet["adopted_rules"]))
         rule_quote = packet["adopted_rules"][rule_path].splitlines()[0].split(": ", 1)[1]
-        for path, text in packet["current_files"].items():
+        for path, text in current_files.items():
             for numbered_line in text.splitlines():
                 number, line = numbered_line.split(": ", 1)
                 if line != "    return values[0]":
@@ -189,8 +202,8 @@ if ((stage == "reviewer-2" and mode == "model_failure_reviewer2")
         or (stage == "summarize" and mode in {"summary_failure", "summary_failure_after_resolution"})):
     sys.exit(9)
 if mode == "case_as_rule_" + stage:
-    case_path = next(path for path in packet["current_files"] if path.startswith(".clarity/current/cases/"))
-    case_quote = packet["current_files"][case_path].splitlines()[0].split(": ", 1)[1]
+    case_path = next(path for path in current_files if path.startswith(".clarity/current/cases/"))
+    case_quote = current_files[case_path].splitlines()[0].split(": ", 1)[1]
     result["findings"][0].update(rule_path=case_path, rule_line=1, rule_quote=case_quote)
 if mode == "principle_as_rule_" + stage:
     result["findings"][0].update(rule_path="engine/principles.md", rule_line=1, rule_quote="# Principles")
@@ -202,7 +215,7 @@ if mode == "model_as_rule_" + stage:
 output_path.write_text("{invalid JSON" if stage == "reviewer-1" and mode == "invalid_json"
                        else json.dumps(result, ensure_ascii=False))
 events = [{"type": "thread.started", "thread_id": "fixture"}, {"type": "turn.started"}]
-if stage == "reviewer-1" and mode == "tool_event":
+if stage == "health" and mode == "tool_event":
     events.append({"type": "item.completed", "item": {"id": "forbidden", "type": "command_execution"}})
 events.extend([
     {"type": "item.completed", "item": {"id": "answer", "type": "agent_message", "text": "fixture"}},
@@ -232,7 +245,7 @@ class IsolatedReviewTests(unittest.TestCase):
         self.fake = self.root / "fake-codex.py"
         self.fake.write_text("#!" + sys.executable + "\n" + FAKE_CODEX)
         self.fake.chmod(0o755)
-        self.environment.update(CLARITY_AGENT="custom", CLARITY_AGENT_COMMAND=json.dumps([str(self.fake)]))
+        self.environment.update(CLARITY_AGENT="codex", CLARITY_AGENT_COMMAND=json.dumps([str(self.fake)]))
         self.fixture_path = self.fake.with_suffix(".json")
         self.fixture_path.write_text(json.dumps({"mode": "normal"}))
         self.git("init", "-q", "-b", "main")
@@ -343,15 +356,102 @@ class IsolatedReviewTests(unittest.TestCase):
         self.assertEqual(len(initial), 2)
         for call in initial:
             packet = call["packet"]
-            self.assertEqual(set(packet["current_files"]),
+            self.assertEqual(set(call["current_files"]),
                              {"rules.md", "legacy.py", "edited.py", ".clarity/initial/rules.md"})
-            self.assertIn("2:     return values[0]", packet["current_files"]["legacy.py"])
-            self.assertEqual(packet["current_files"]["edited.py"], "1: VERSION = 2")
+            self.assertIn("2:     return values[0]", call["current_files"]["legacy.py"])
+            self.assertEqual(call["current_files"]["edited.py"], "1: VERSION = 2")
             self.assertIn("legacy.py", packet["unchanged_paths"])
         report = self.latest_result()
         self.assertEqual(report["status"], "issues")
         self.assertTrue(report["findings"])
         self.assertTrue(all(item["origin"] == "pre_existing" for item in report["findings"]))
+
+    def test_custom_agent_keeps_complete_inline_snapshot_and_closed_cwd(self):
+        """test_custom_agent_keeps_complete_inline_snapshot_and_closed_cwd() 核对 custom 仍接收完整固定正文，不取得原生工具视图。"""
+        self.environment["CLARITY_AGENT"] = "custom"
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        self.write("edited.py", "VERSION = 999\n")
+        self.write("legacy.py", FIXED)
+        self.write("untracked.py", "UNTRACKED_MUST_NOT_ENTER_CUSTOM = True\n")
+        result = self.review()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.latest_result()["status"], "issues")
+        calls = [call for call in self.calls() if call["stage"] != "health"]
+        self.assertEqual({call["stage"] for call in calls}, {"reviewer-1", "reviewer-2", "cross", "summarize"})
+        expected = {"rules.md": "1: Guard empty input before indexing values.",
+                    "legacy.py": "1: def first(values):\n2:     return values[0]",
+                    "edited.py": "1: VERSION = 2", ".clarity/initial/rules.md": "1: " + TEMPLATE.decode().strip()}
+        for call in calls:
+            packet = call["packet"]
+            self.assertEqual(packet["current_files"], expected)
+            self.assertEqual(packet["baseline_changed_files"], {"edited.py": "1: VERSION = 1"})
+            self.assertEqual(call["current_files"], expected)
+            self.assertNotIn("code_context", packet)
+            self.assertIsNone(call["context"])
+            self.assertIsNone(call["context_manifest"])
+            self.assertEqual(call["cwd_files"], [])
+            self.assertIn("不用也不允许调用任何工具", call["prompt"])
+            self.assertNotIn("UNTRACKED_MUST_NOT_ENTER_CUSTOM", call["prompt"])
+        self.assertTrue(all(item["origin"] == "pre_existing" for item in self.latest_result()["findings"]))
+
+    def test_custom_oversized_inline_snapshot_stops_before_model_without_truncation(self):
+        """test_custom_oversized_inline_snapshot_stops_before_model_without_truncation() 保留 custom 全文容量边界，不能静默改成视图或截断后放行。"""
+        self.environment.update(CLARITY_AGENT="custom", CLARITY_LANG="en")
+        self.install()
+        self.write("oversized.txt", "x" * 1_500_001)
+        self.git("add", "oversized.txt")
+        result = self.review()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        report = self.latest_result()
+        self.assertEqual(report["status"], "incomplete")
+        self.assertIn("Complete snapshot exceeds", report["incomplete_reason"])
+        self.assertIn("nothing was truncated or automatically passed", report["incomplete_reason"])
+        self.assertEqual(self.calls(), [])
+
+    def test_code_context_contains_exact_selected_versions_without_inline_source(self):
+        """test_code_context_contains_exact_selected_versions_without_inline_source() 逐版核对冻结原文，防止工作树或提示副本替代选定索引。"""
+        self.install()
+        added = "nested α/acquired.py"
+        selected = "CONTEXT_ONLY_MARKER = 'selected bytes'\r\nVALUE = 2\n"
+        self.write(added, selected)
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", added, "edited.py")
+        self.git("rm", "--cached", "legacy.py")
+        self.write(added, "WORKTREE_ONLY_MARKER = True\n")
+        self.write("legacy.py", "DELETED_INDEX_WORKTREE_MARKER = True\n")
+        result = self.review()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.latest_result()["status"], "clear")
+        expected_current = {"rules.md": "Guard empty input before indexing values.\n",
+                            "edited.py": "VERSION = 2\n", added: selected,
+                            ".clarity/initial/rules.md": TEMPLATE.decode()}
+        expected_baseline = {"edited.py": "VERSION = 1\n", "legacy.py": BROKEN}
+        calls = self.calls()
+        code_calls = [call for call in calls if call["stage"] != "health"]
+        self.assertEqual({call["stage"] for call in code_calls}, {"reviewer-1", "reviewer-2", "cross", "summarize"})
+        for call in code_calls:
+            packet, context = call["packet"], call["context"]
+            self.assertNotIn("current_files", packet)
+            self.assertNotIn("baseline_changed_files", packet)
+            self.assertEqual(context, {"current": expected_current, "baseline": expected_baseline})
+            self.assertEqual(packet["code_context"]["current_file_count"], len(expected_current))
+            self.assertEqual(packet["code_context"]["baseline_changed_file_count"], len(expected_baseline))
+            self.assertNotIn("CONTEXT_ONLY_MARKER", call["prompt"])
+            self.assertNotIn("WORKTREE_ONLY_MARKER", call["prompt"])
+            self.assertNotIn("DELETED_INDEX_WORKTREE_MARKER", call["prompt"])
+            for group, files in (("current_files", expected_current), ("baseline_changed_files", expected_baseline)):
+                manifest = call["context_manifest"][group]
+                self.assertEqual(set(manifest), set(files))
+                for path, text in files.items():
+                    self.assertEqual(manifest[path]["bytes"], len(text.encode()))
+                    self.assertEqual(manifest[path]["lines"], len(text.splitlines()))
+                    self.assertEqual(manifest[path]["oid"], self.git("hash-object", "--stdin", input_text=text).stdout.strip())
+                    self.assertEqual(manifest[path]["mode"], "100644")
+        health = next(call for call in calls if call["stage"] == "health")
+        self.assertNotIn("code_context", health["packet"])
+        self.assertIsNone(health["context"])
 
     def test_independent_initial_inputs_then_cross_review_preserves_each_finding(self):
         self.write("second.py", BROKEN)
@@ -568,10 +668,10 @@ class IsolatedReviewTests(unittest.TestCase):
         })
         self.assertEqual(health["fixtures"], {})
         self.assertEqual(health["candidate_fixture_changes"], {})
-        initial = [call["packet"] for call in calls if call["stage"].startswith("reviewer-")]
+        initial = [call for call in calls if call["stage"].startswith("reviewer-")]
         self.assertEqual(len(initial), 2)
-        self.assertTrue(all(added in packet["current_files"] for packet in initial))
-        self.assertTrue(all(packet["current_files"]["edited.py"] == "1: VERSION = 2" for packet in initial))
+        self.assertTrue(all(added in call["current_files"] for call in initial))
+        self.assertTrue(all(call["current_files"]["edited.py"] == "1: VERSION = 2" for call in initial))
 
     def adopt_current_fixtures(self, count=2):
         self.write(".clarity/current/rules.md", "Guard empty input before indexing values.\n")
@@ -620,13 +720,15 @@ class IsolatedReviewTests(unittest.TestCase):
         self.assertEqual(len(code_calls), 4)
         for call in code_calls:
             packet = call["packet"]
-            self.assertIn("legacy.py", packet["current_files"])
-            self.assertTrue(case_paths <= set(packet["current_files"]))
+            self.assertIn("legacy.py", call["current_files"])
+            self.assertTrue(case_paths <= set(call["current_files"]))
             self.assertEqual(set(packet["adopted_rules"]), rule_paths)
             self.assertNotIn("principles", packet)
             self.assertEqual(packet["engine_model"], health["engine_model"])
             self.assertEqual(packet["fixture_validation"], {"snapshot_id": packet["snapshot_id"], "status": "matched"})
-            self.assertIn("本次输入已经包含完整已跟踪文本", call["prompt"])
+            self.assertIn("只读冻结视图", call["prompt"])
+            self.assertNotIn("current_files", packet)
+            self.assertNotIn("baseline_changed_files", packet)
         run = Path(json.loads((self.state / "latest.json").read_text())["run"])
         fixture_report = json.loads((run / "fixtures.json").read_text())
         self.assertEqual(len(fixture_report["cases"]), 2)
@@ -718,8 +820,9 @@ class IsolatedReviewTests(unittest.TestCase):
                 self.assertIn("准则位置", result["summary"])
                 self.assertIn(case_path, result["summary"])
                 calls = self.calls(mode)
-                packet = next(call["packet"] for call in calls if call["stage"] == stage)
-                self.assertIn(case_path, packet["current_files"])
+                call = next(call for call in calls if call["stage"] == stage)
+                packet = call["packet"]
+                self.assertIn(case_path, call["current_files"])
                 self.assertNotIn(case_path, packet["adopted_rules"])
                 if stage == "reviewer-1":
                     self.assertFalse(any(call["stage"] == "cross" for call in calls))
@@ -848,7 +951,7 @@ class IsolatedReviewTests(unittest.TestCase):
         self.assertTrue(all(packet["adopted_rules"] == expected_rules for packet in fixtures))
         if path == fixtures[0]["case_path"]:
             self.assertNotEqual(fixtures[0]["fixture"], fixtures[1]["fixture"])
-        initial = [call["packet"] for call in calls if call["stage"].startswith("reviewer-")]
+        initial = [call for call in calls if call["stage"].startswith("reviewer-")]
         if mismatch:
             self.assertEqual(initial, [])
             self.assertEqual({issue["path"] for issue in report["findings"]}, {path})
@@ -856,8 +959,8 @@ class IsolatedReviewTests(unittest.TestCase):
                                 for issue in report["findings"]))
         else:
             self.assertEqual(len(initial), 2)
-            self.assertTrue(all(path in packet["current_files"] for packet in initial))
-            self.assertTrue(all(packet["fixture_validation"]["status"] == "matched" for packet in initial))
+            self.assertTrue(all(path in call["current_files"] for call in initial))
+            self.assertTrue(all(call["packet"]["fixture_validation"]["status"] == "matched" for call in initial))
 
     def test_new_case_is_checked_without_a_rule_revision(self):
         """test_new_case_is_checked_without_a_rule_revision() 验证新增案例不强迫修改已有规则。"""
@@ -906,7 +1009,7 @@ class IsolatedReviewTests(unittest.TestCase):
         self.assertEqual(len(calls), 4)
         for call in calls:
             packet = call["packet"]
-            self.assertEqual(set(packet["current_files"]), paths)
+            self.assertEqual(set(call["current_files"]), paths)
             self.assertEqual(packet["adopted_rules"], expected_rules)
             self.assertEqual(packet["target_tree"], tree)
             self.assertNotIn("principles", packet)
@@ -1467,7 +1570,7 @@ class IsolatedReviewTests(unittest.TestCase):
         for call in calls:
             self.assertNotIn(metadata, call["packet"]["adopted_rules"])
             if call["stage"] != "health":
-                self.assertIn(metadata, call["packet"]["current_files"])
+                self.assertIn(metadata, call["current_files"])
         config_path = self.state / "config.json"
         original = json.loads(config_path.read_text())
         configurations = ({"basis": ["rules.md", metadata], "basis_selections": []},

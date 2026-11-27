@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import math
 import os
@@ -11,18 +12,21 @@ from pathlib import Path
 import signal
 import tempfile
 
-from model_common import ModelFailure, _INSTRUCTIONS, _load_json
+from model_common import ModelFailure, _CONTEXT_INSTRUCTIONS, _INSTRUCTIONS, _load_json
 
 
 class _ReviewClient:
-    """_ReviewClient 收集本次回答并拒绝工具请求，不提供宿主文件或终端能力。"""
+    """_ReviewClient 按消息边界收集回答，不提供宿主文件或终端能力。"""
 
-    def __init__(self, events):
+    def __init__(self, events, *, allow_tools=False):
         """__init__() 将过程记录与回答分开，避免启动提示或推理成为审核 JSON。"""
         self.events = events
         self.session_id = None
         self.receiving = False
         self.parts = []
+        self.message_id = None
+        self.after_tool = False
+        self.allow_tools = allow_tools
         self.violation = None
 
     def record(self, kind, **values):
@@ -31,25 +35,43 @@ class _ReviewClient:
         self.events.flush()
 
     async def session_update(self, session_id, update, **kwargs):
-        """session_update() 只拼接活动回合的文字；工具或不支持的正文使本次未完成。"""
+        """session_update() 按 ACP 消息标识收取末条回答，过程事件只保留为调用证据。
+
+        没有 messageId 的 Agent 在工具调用后开始新的文字组，防止工具前的进度说明混入最终 JSON。
+        同一 messageId 的分块仍归同一回答；本层不从任意文字中猜选看似合法的 JSON。
+        允许工具事件只表示使用已配置的原生上下文工具，不保证 Agent 的操作系统隔离。
+        """
         value = update.model_dump(mode="json", by_alias=True, exclude_none=True)
-        self.record("session/update", session_id=session_id, update=value)
+        kind = value.get("sessionUpdate")
+        category = ("tool" if kind in {"tool_call", "tool_call_update"} else
+                    "plan" if kind == "plan" else
+                    "message" if kind == "agent_message_chunk" else
+                    "thought" if kind == "agent_thought_chunk" else "state")
+        self.record("session/update", session_id=session_id, category=category, update=value)
         if self.session_id is not None and session_id != self.session_id:
             self.violation = "ACP update belongs to another session"
             return
-        kind = value.get("sessionUpdate")
         if kind in {"tool_call", "tool_call_update"}:
-            self.violation = "ACP agent attempted a tool call"
+            if not self.allow_tools:
+                self.violation = "ACP agent attempted a tool call"
+            if self.receiving:
+                self.after_tool = True
         elif kind == "agent_message_chunk" and self.receiving:
             content = value.get("content", {})
             if content.get("type") != "text":
                 self.violation = "ACP review answer contains unsupported content"
             else:
+                message_id = value.get("messageId")
+                if self.parts and (message_id != self.message_id or (self.after_tool and message_id is None)):
+                    self.record("answer/progress", message_id=self.message_id, text="".join(self.parts))
+                    self.parts = []
+                self.message_id = message_id
+                self.after_tool = False
                 self.parts.append(content["text"])
         elif kind not in {
             "agent_message_chunk", "agent_thought_chunk", "user_message_chunk",
             "available_commands_update", "current_mode_update", "config_option_update",
-            "session_info_update", "usage_update",
+            "session_info_update", "usage_update", "plan",
         }:
             self.violation = "ACP agent emitted an unsupported review update"
 
@@ -101,7 +123,9 @@ class AcpModel:
     """AcpModel 在新会话中通过通用 ACP 协议交换审核材料，不解析各家 CLI 输出。"""
 
     def __init__(self, command: list[str], model: str | None = None, timeout: float = 300,
-                 *, environment: dict[str, str] | None = None):
+                 *, environment: dict[str, str] | None = None, cwd: Path | None = None,
+                 mcp_servers: list[dict] | None = None, allow_tools: bool = False,
+                 instructions: str | None = None, max_request_chars: int | None = None):
         """__init__() 保存已选择的 Agent 启动方式，供应商认证和原生协议由现成适配器负责。"""
         if (not isinstance(command, list) or not command
                 or any(not isinstance(item, str) or not item or "\0" in item for item in command)):
@@ -110,19 +134,38 @@ class AcpModel:
             raise ValueError("timeout must be a positive finite number")
         if model is not None and (not isinstance(model, str) or not model.strip()):
             raise ValueError("model must be a nonempty string or null")
+        if not isinstance(allow_tools, bool):
+            raise ValueError("allow_tools must be a boolean")
+        if allow_tools and cwd is None:
+            raise ValueError("Context tools require a supplied frozen view directory")
+        if mcp_servers is not None and (not isinstance(mcp_servers, list)
+                                        or any(not isinstance(server, dict) for server in mcp_servers)):
+            raise ValueError("MCP servers must be a list of stdio server specifications")
+        if mcp_servers and not allow_tools:
+            raise ValueError("MCP servers require context tools")
+        if instructions is not None and (not isinstance(instructions, str) or not instructions.strip()):
+            raise ValueError("instructions must be a nonempty string or null")
+        if max_request_chars is not None and (type(max_request_chars) is not int or max_request_chars <= 0):
+            raise ValueError("max_request_chars must be a positive integer or null")
         self.command = list(command)
         self.model = model
         self.timeout = timeout
         self.environment = dict(environment) if environment is not None else None
+        self.cwd = Path(cwd).resolve() if cwd is not None else None
+        self.mcp_servers = copy.deepcopy(mcp_servers or [])
+        self.allow_tools = allow_tools
+        self.instructions = instructions if instructions is not None else (
+            _CONTEXT_INSTRUCTIONS if allow_tools else _INSTRUCTIONS)
+        self.max_request_chars = max_request_chars
 
     async def _exchange(self, process, work_root, client, request):
-        """_exchange() 完成握手、新建会话和一次审核，只接受正常结束且无工具的文字回答。
+        """_exchange() 完成握手、新建会话和一次审核，只接受正常结束的最终文字回答。
 
         模型仅在明确选择时覆盖；选择使用 Agent 公布的配置项，不把某一家模型名写入协议层。
         SDK 负责 ACP 帧和消息类型，本文本、完成状态及后续结果校验决定能否收取回答。
         """
         from acp import PROTOCOL_VERSION, connect_to_agent
-        from acp.schema import ClientCapabilities, Implementation, TextContentBlock
+        from acp.schema import ClientCapabilities, Implementation, McpServerStdio, TextContentBlock
 
         connection = connect_to_agent(client, process.stdin, process.stdout)
         try:
@@ -133,7 +176,8 @@ class AcpModel:
             client.record("initialize", protocol_version=initialized.protocol_version)
             if initialized.protocol_version != PROTOCOL_VERSION:
                 raise ModelFailure("ACP agent uses an unsupported protocol version")
-            session = await connection.new_session(cwd=str(work_root), mcp_servers=[])
+            servers = [McpServerStdio.model_validate(server) for server in self.mcp_servers]
+            session = await connection.new_session(cwd=str(work_root), mcp_servers=servers)
             client.session_id = session.session_id
             client.record("session/new", session=session.model_dump(mode="json", by_alias=True, exclude_none=True))
             if self.model is not None:
@@ -162,11 +206,13 @@ class AcpModel:
                 raise ModelFailure(client.violation)
             if response.stop_reason != "end_turn":
                 raise ModelFailure("ACP agent did not finish the review turn")
-            if not client.parts or not "".join(client.parts).strip():
+            if client.after_tool or not client.parts or not "".join(client.parts).strip():
                 raise ModelFailure("ACP agent completed without a review answer")
             if process.returncode not in (None, 0):
                 raise ModelFailure("ACP agent exited unsuccessfully")
-            return "".join(client.parts)
+            text = "".join(client.parts)
+            client.record("answer/final", message_id=client.message_id, text=text)
+            return text
         finally:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(connection.close(), timeout=1)
@@ -194,8 +240,8 @@ class AcpModel:
     def run(self, prompt: str, schema: dict, stage_dir: Path) -> dict:
         """run() 保存一次调用的材料与过程，返回满足 JSON 结构的回答；审核结论由调用者核对。
 
-        每次创建空工作目录和新 ACP 会话；不声明宿主工具并拒绝工具事件。
-        这些客户端约束不取代 Agent 自身的隔离配置，启动配置仍须关闭其本地工具和自动上下文。
+        默认创建空工作目录并拒绝工具事件；上下文模式使用调用者提供的冻结视图与原生只读工具。
+        两种模式均不声明宿主文件或终端能力，Agent 自身的工具配置和访问边界仍由启动层约束。
         进程结束、协议回合完成、结构合法分别核对；任何一项不足都不转换成审核通过。
         """
         if not isinstance(prompt, str) or not prompt.strip() or not isinstance(schema, dict):
@@ -213,20 +259,27 @@ class AcpModel:
             if any((stage_dir / name).exists() or (stage_dir / name).is_symlink() for name in names):
                 raise ModelFailure("ACP stage artifacts already exist; use a fresh stage directory")
             for name, content in (("schema.json", json.dumps(schema, ensure_ascii=False, allow_nan=False)),
-                                  ("instructions.txt", _INSTRUCTIONS)):
+                                  ("instructions.txt", self.instructions)):
                 with (stage_dir / name).open("x", encoding="utf-8") as output:
                     os.chmod(output.name, 0o600)
                     output.write(content)
             jsonschema.Draft202012Validator.check_schema(schema)
-            request = ("Review stage: " + stage_dir.parent.name + "\n" + _INSTRUCTIONS + "\nResponse JSON Schema:\n" +
+            request = ("Review stage: " + stage_dir.parent.name + "\n" + self.instructions + "\nResponse JSON Schema:\n" +
                        json.dumps(schema, ensure_ascii=False, allow_nan=False) + "\n\n" + prompt)
+            # 启动层只为已核实有字符上限的 Agent 设置此界限；完整包装也计入，超限不截断审核证据。
+            if self.max_request_chars is not None and len(request) > self.max_request_chars:
+                raise ModelFailure(f"ACP review request contains {len(request)} characters, exceeding configured "
+                                   f"limit {self.max_request_chars}; the stage is incomplete")
             with (stage_dir / "events.jsonl").open("x", encoding="utf-8") as events, \
                     (stage_dir / "stderr.log").open("xb") as errors:
                 os.chmod(events.name, 0o600)
                 os.chmod(errors.name, 0o600)
-                client = _ReviewClient(events)
-                with tempfile.TemporaryDirectory(prefix="clarity-acp-") as temporary:
-                    text = asyncio.run(self._invoke(Path(temporary), client, request, errors))
+                client = _ReviewClient(events, allow_tools=self.allow_tools)
+                if self.cwd is None:
+                    with tempfile.TemporaryDirectory(prefix="clarity-acp-") as temporary:
+                        text = asyncio.run(self._invoke(Path(temporary), client, request, errors))
+                else:
+                    text = asyncio.run(self._invoke(self.cwd, client, request, errors))
             with (stage_dir / "output.json").open("x", encoding="utf-8") as output:
                 os.chmod(output.name, 0o600)
                 output.write(text)

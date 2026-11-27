@@ -33,7 +33,7 @@ class FirstReviewTests(unittest.TestCase):
         self.fake = self.binary / 'codex'
         self.fake.write_text('#!' + sys.executable + '\n' + FAKE_CODEX)
         self.fake.chmod(0o755)
-        self.environment.update(CLARITY_AGENT='custom', CLARITY_AGENT_COMMAND=json.dumps([str(self.fake)]))
+        self.environment.update(CLARITY_AGENT='codex', CLARITY_AGENT_COMMAND=json.dumps([str(self.fake)]))
         self.fake.with_suffix('.json').write_text(json.dumps({'mode': 'normal'}))
         self.environment['PATH'] = str(self.binary) + os.pathsep + self.environment.get('PATH', os.defpath)
         (self.host / 'legacy.py').write_text(BROKEN)
@@ -131,7 +131,7 @@ class FirstReviewTests(unittest.TestCase):
             if call['stage'] == 'health':
                 self.assertEqual(call['packet']['adopted_rules']['.clarity/current/rules.md'], '1: Guard empty input before indexing values.')
             if call['stage'].startswith('reviewer-'):
-                self.assertEqual(set(call['packet']['current_files']), {'legacy.py'})
+                self.assertEqual(set(call['current_files']), {'legacy.py'})
 
     def test_local_material_change_during_model_call_never_publishes_a_pass(self):
         self.fill_rules()

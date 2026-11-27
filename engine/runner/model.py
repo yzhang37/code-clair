@@ -6,12 +6,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 
 from model_common import ModelFailure, _INSTRUCTIONS
 
 
-# Codex 的静态审核设置沿用旧调用约束；只改变通信协议，不给审核增添工具或项目自动上下文。
+# 代码阶段通过只读 MCP 取得冻结事实；关闭原生命令和环境指令，避免混入实时工作树或其他规则。
+# 封闭材料阶段仍沿用无工具输入；只读上下文不会授权执行项目程序、修改文件或增加判断标准。
 _CONFIG = (
     'approval_policy="never"',
     "project_doc_max_bytes=0",
@@ -54,7 +56,20 @@ _ENV_KEYS = (
 ADAPTERS = {"pi": ("pi-acp", "pi-acp@0.0.35"),
             "codex": ("codex-acp", "@agentclientprotocol/codex-acp@2.12.0")}
 MODEL_FIELDS = ("agent", "agent_command", "agent_bin", "codex_bin", "model", "timeout")
-ADAPTER_FILES = ("acp_model.py", "model.py", "model_common.py", "pi_entry.py", "acp_runtime.py")
+ADAPTER_FILES = ("acp_model.py", "model.py", "model_common.py", "pi_entry.py", "acp_runtime.py",
+                 "review_context.py", "context_server.py", "pi_context_guard.mjs")
+
+
+def _restore_view_permissions(root):
+    """_restore_view_permissions() 在 Agent 结束后恢复临时视图权限，使只读材料可以被回收。
+
+    只处理本次视图中的普通路径，不跟随链接，避免清理时更改视图外文件或认证资料的权限。
+    """
+    if not root.exists():
+        return
+    for path in [root, *root.rglob("*")]:
+        if not path.is_symlink():
+            path.chmod(0o700 if path.is_dir() else 0o600)
 
 
 def agent_settings(config, *, from_environment=False):
@@ -125,46 +140,78 @@ class ModelClient:
         """__init__() 保存审核已冻结的配置，不在每个阶段重新选择另一个模型或 Agent。"""
         self.config = dict(config)
 
-    def run(self, prompt, schema, stage_dir):
-        """run() 为现成适配器提供独立上下文，保留认证入口而不记录凭据正文。
+    def run(self, prompt, schema, stage_dir, *, context=None):
+        """run() 按本阶段材料准备原生 Agent 环境，通信和回答核验仍交给同一个 ACP 客户端。
 
-        Pi 自己管理模型和认证；Codex 延续原先临时配置目录的静态审核约束。
-        两者最后进入同一个 ACP 客户端，启动选项不承担审核语义判断。
+        没有 context 的材料检查保持封闭输入；代码阶段把调用方已冻结的内容投影成只读视图。
+        Pi 使用受路径守卫约束的原生读取工具，Codex 使用只读 MCP 工具；其他 Agent 保持封闭输入。
+        独立会话及自动项目指令的隔离保持；启动配置不改变正式规则、GOLD 或完成标准。
         """
+        config = self.config
+        if context is not None and config.get("agent") not in {"pi", "codex"}:
+            raise ModelFailure("Context-enabled review is available only for Pi and Codex; the stage is incomplete.")
         from acp_model import AcpModel
 
-        config = self.config
         environment = {key: value for key, value in os.environ.items()
                        if key in _ENV_KEYS or key.endswith(("_API_KEY", "_AUTH_TOKEN", "_OAUTH_TOKEN"))
                        or key.startswith(("AWS_", "AZURE_", "GOOGLE_", "CLOUDFLARE_"))
                        or key in {"COPILOT_GITHUB_TOKEN", "PI_CODING_AGENT_DIR", "PI_PACKAGE_DIR"}}
         with tempfile.TemporaryDirectory(prefix="clarity-agent-") as temporary:
             root = Path(temporary)
-            if config.get("agent") == "pi":
-                environment["PI_ACP_PI_COMMAND"] = str(Path(__file__).with_name("pi_entry.py"))
-                environment["CLARITY_PI_BINARY"] = config.get("agent_bin", "pi")
-            elif config.get("agent") == "codex":
-                home = root / "codex-home"
-                home.mkdir(mode=0o700)
-                source = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
-                if source.is_file():
-                    (home / "auth.json").symlink_to(source.resolve())
-                environment["CODEX_HOME"] = str(home)
-                environment["CODEX_PATH"] = config.get("codex_bin") or config.get("agent_bin", "codex")
-                instructions = root / "instructions.txt"
-                instructions.write_text(_INSTRUCTIONS)
-                overrides = {"sandbox_mode": "read-only", "model_instructions_file": str(instructions)}
-                for setting in _CONFIG:
-                    name, value = setting.split("=", 1)
-                    target = overrides
-                    parts = name.split(".")
-                    for part in parts[:-1]:
-                        target = target.setdefault(part, {})
-                    target[parts[-1]] = json.loads(value)
-                environment["CODEX_CONFIG"] = json.dumps(overrides)
-                environment["INITIAL_AGENT_MODE"] = "read-only"
-            return AcpModel(config["agent_command"], config.get("model"), config.get("timeout", 300),
-                            environment=environment).run(prompt, schema, stage_dir)
+            view = None
+            instructions = _INSTRUCTIONS
+            servers = None
+            try:
+                if context is not None:
+                    from model_common import _CONTEXT_INSTRUCTIONS
+                    from review_context import materialize_context
+
+                    view = root / "view"
+                    view.mkdir()
+                    materialize_context(context, view)
+                    instructions = _CONTEXT_INSTRUCTIONS
+                    environment["CLARITY_CONTEXT_ROOT"] = str(view)
+                    if config.get("agent") == "codex":
+                        servers = [{"name": "clarity", "command": sys.executable,
+                                    "args": [str(Path(__file__).with_name("context_server.py")),
+                                             "--root", str(view), "--log",
+                                             str(Path(stage_dir).resolve() / "context-access.jsonl")],
+                                    "env": []}]
+                if config.get("agent") == "pi":
+                    environment["PI_ACP_PI_COMMAND"] = str(Path(__file__).with_name("pi_entry.py"))
+                    environment["CLARITY_PI_BINARY"] = config.get("agent_bin", "pi")
+                    if view is not None:
+                        environment["CLARITY_CONTEXT_PYTHON"] = sys.executable
+                        environment["CLARITY_CONTEXT_LOG"] = str(Path(stage_dir).resolve() / "context-access.jsonl")
+                elif config.get("agent") == "codex":
+                    home = root / "codex-home"
+                    home.mkdir(mode=0o700)
+                    source = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
+                    if source.is_file():
+                        (home / "auth.json").symlink_to(source.resolve())
+                    environment["CODEX_HOME"] = str(home)
+                    environment["CODEX_PATH"] = config.get("codex_bin") or config.get("agent_bin", "codex")
+                    instruction_file = root / "instructions.txt"
+                    instruction_file.write_text(instructions)
+                    overrides = {"sandbox_mode": "read-only", "model_instructions_file": str(instruction_file)}
+                    for setting in _CONFIG:
+                        name, value = setting.split("=", 1)
+                        target = overrides
+                        parts = name.split(".")
+                        for part in parts[:-1]:
+                            target = target.setdefault(part, {})
+                        target[parts[-1]] = json.loads(value)
+                    environment["CODEX_CONFIG"] = json.dumps(overrides)
+                    environment["INITIAL_AGENT_MODE"] = "read-only"
+                # 已核对的 Codex 入口按一次请求的字符总量限制；不把该数值套到其他 Agent 或 token 窗口。
+                return AcpModel(config["agent_command"], config.get("model"), config.get("timeout", 300),
+                                environment=environment, cwd=view, mcp_servers=servers,
+                                allow_tools=view is not None, instructions=instructions,
+                                max_request_chars=1_048_576 if config.get("agent") == "codex" else None).run(
+                                    prompt, schema, stage_dir)
+            finally:
+                if view is not None:
+                    _restore_view_permissions(view)
 
 
 def create_model(config):

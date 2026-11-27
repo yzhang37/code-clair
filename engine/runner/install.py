@@ -27,6 +27,7 @@ from model_common import ModelFailure
 HOOK_MARKER = "# clarity-review-hook v1"
 HOOK_NAMES = ("pre-commit",)
 ENGINE_RUNNERS = ("review.py", "model_common.py", "acp_model.py", "acp_runtime.py", "model.py", "pi_entry.py",
+                  "review_context.py", "context_server.py", "pi_context_guard.mjs",
                   "directory_snapshot.py", "make_integration.py", "release.py", "install.py", "rules_check.py", "rules_report.py",
                   "material_check.py", "maintenance.py", "i18n.py")
 REQUIRED_PROMPTS = ("health.md", "fixtures.md", "review.md", "summarize.md", "learn.md", "rules-check.md",
