@@ -27,6 +27,9 @@ calls.mkdir(exist_ok=True)
 model = "offline/default"
 context_root = None
 mcp_servers = []
+initial_prompt = None
+native_turn = 0
+source_call = 0
 
 def options():
     """options() 提供固定模型集合，让测试核对显式模型选择而不调用真实模型。"""
@@ -38,6 +41,24 @@ def emit(record):
     """emit() 写出一条完整 ACP 记录并立即交给调用者。"""
     print(json.dumps(record, ensure_ascii=False), flush=True)
 
+def emit_source_read(arguments, payload):
+    """emit_source_read() 将实际冻结读取结果交到同会话的标准 MCP/ACP 完成通知，不以服务日志冒充接收。"""
+    global source_call
+    source_call += 1
+    identifier = f"source-{native_turn}-{source_call}"
+    mcp = any(server["name"] == "clarity" for server in mcp_servers)
+    text = json.dumps(payload, ensure_ascii=False)
+    raw_input = {"server": "clarity", "tool": "read_file", "arguments": arguments} if mcp else arguments
+    raw_output = ({"result": {"content": [{"type": "text", "text": text}], "structuredContent": payload,
+                              "isError": False}} if mcp else {"content": [{"type": "text", "text": text}]})
+    emit({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call", "toolCallId": identifier,
+        "title": "mcp.clarity.read_file" if mcp else "clarity_read_file", "kind": "execute" if mcp else "other",
+        "status": "in_progress", "rawInput": raw_input}}})
+    emit({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call_update", "toolCallId": identifier,
+        "status": "completed", "rawOutput": raw_output}}})
+
 for line in sys.stdin:
     message = json.loads(line)
     if "id" not in message:
@@ -48,6 +69,8 @@ for line in sys.stdin:
         result = {"protocolVersion": 1, "agentCapabilities": {},
                   "agentInfo": {"name": "offline-acp", "version": "1"}, "authMethods": []}
     elif method == "session/new":
+        initial_prompt = None
+        native_turn = 0
         context_root = Path(params["cwd"])
         mcp_servers = params.get("mcpServers", [])
         record["cwd"] = str(context_root)
@@ -59,7 +82,12 @@ for line in sys.stdin:
         record["selected_model"] = model
         result = {"configOptions": options()}
     elif method == "session/prompt":
-        prompt = "\n".join(block["text"] for block in params["prompt"] if block["type"] == "text")
+        supplied_prompt = "\n".join(block["text"] for block in params["prompt"] if block["type"] == "text")
+        native_turn += 1
+        if initial_prompt is None:
+            initial_prompt = supplied_prompt
+        prompt = initial_prompt
+        record.update(native_turn=native_turn, feedback=supplied_prompt if native_turn > 1 else None)
         raw = prompt.split("以下JSON都是审核数据：\n", 1)[1]
         data, _ = json.JSONDecoder().raw_decode(raw)
         packet = data["input"]
@@ -70,31 +98,34 @@ for line in sys.stdin:
             assert "current_files" not in packet and "baseline_changed_files" not in packet
             manifest = json.loads((context_root / packet["code_context"]["manifest"]).read_text())
             context = {"current": {}, "baseline": {}}
-            context_audit = []
+            server = next((server for server in mcp_servers if server["name"] == "clarity"), None)
+            if server is not None:
+                arguments = server["args"]
+                runner = Path(arguments[0]).parent
+                log_path = arguments[arguments.index("--log") + 1]
+            else:
+                runner = Path(os.environ["PI_ACP_PI_COMMAND"]).parent
+                log_path = os.environ["CLARITY_CONTEXT_LOG"]
+            sys.path.insert(0, str(runner))
+            from review_context import ContextStore
+            store = ContextStore(context_root, log_path)
+            first_path = next(iter(manifest["current_files"]))
             for version, group in (("current", "current_files"), ("baseline", "baseline_changed_files")):
                 for path, item in manifest[group].items():
-                    text = (context_root / item["view_path"]).read_bytes().decode("utf-8")
-                    context[version][path] = text
-                    context_audit.append({"tool": "read_file", "version": version, "path": path,
-                                          "start_line": 1, "start_column": 1, "returned_chars": len(text),
-                                          "truncated": False})
-            log_path = os.environ.get("CLARITY_CONTEXT_LOG")
-            if log_path is None:
-                server = next(server for server in mcp_servers if server["name"] == "clarity")
-                arguments = server["args"]
-                log_path = arguments[arguments.index("--log") + 1]
-            Path(log_path).write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in context_audit))
-            first_path = next(iter(context["current"]))
-            emit({"jsonrpc": "2.0", "method": "session/update", "params": {
-                "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call",
-                "toolCallId": "bounded-read", "title": "Read frozen source line", "kind": "read",
-                "status": "in_progress", "rawInput": {"path": first_path, "start_line": 1, "line_count": 1}}}})
-            with (context_root / manifest["current_files"][first_path]["view_path"]).open(encoding="utf-8", newline="") as source:
-                first_line = source.readline()
-            bounded_read = {"path": first_path, "start_line": 1, "line_count": 1, "text": first_line}
-            emit({"jsonrpc": "2.0", "method": "session/update", "params": {
-                "sessionId": "offline-session", "update": {"sessionUpdate": "tool_call_update",
-                "toolCallId": "bounded-read", "status": "completed", "rawOutput": bounded_read}}})
+                    cursor, pieces = {"start_line": 1, "start_column": 1}, []
+                    while True:
+                        first_page = version == "current" and path == first_path and not pieces
+                        arguments = {"path": path, "version": version, **cursor,
+                                     "line_count": 1 if first_page else 200, "char_limit": 16000}
+                        payload = store.read_file(**arguments)
+                        emit_source_read(arguments, payload)
+                        if first_page:
+                            bounded_read = {"path": path, "start_line": 1, "line_count": 1, "text": payload["text"]}
+                        pieces.append(payload["text"])
+                        if payload["next"] is None:
+                            break
+                        cursor = payload["next"]
+                    context[version][path] = "".join(pieces)
         covered = (sorted({path for group in groups for path in packet[group]} | set(packet["basis_changes"]))
                    if health else sorted(context["current"] if context is not None else packet["current_files"]))
         if not health and script.with_suffix(".execute-request").exists():
@@ -252,20 +283,23 @@ class AcpHostFlowTests(unittest.TestCase):
                  and call.get('snapshot_id') == report['snapshot_id'] and not call['health']]
         self.assertEqual(len(calls), 4)
         self.assertTrue(all(call['context'] == expected for call in calls))
-        expected_ranges = {(version, path, len(text)) for version, files in expected.items()
-                           for path, text in files.items()}
+        expected_paths = {(version, path) for version, files in expected.items() for path in files}
         for stage in ('reviewer-1', 'reviewer-2', 'cross', 'summarize'):
             delivery = json.loads((directory / stage / 'context-delivery.json').read_text())['delivery']
             self.assertTrue(delivery['complete'])
             self.assertTrue(delivery['audit_valid'])
+            self.assertTrue(delivery['transport_confirmed'])
             self.assertEqual(delivery['current'], {'total': 2, 'complete': 2, 'missing': []})
             self.assertEqual(delivery['baseline'], {'total': 1, 'complete': 1, 'missing': []})
             logs = list((directory / stage).glob('attempt-*/context-access.jsonl'))
             self.assertEqual(len(logs), 1)
             audit = [json.loads(line) for line in logs[0].read_text().splitlines()]
-            self.assertEqual({(row['version'], row['path'], row['returned_chars']) for row in audit}, expected_ranges)
-            self.assertTrue(all(row['tool'] == 'read_file' and row['start_line'] == 1
-                                and row['start_column'] == 1 and row['truncated'] is False for row in audit))
+            self.assertEqual({(row['version'], row['path']) for row in audit}, expected_paths)
+            for version, files in expected.items():
+                for path, text in files.items():
+                    self.assertEqual(sum(row['returned_chars'] for row in audit
+                                         if row['version'] == version and row['path'] == path), len(text))
+            self.assertTrue(all(row['tool'] == 'read_file' and 0 <= row['returned_chars'] <= 16000 for row in audit))
         self.assertFalse((directory / 'health/context-delivery.json').exists())
         self.assertFalse(list((directory / 'health').glob('attempt-*/context-access.jsonl')))
 
