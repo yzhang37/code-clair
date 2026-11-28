@@ -709,8 +709,70 @@ def validate_fixture(output, snapshot, path, document, rules, expected):
     return output
 
 
+def make_fixture_reply_feedback(snapshot, path, document, rules, expected):
+    """make_fixture_reply_feedback() 只把固定案例回包的格式或预期账目错误交回原会话纠正一次。
+
+    完整判断仍由原 validate_fixture 验收；显式证据不足、输入身份错误或它先报告的引文/判断错误不续接。
+    反馈不改回包或固定预期，也不要求 matched，避免把重交机会变成迁就规则的通过指令。
+    """
+    import jsonschema
+    from model_common import _load_json
+
+    validator = jsonschema.Draft202012Validator(fixture_schema())
+    accounting_errors = {
+        tr('Fixture expectation identifier is invalid or duplicated: ') + path,
+        tr('Fixture verification does not cover every positive/negative expectation and rationale boundary: ') + path,
+    }
+
+    def reply_feedback(text):
+        """reply_feedback() 分类首答失败，不修改原答；返回的短反馈仍由 ACP 的单次续接与总超时约束。"""
+        try:
+            output = _load_json(text)
+        except (ValueError, RecursionError):
+            problem = "The reply is not one strict JSON object."
+        else:
+            if isinstance(output, dict):
+                if (output.get("snapshot_id", snapshot) != snapshot
+                        or output.get("case_path", path) != path or output.get("status") == "incomplete"):
+                    return None
+            try:
+                validator.validate(output)
+            except jsonschema.ValidationError:
+                problem = "The reply fields do not match the original response JSON schema."
+            else:
+                try:
+                    validate_fixture(output, snapshot, path, document, rules, expected)
+                except Incomplete as failure:
+                    # 只分类原校验器先报告的两类账目错误，避免复制或放宽它的判断算法。
+                    # 首个账目错误之后仍可能有其他缺陷；重交整答须再次完整验收，不能把发送反馈当作已通过。
+                    if str(failure) not in accounting_errors:
+                        return None
+                    counts = {}
+                    for check in output["checks"]:
+                        counts[check["id"]] = counts.get(check["id"], 0) + 1
+                    problem = ("Each expected ID must appear exactly once in checks. Expected ID counts: "
+                               + json.dumps(dict.fromkeys(expected, 1), ensure_ascii=False)
+                               + "; actual ID counts: " + json.dumps(counts, ensure_ascii=False) + ".")
+                    # 原请求已含完整预期；异常长的回包标识不能让一次格式反馈重新变成大型材料请求。
+                    if len(problem) > 6500:
+                        problem = ("The checks have missing, repeated or unknown IDs. "
+                                   "Use every expected ID from the original input exactly once.")
+                else:
+                    return None
+        return ("Your fixture reply could not be accepted. " + problem
+                + " Return one complete JSON object under the original schema and the same snapshot_id and case_path."
+                + " Correct the response format or ID accounting without changing the supplied rules, fixture or expectations."
+                + " Keep evidence-based judgments and exact original quotations; a correction does not require matched."
+                + " If the supplied evidence is insufficient, report incomplete instead of inventing a judgment.")
+
+    return reply_feedback
+
+
 def run_fixture(model, directory, name, snapshot, path, document, rules, view, responses, texts, repository):
-    """run_fixture() 单独交付一个完整案例和规则，保留可复查的语义兼容核对记录。"""
+    """run_fixture() 单独交付完整案例和规则，格式或预期账目错误可在原会话重交一次，再按原标准验收。
+
+    首答与反馈由 ACP 留存；只有最终严格验收通过的结果写入缓存，重交不改变规则、案例或判断标准。
+    """
     expected = fixture_expectations(path, document)
     packet = {"snapshot_id": snapshot, "target_repository": repository, "case_path": path, "view": view,
               "fixture": numbered(document["text"]), "expectations": expected,
@@ -725,7 +787,9 @@ def run_fixture(model, directory, name, snapshot, path, document, rules, view, r
         return validate_fixture(json.loads(output_file.read_text()), snapshot, path, document, rules, expected)
     print("Clarity: " + name, file=sys.stderr, flush=True)
     attempt = stage / ("attempt-" + str(time.time_ns()))
-    output = validate_fixture(model.run(prompt, fixture_schema(), attempt), snapshot, path, document, rules, expected)
+    feedback = make_fixture_reply_feedback(snapshot, path, document, rules, expected)
+    output = validate_fixture(model.run(prompt, fixture_schema(), attempt, reply_feedback=feedback),
+                              snapshot, path, document, rules, expected)
     save(output_file, output)
     key_file.write_text(key)
     return output

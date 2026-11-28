@@ -146,13 +146,14 @@ class ModelClient:
         没有 context 的材料检查保持封闭输入；代码阶段把调用方已冻结的内容投影成只读视图。
         Pi 使用受路径守卫约束的原生读取工具，Codex 使用只读 MCP 工具；其他 Agent 保持封闭输入。
         独立会话及自动项目指令的隔离保持；启动配置不改变正式规则、GOLD 或完成标准。
-        代码调用方可要求一次同会话补读或重交格式，共用原超时；材料阶段不能启用这条续接。
+        调用方可要求一次同会话补读或重交格式，共用原超时，避免仅因回包不合格重启整个审核。
+        封闭材料阶段的反馈只允许重交结果，不授予上下文工具或额外资料访问。
         """
         config = self.config
         if context is not None and config.get("agent") not in {"pi", "codex"}:
             raise ModelFailure("Context-enabled review is available only for Pi and Codex; the stage is incomplete.")
-        if reply_feedback is not None and context is None:
-            raise ModelFailure("Reply feedback requires a frozen code context.")
+        if reply_feedback is not None and not callable(reply_feedback):
+            raise ModelFailure("Reply feedback must be callable or null.")
         from acp_model import AcpModel
 
         environment = {key: value for key, value in os.environ.items()

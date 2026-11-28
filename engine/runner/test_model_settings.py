@@ -179,11 +179,28 @@ class ModelSettingsTests(unittest.TestCase):
             self.assertEqual(options["startup_metadata_path"], ("piAcp", "startupInfo") if agent == "pi" else None)
             self.assertNotIn("CLARITY_CONTEXT_ROOT", options["environment"])
 
-    def test_feedback_without_code_context_is_rejected_before_starting_agent(self):
+    def test_closed_feedback_keeps_material_isolation_for_every_agent(self):
+        feedback = lambda text: "Correct the response format."
+        for agent in ("pi", "codex", "custom"):
+            with self.subTest(agent=agent), patch.dict(os.environ, {}, clear=True), \
+                    patch("acp_model.AcpModel") as adapter:
+                adapter.return_value.run.return_value = {"accepted": True}
+                result = ModelClient({"agent": agent, "agent_command": ["adapter"]}).run(
+                    "prompt", {}, Path("stage/attempt"), reply_feedback=feedback)
+                options = adapter.call_args.kwargs
+            self.assertEqual(result, {"accepted": True})
+            self.assertIs(options["reply_feedback"], feedback)
+            self.assertFalse(options["allow_tools"])
+            self.assertIsNone(options["cwd"])
+            self.assertIsNone(options["mcp_servers"])
+            self.assertEqual(options["instructions"], _INSTRUCTIONS)
+            self.assertNotIn("CLARITY_CONTEXT_ROOT", options["environment"])
+
+    def test_noncallable_feedback_is_rejected_before_starting_agent(self):
         with patch("model.tempfile.TemporaryDirectory") as temporary, patch("acp_model.AcpModel") as adapter:
-            with self.assertRaisesRegex(ModelFailure, "requires a frozen code context"):
+            with self.assertRaisesRegex(ModelFailure, "must be callable or null"):
                 ModelClient({"agent": "pi", "agent_command": ["adapter"]}).run(
-                    "prompt", {}, Path("stage/attempt"), reply_feedback=lambda text: "Retry")
+                    "prompt", {}, Path("stage/attempt"), reply_feedback="invalid")
         temporary.assert_not_called()
         adapter.assert_not_called()
 

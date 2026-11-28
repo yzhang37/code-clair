@@ -169,6 +169,8 @@ mode, capture = sys.argv[1], Path(sys.argv[2])
 session_id = "feedback-session"
 startup = "Declared startup.\n"
 turn = 0
+closed = mode.startswith("closed_")
+mode = mode.removeprefix("closed_")
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -197,8 +199,8 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": identifier,
                   "error": {"code": -32000, "message": "Synthetic provider failure"}})
             continue
-        if mode in {"permission", "read", "write", "terminal"} or (mode == "second_permission" and turn == 2):
-            action = "permission" if mode == "second_permission" else mode
+        action = mode.removeprefix("second_")
+        if action in {"permission", "read", "write", "terminal"} and (not mode.startswith("second_") or turn == 2):
             params = {"sessionId": session_id}
             if action == "permission":
                 method = "session/request_permission"
@@ -216,8 +218,9 @@ for line in sys.stdin:
             answer = json.loads(sys.stdin.readline())
             with capture.open("a") as saved:
                 saved.write(json.dumps(answer) + "\n")
-        update("tool_call", toolCallId=f"read-{turn}", title=f"Frozen body {turn}", status="completed",
-               rawOutput={"body": f"source-body-{turn}"})
+        if not closed or (mode == "tool_first" and turn == 1) or (mode == "tool_second" and turn == 2):
+            update("tool_call", toolCallId=f"read-{turn}", title=f"Frozen body {turn}", status="completed",
+                   rawOutput={"body": f"source-body-{turn}"})
         if mode == "total_timeout":
             time.sleep(0.45)
         if mode == "repeat_startup" and turn == 2:
@@ -233,6 +236,8 @@ for line in sys.stdin:
             body = ""
         if (mode == "fenced_first" and turn == 1) or (mode == "fenced_final" and turn == 2):
             body = "```json\n" + body + "\n```"
+        if mode == "schema_final" and turn == 2:
+            body = '{"accepted":"yes"}'
         for text in (body[:6], body[6:]):
             update("agent_message_chunk", content={"type": "text", "text": text})
         reply(identifier, {"stopReason": mode if mode in {"refusal", "max_tokens", "cancelled"} else "end_turn"})
@@ -257,10 +262,13 @@ class AcpModelTests(unittest.TestCase):
         result = client.run("Transport-only fixture prompt", SCHEMA, stage)
         return result, stage
 
-    def invoke_feedback(self, mode="success", callback=None, timeout=3, **kwargs):
+    def invoke_feedback(self, mode="success", callback=None, timeout=3, closed=False, **kwargs):
         self.server.write_text(FEEDBACK_SERVER)
-        return self.invoke(mode, timeout=timeout, cwd=self.root, allow_tools=True,
-                           startup_metadata_path=("fixture", "startup"), reply_feedback=callback, **kwargs)
+        if closed:
+            mode = "closed_" + mode
+        options = {} if closed else {"cwd": self.root, "allow_tools": True}
+        return self.invoke(mode, timeout=timeout, startup_metadata_path=("fixture", "startup"),
+                           reply_feedback=callback, **options, **kwargs)
 
     def captured_prompts(self):
         return [message for line in self.capture.read_text().splitlines()
@@ -505,15 +513,70 @@ class AcpModelTests(unittest.TestCase):
             self.invoke_feedback("over_cap", callback=lambda reply: text + "x", max_request_chars=limit)
         self.assertEqual(len(self.captured_prompts()), 3)
 
-    def test_feedback_callback_is_context_only_and_rejects_nontext_results(self):
-        for options in ({"reply_feedback": lambda text: None},
-                        {"reply_feedback": lambda text: None, "cwd": self.root},
+    def test_feedback_callback_rejects_noncallable_or_nontext_results(self):
+        for options in ({"reply_feedback": "invalid"},
                         {"reply_feedback": "invalid", "cwd": self.root, "allow_tools": True}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 AcpModel([sys.executable], **options)
         with self.assertRaisesRegex(ModelFailure, "must be text or null"):
             self.invoke_feedback(callback=lambda text: 1)
         self.assertEqual(len(self.captured_prompts()), 1)
+
+    def test_closed_feedback_reuses_session_without_granting_tools_or_host_capabilities(self):
+        feedback = "Correct the response format using the same supplied materials."
+        callback = Mock(return_value=feedback)
+        result, stage = self.invoke_feedback("fenced_first", callback=callback, closed=True)
+        self.assertEqual(result, {"accepted": True})
+        callback.assert_called_once_with('```json\n{"accepted":false}\n```')
+        requests = [json.loads(line) for line in self.capture.read_text().splitlines()]
+        self.assertEqual([request.get("method") for request in requests],
+                         ["initialize", "session/new", "session/prompt", "session/prompt"])
+        capabilities = requests[0]["params"]["clientCapabilities"]
+        self.assertFalse(capabilities.get("terminal", False))
+        self.assertFalse(capabilities.get("fs", {}).get("readTextFile", False))
+        self.assertFalse(capabilities.get("fs", {}).get("writeTextFile", False))
+        self.assertEqual(requests[1]["params"]["mcpServers"], [])
+        self.assertNotEqual(requests[1]["params"]["cwd"], str(self.root))
+        prompts = self.captured_prompts()
+        self.assertEqual([prompt["params"]["sessionId"] for prompt in prompts], ["feedback-session"] * 2)
+        self.assertEqual(prompts[1]["params"]["prompt"], [{"type": "text", "text": feedback}])
+        self.assertEqual((stage / "instructions.txt").read_text(), _INSTRUCTIONS)
+        events = [json.loads(line) for line in (stage / "events.jsonl").read_text().splitlines()]
+        self.assertEqual(sum(event["type"] == "answer/provisional" for event in events), 1)
+        self.assertFalse(any(event.get("category") == "tool" for event in events))
+
+    def test_closed_feedback_keeps_final_json_strict_and_stops_after_second_turn(self):
+        for mode, final in (("fenced_final", '```json\n{"accepted":true}\n```'),
+                            ("schema_final", '{"accepted":"yes"}')):
+            before = len(self.captured_prompts()) if self.capture.exists() else 0
+            callback = Mock(return_value="Return only the requested JSON object.")
+            with self.subTest(mode=mode), self.assertRaises(ModelFailure):
+                self.invoke_feedback(mode, callback=callback, closed=True)
+            callback.assert_called_once_with('{"accepted":false}')
+            self.assertEqual(len(self.captured_prompts()) - before, 2)
+            self.assertEqual((self.root / ("closed_" + mode) / "attempt" / "output.json").read_text(), final)
+
+    def test_closed_feedback_cannot_repair_permission_tool_or_incomplete_turns(self):
+        for mode, turns in (("tool_first", 1), ("tool_second", 2), ("permission", 1),
+                            ("second_permission", 2), ("read", 1), ("second_read", 2),
+                            ("write", 1), ("second_write", 2), ("terminal", 1),
+                            ("second_terminal", 2), ("refusal", 1), ("max_tokens", 1),
+                            ("cancelled", 1), ("empty", 1), ("provider_error", 1)):
+            before = len(self.captured_prompts()) if self.capture.exists() else 0
+            callback = Mock(return_value="Correct the response format.")
+            with self.subTest(mode=mode), self.assertRaises(ModelFailure):
+                self.invoke_feedback(mode, callback=callback, closed=True)
+            self.assertEqual(callback.call_count, turns - 1)
+            self.assertEqual(len(self.captured_prompts()) - before, turns)
+
+    def test_closed_feedback_uses_one_total_timeout_for_both_turns(self):
+        callback = Mock(return_value="Correct the response format.")
+        started = time.monotonic()
+        with self.assertRaisesRegex(ModelFailure, "timed out"):
+            self.invoke_feedback("total_timeout", callback=callback, timeout=0.75, closed=True)
+        self.assertLess(time.monotonic() - started, 2)
+        callback.assert_called_once_with('{"accepted":false}')
+        self.assertEqual(len(self.captured_prompts()), 2)
 
     def test_custom_instructions_are_saved_and_sent(self):
         _, stage = self.invoke(instructions="Use the supplied frozen evidence.")

@@ -195,8 +195,8 @@ class AcpModel:
                                                   or any(not isinstance(key, str) or not key or "\0" in key
                                                          for key in startup_metadata_path)):
             raise ValueError("startup_metadata_path must be a nonempty tuple of metadata field names or null")
-        if reply_feedback is not None and (not callable(reply_feedback) or not allow_tools or cwd is None):
-            raise ValueError("reply_feedback requires a callable, context tools and a supplied frozen view directory")
+        if reply_feedback is not None and not callable(reply_feedback):
+            raise ValueError("reply_feedback must be callable or null")
         self.command = list(command)
         self.model = model
         self.timeout = timeout
@@ -221,7 +221,8 @@ class AcpModel:
 
         模型仅在明确选择时覆盖；选择使用 Agent 公布的配置项，不把某一家模型名写入协议层。
         SDK 负责 ACP 帧和消息类型，本文本、完成状态及后续结果校验决定能否收取回答。
-        上下文调用方可把首轮非空正文的格式或交付缺口原样反馈一次；两轮共用原生会话和外层总超时。
+        调用方可把首轮非空正文的格式或交付缺口反馈一次；两轮共用原生会话和外层总超时。
+        反馈不会授予工具权限，封闭材料核对可重交回答而不必开放额外资料或重启审核。
         第二轮正文仍交由原有 JSON、结构及调用方交付校验决定结果，不把反馈发出当成缺口已补齐。
         """
         from acp import PROTOCOL_VERSION, connect_to_agent
@@ -239,7 +240,7 @@ class AcpModel:
             servers = [McpServerStdio.model_validate(server) for server in self.mcp_servers]
             session = await connection.new_session(cwd=str(work_root), mcp_servers=servers)
             client.start_session(session.session_id, session.field_meta)
-            # 只记录本次冻结视图的位置，供交付核验把原生读取路径绑定到此会话，不记录认证环境。
+            # 只记录本次会话的工作目录；上下文交付核验据此绑定读取路径，不记录认证环境。
             client.record("session/new", session=session.model_dump(mode="json", by_alias=True, exclude_none=True),
                           cwd=str(work_root))
             if self.model is not None:

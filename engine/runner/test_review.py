@@ -2079,5 +2079,181 @@ class IsolatedReviewTests(unittest.TestCase):
                 installed.write_bytes(original)
 
 
+class FixtureReplyFeedbackTests(unittest.TestCase):
+    """FixtureReplyFeedbackTests() 验证回包可重交而固定判断、引用和缓存验收不放宽。"""
+
+    def setUp(self):
+        import review
+
+        self.runner = review
+        self.snapshot = "frozen-fixture-snapshot"
+        self.path = ".clarity/current/cases/empty-input.md"
+        self.document = {"text": CASE}
+        self.rules = {"rules.md": {"text": "Guard empty input before indexing values.\n"}}
+        self.expected = review.fixture_expectations(self.path, self.document)
+        self.temporary = tempfile.TemporaryDirectory(prefix="clarity-fixture-feedback-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.texts = {"workflow.md": "Fixture transport test.", "prompts/fixtures.md": "Use the fixed expectations."}
+
+    def result(self):
+        """result() 用既有测试材料构造可被原固定案例校验器独立验收的回答。"""
+        lines = CASE.splitlines()
+        checks = []
+        for identifier, expectation in self.expected.items():
+            line = next(number for number in range(expectation["start_line"], expectation["end_line"] + 1)
+                        if lines[number - 1].strip())
+            checks.append({"id": identifier, "matches": True, "case_line": line,
+                           "case_quote": lines[line - 1], "rule_path": "rules.md", "rule_line": 1,
+                           "rule_quote": self.rules["rules.md"]["text"].strip(),
+                           "reason": "The original fixed expectation is supported by the supplied rule."})
+        return {"snapshot_id": self.snapshot, "case_path": self.path, "status": "matched", "checks": checks,
+                "summary": "Fixed transport test result.", "incomplete_reason": ""}
+
+    def feedback(self, result):
+        return self.runner.make_fixture_reply_feedback(
+            self.snapshot, self.path, self.document, self.rules, self.expected)(
+                result if isinstance(result, str) else json.dumps(result, ensure_ascii=False))
+
+    def model(self, first, final=None):
+        """model() 模拟一次调用里的首答与唯一续答，不替生产 ACP 测试证明原生会话传输。"""
+        class Model:
+            calls = 0
+            feedback = None
+
+            def run(transport, prompt, schema, stage_dir, *, reply_feedback):
+                transport.calls += 1
+                transport.feedback = reply_feedback(json.dumps(first, ensure_ascii=False))
+                return final if transport.feedback is not None else first
+
+        return Model()
+
+    def run_fixture(self, model):
+        return self.runner.run_fixture(model, self.directory, "fixture-0001", self.snapshot, self.path,
+                                       self.document, self.rules, "adopted", [], self.texts, {})
+
+    def duplicate_result(self):
+        """duplicate_result() 保留同 ID 的两个不同引文，复现真实故障而非复制完全相同的数组元素。"""
+        result = self.result()
+        second = {**result["checks"][-1], "case_line": len(CASE.splitlines()),
+                  "case_quote": CASE.splitlines()[-1], "reason": "A second distinct boundary quotation."}
+        result["checks"].append(second)
+        return result
+
+    def test_duplicate_boundary_can_be_resubmitted_without_mutating_first_reply(self):
+        first = self.duplicate_result()
+        original = json.dumps(first, sort_keys=True)
+        final = self.result()
+        model = self.model(first, final)
+        self.assertEqual(self.run_fixture(model), final)
+        self.assertEqual(model.calls, 1)
+        self.assertIn('"boundary": 2', model.feedback)
+        self.assertIn('"boundary": 1', model.feedback)
+        self.assertIn("does not require matched", model.feedback)
+        self.assertEqual(json.dumps(first, sort_keys=True), original)
+        self.assertEqual(json.loads((self.directory / "fixture-0001/validated.json").read_text()), final)
+
+    def test_missing_or_unknown_id_receives_accounting_feedback(self):
+        missing = self.result()
+        missing["checks"].pop()
+        unknown = self.result()
+        unknown["checks"][-1]["id"] = "not-an-expectation"
+        for result in (missing, unknown):
+            with self.subTest(ids=[item["id"] for item in result["checks"]]):
+                feedback = self.feedback(result)
+                self.assertIn("Each expected ID must appear exactly once", feedback)
+                self.assertIn("actual ID counts", feedback)
+                self.assertLess(len(feedback), 8000)
+
+    def test_strict_json_or_schema_error_gets_format_feedback(self):
+        malformed = "```json\n" + json.dumps(self.result()) + "\n```"
+        repeated_key = '{"status":"matched","status":"matched"}'
+        missing_field = self.result()
+        del missing_field["checks"][0]["reason"]
+        for result in (malformed, repeated_key, [], missing_field):
+            with self.subTest(result=result):
+                self.assertIn("could not be accepted", self.feedback(result))
+
+    def test_valid_mismatch_and_explicit_incomplete_are_not_retried(self):
+        mismatch = self.result()
+        mismatch["status"] = "mismatched"
+        mismatch["checks"][0]["matches"] = False
+        model = self.model(mismatch)
+        self.assertEqual(self.run_fixture(model), mismatch)
+        self.assertIsNone(model.feedback)
+        incomplete = self.result()
+        incomplete.update(status="incomplete", checks=[], incomplete_reason="The supplied evidence is insufficient.")
+        self.assertIsNone(self.feedback(incomplete))
+        with self.assertRaisesRegex(self.runner.Incomplete, "supplied evidence is insufficient"):
+            self.runner.validate_fixture(incomplete, self.snapshot, self.path, self.document, self.rules, self.expected)
+
+    def test_wrong_identity_bad_evidence_or_inconsistent_status_are_not_repaired(self):
+        mutations = [
+            lambda result: result.update(snapshot_id="another-snapshot"),
+            lambda result: result.update(case_path="another-case.md"),
+            lambda result: result["checks"][0].update(case_quote="not original text"),
+            lambda result: result["checks"][0].update(rule_path="not-selected.md"),
+            lambda result: result["checks"][0].update(case_line=1, case_quote=CASE.splitlines()[0]),
+            lambda result: result["checks"][0].update(matches=False),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                result = self.result()
+                mutate(result)
+                self.assertIsNone(self.feedback(result))
+                with self.assertRaises(self.runner.Incomplete):
+                    self.runner.validate_fixture(result, self.snapshot, self.path, self.document, self.rules, self.expected)
+
+    def test_second_invalid_answer_is_rejected_without_a_validated_cache(self):
+        for bad_final in (self.duplicate_result(), self.result()):
+            if len(bad_final["checks"]) == len(self.expected):
+                bad_final["checks"][0]["case_quote"] = "not an original quotation"
+            with self.subTest(final=bad_final):
+                model = self.model(self.duplicate_result(), bad_final)
+                with self.assertRaises(self.runner.Incomplete):
+                    self.run_fixture(model)
+                self.assertEqual(model.calls, 1)
+                self.assertIsNotNone(model.feedback)
+                self.assertFalse((self.directory / "fixture-0001/validated.json").exists())
+
+    def test_resubmitted_mismatch_keeps_its_verdict(self):
+        final = self.result()
+        final["status"] = "mismatched"
+        final["checks"][0]["matches"] = False
+        model = self.model(self.duplicate_result(), final)
+        self.assertEqual(self.run_fixture(model), final)
+        self.assertIsNotNone(model.feedback)
+        self.assertFalse(final["checks"][0]["matches"])
+
+    def test_resubmitted_incomplete_keeps_the_stage_unfinished(self):
+        final = self.result()
+        final.update(status="incomplete", checks=[], incomplete_reason="The evidence remains insufficient.")
+        model = self.model(self.duplicate_result(), final)
+        with self.assertRaisesRegex(self.runner.Incomplete, "evidence remains insufficient"):
+            self.run_fixture(model)
+        self.assertIsNotNone(model.feedback)
+        self.assertFalse((self.directory / "fixture-0001/validated.json").exists())
+
+    def test_feedback_does_not_echo_unbounded_unknown_ids(self):
+        result = self.result()
+        result["checks"][-1]["id"] = "x" * 10000
+        feedback = self.feedback(result)
+        self.assertLess(len(feedback), 8000)
+        self.assertNotIn("x" * 10000, feedback)
+        self.assertIn("original input", feedback)
+
+    def test_cached_result_is_revalidated_without_new_feedback_or_model_call(self):
+        first = self.model(self.result())
+        self.run_fixture(first)
+        cached = self.model(self.duplicate_result(), self.result())
+        self.assertEqual(self.run_fixture(cached), self.result())
+        self.assertEqual(cached.calls, 0)
+        target = self.directory / "fixture-0001/validated.json"
+        target.write_text(json.dumps(self.duplicate_result()))
+        with self.assertRaises(self.runner.Incomplete):
+            self.run_fixture(cached)
+        self.assertEqual(cached.calls, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
