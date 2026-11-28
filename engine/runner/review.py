@@ -419,6 +419,34 @@ def record_context_result(attempt, key, prompt, result, accounted, source="model
     return record
 
 
+def finding_reference_feedback(failure, output, files, rules, *, candidate_files=None, principles=None):
+    """finding_reference_feedback() 只为原校验器首先报告的已授权原文位置或引文错误生成重读提示。
+
+    精确匹配原错误与已有路径，不复制行号/引文判定，也不替 Agent 改行号或摘引；未授权资料仍直接拒收。
+    首错之后可能还有其他错误，重交整答仍须经过原 validate 与 account_for，不以重读或撤回指令保证通过。
+    """
+    allowed_files = set(files) | set(candidate_files or {})
+    for issue in output["findings"]:
+        issue_rules = principles if principles is not None and issue["category"] == "writing_quality" else rules
+        if issue["path"] not in allowed_files or issue["rule_path"] not in issue_rules:
+            return None
+    for issue in output["findings"]:
+        for path in (issue["path"], issue["rule_path"]):
+            for error, kind in (
+                    ('Finding has no valid code or rule location: ', "location"),
+                    ('Finding quotation differs from snapshot text: ', "quotation")):
+                if str(failure) != tr(error) + path:
+                    continue
+                quoted_path = json.dumps(path, ensure_ascii=False)
+                where = " for frozen path " + quoted_path if len(quoted_path) <= 400 else ""
+                return ("Original-source validation rejected a finding's " + kind + where + ". "
+                        "Re-read the frozen source and supplied formal rules, then check the original line numbers "
+                        "and exact quotations. Correct the citation or withdraw the finding if the sources do not "
+                        "support it; do not edit the source or invent an excerpt. Return one complete response "
+                        "under the original JSON schema. A correction does not require a clear verdict.")
+    return None
+
+
 def run_stage(model, directory, name, prompt, snapshot, expected, files, rules, *, candidate_files=None, principles=None,
               context=None, previous_findings=None, retained_results=None):
     """run_stage() 复用已完成的同任务结果，重取时显式交回本阶段未解除的已核验发现。
@@ -533,16 +561,23 @@ def run_stage(model, directory, name, prompt, snapshot, expected, files, rules, 
         def reply_feedback(text):
             """reply_feedback() 在反馈前保留首轮有效发现，续接失败或审计损坏都不能抹去这些原文证据。
 
-            无效 JSON、结构或引用不进入已核验记录；反馈只补取材或原结构协议，不授权业务裁决。
+            无效 JSON、结构或引用不进入已核验记录；原校验器先报的已授权位置/引文错误可要求原会话重读。
+            身份、状态及其他判断错误不新增引用提示；原格式/取材反馈仍保持，重交不授权业务裁决或要求 clear。
             第二回合沿用原会话，因此保存首提示及单独的反馈和协议引用，不冒充另一份独立初审。
             """
             nonlocal first_result, first_error, result_attempt, feedback_sent
+            reference_feedback = None
             try:
                 candidate = _load_json(text)
                 jsonschema.Draft202012Validator(schema()).validate(candidate)
-                first_result = validate(candidate, snapshot, expected, files, rules,
-                                        candidate_files=candidate_files, principles=principles)
-            except (ValueError, RecursionError, jsonschema.ValidationError, Incomplete, TypeError, KeyError):
+                try:
+                    first_result = validate(candidate, snapshot, expected, files, rules,
+                                            candidate_files=candidate_files, principles=principles)
+                except Incomplete as failure:
+                    reference_feedback = finding_reference_feedback(failure, candidate, files, rules,
+                                                                    candidate_files=candidate_files, principles=principles)
+                    first_result = None
+            except (ValueError, RecursionError, jsonschema.ValidationError, TypeError, KeyError):
                 first_result = None
             if first_result is not None:
                 first_error = retain_turn(first_result, attempt)
@@ -553,6 +588,12 @@ def run_stage(model, directory, name, prompt, snapshot, expected, files, rules, 
                 if first_result is not None and first_error is None:
                     save_turn(first_result)
                 raise
+            if reference_feedback:
+                # 取材反馈已限制为 7700 字符；引用诊断过长时只省略路径细节，不截断缺口坐标或原文。
+                if len(feedback or "") + len(reference_feedback) + 1 > 7800:
+                    reference_feedback = ("Re-read finding locations and quotations in the frozen view; "
+                                          "correct or withdraw unsupported findings.")
+                feedback = "\n".join(item for item in (feedback, reference_feedback) if item)
             if feedback is not None and feedback.strip():
                 if first_result is not None and first_error is None:
                     save_turn(first_result)

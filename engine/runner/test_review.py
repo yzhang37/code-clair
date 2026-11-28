@@ -72,7 +72,9 @@ if "code_context" in packet:
             partial = (path == "edited.py" and retry_behavior is None
                        and (mode == "delivery_partial_" + stage
                             or (mode in {"feedback_complete_" + stage, "feedback_drop_" + stage,
-                                         "feedback_failure_" + stage} and native_turn == 1)))
+                                         "feedback_failure_" + stage, "feedback_quote_combined_" + stage,
+                                         "feedback_abstain_delivery_" + stage}
+                                and native_turn == 1)))
             cursor = {"start_line": 1, "start_column": 1}
             pieces = []
             while True:
@@ -91,7 +93,7 @@ if "code_context" in packet:
             context[version][path] = "".join(pieces)
     context_audit = [json.loads(line) for line in audit_path.read_text().splitlines()[audit_start:]]
     with audit_path.open("a") as audit:
-        if mode == "feedback_invalid_audit_" + stage:
+        if mode in {"feedback_invalid_audit_" + stage, "feedback_quote_invalid_audit_" + stage}:
             audit.write("invalid audit record\n")
     current_files = {path: "\n".join(f"{number}: {line}" for number, line in enumerate(text.splitlines(), 1))
                      for path, text in context["current"].items()}
@@ -195,6 +197,29 @@ if retry_behavior in {"drop", "resolved", "replace_with_new"}:
     result["status"] = "issues" if result["findings"] else "clear"
     result["unresolved_ids"] = [item["id"] for item in result["findings"]]
     result["current_category"] = result["findings"][0]["category"] if result["findings"] else ""
+if retry_behavior == "quote_then_drop":
+    if native_turn == 1:
+        result["findings"][0]["line"] = 1
+    else:
+        result.update(findings=[], resolved=[], unresolved_ids=[], status="clear", current_category="")
+if mode in {"feedback_quote_" + stage, "feedback_quote_combined_" + stage,
+            "feedback_quote_invalid_audit_" + stage, "feedback_quote_wrong_input_" + stage,
+            "feedback_quote_wrong_status_" + stage, "feedback_quote_rule_permission_" + stage} and native_turn == 1:
+    result["findings"][0]["line"] = 1
+    if mode == "feedback_quote_wrong_input_" + stage:
+        result["snapshot_id"] = "wrong-snapshot"
+    elif mode == "feedback_quote_wrong_status_" + stage:
+        result["status"] = "clear"
+    elif mode == "feedback_quote_rule_permission_" + stage:
+        result["findings"][0]["rule_path"] = "unadopted-rule.md"
+if mode == "feedback_quote_location_" + stage and native_turn == 1:
+    result["findings"][0]["line"] = 10000
+if mode == "feedback_quote_always_" + stage:
+    result["findings"][0]["line"] = 1
+if mode == "feedback_abstain_delivery_" + stage and native_turn == 1:
+    result.update(status="incomplete", incomplete_reason="The original source delivery is incomplete.")
+if mode == "feedback_bad_status_" + stage and native_turn == 1:
+    result["status"] = "not-a-status"
 if health and mode == "health_clear":
     result["status"] = "clear"
 if health and mode == "health_missing_fixture":
@@ -694,6 +719,101 @@ class IsolatedReviewTests(unittest.TestCase):
         self.assertEqual([record["accounted"] for record in records], [True, False])
         self.assertTrue(records[0]["result"]["findings"])
         self.assertEqual(records[1]["result"]["findings"], [])
+
+    def test_same_session_feedback_repairs_original_line_or_quote_after_complete_delivery(self):
+        """test_same_session_feedback_repairs_original_line_or_quote_after_complete_delivery() 取得全文仍有引文错位时只重交回答，首答不写有效缓存。"""
+        self.install()
+        for mode in ("feedback_quote_reviewer-1", "feedback_quote_location_reviewer-1",
+                     "feedback_quote_combined_reviewer-1"):
+            with self.subTest(mode=mode):
+                self.set_mode(mode)
+                completed = self.review()
+                self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+                calls = sorted((call for call in self.calls(mode) if call["stage"] == "reviewer-1"),
+                               key=lambda call: call["native_turn"])
+                self.assertEqual([call["native_turn"] for call in calls], [1, 2])
+                self.assertIn("Original-source validation rejected", calls[1]["native_feedback"])
+                self.assertIn("correct", calls[1]["native_feedback"].lower())
+                self.assertIn("withdraw", calls[1]["native_feedback"])
+                self.assertLessEqual(len(calls[1]["native_feedback"]), 8000)
+                if "combined" in mode:
+                    self.assertIn("Source delivery is incomplete", calls[1]["native_feedback"])
+                run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+                records = list((run / "reviewer-1").glob("attempt-*/validated-stage.json"))
+                self.assertEqual(len(records), 1)
+                self.assertTrue(records[0].parent.name.endswith("-turn-2"))
+                event_path = next((run / "reviewer-1").glob("attempt-*/events.jsonl"))
+                events = [json.loads(line) for line in event_path.read_text().splitlines()]
+                provisional = next(event for event in events if event["type"] == "answer/provisional")
+                self.assertIn('"line": 1' if "location" not in mode else '"line": 10000', provisional["text"])
+
+    def test_same_session_reference_repair_still_rejects_bad_second_reply(self):
+        """test_same_session_reference_repair_still_rejects_bad_second_reply() 第二答仍错位则保持未完成，不把反馈记录当作已修好。"""
+        self.install()
+        self.set_mode("feedback_quote_always_reviewer-1")
+        completed = self.review()
+        self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+        calls = [call for call in self.calls() if call["stage"] == "reviewer-1"]
+        self.assertEqual(sorted(call["native_turn"] for call in calls), [1, 2])
+        run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+        self.assertFalse((run / "reviewer-1/validated.json").exists())
+        self.assertEqual(list((run / "reviewer-1").glob("attempt-*/validated-stage.json")), [])
+
+    def test_reference_repair_preserves_existing_abstention_delivery_and_schema_feedback(self):
+        """test_reference_repair_preserves_existing_abstention_delivery_and_schema_feedback() 引文增量不收紧原有未完取材续接或结构格式纠正。"""
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        for mode in ("feedback_abstain_delivery_reviewer-1", "feedback_bad_status_reviewer-1"):
+            with self.subTest(mode=mode):
+                self.set_mode(mode)
+                completed = self.review()
+                self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+                calls = sorted((call for call in self.calls(mode) if call["stage"] == "reviewer-1"),
+                               key=lambda call: call["native_turn"])
+                self.assertEqual([call["native_turn"] for call in calls], [1, 2])
+                self.assertNotIn("Original-source validation rejected", calls[1]["native_feedback"])
+                expected = ("Source delivery is incomplete" if "abstain_delivery" in mode
+                            else "failed strict JSON/object/response-schema validation")
+                self.assertIn(expected, calls[1]["native_feedback"])
+
+    def test_same_session_reference_repair_does_not_hide_corrupt_audit_or_identity_errors(self):
+        """test_same_session_reference_repair_does_not_hide_corrupt_audit_or_identity_errors() 引文错误不能替审计、输入身份、状态或资料权限的失败开重试后门。"""
+        self.install()
+        for mode in ("feedback_quote_invalid_audit_reviewer-1", "feedback_quote_wrong_input_reviewer-1",
+                     "feedback_quote_wrong_status_reviewer-1", "feedback_quote_rule_permission_reviewer-1"):
+            with self.subTest(mode=mode):
+                self.set_mode(mode)
+                completed = self.review()
+                self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+                calls = [call for call in self.calls(mode) if call["stage"] == "reviewer-1"]
+                self.assertEqual([call["native_turn"] for call in calls], [1])
+                run = Path(json.loads((self.state / "latest.json").read_text())["run"])
+                self.assertEqual(list((run / "reviewer-1").glob("attempt-*/feedback.txt")), [])
+                self.assertFalse((run / "reviewer-1/validated.json").exists())
+
+    def test_quote_repair_cannot_drop_previously_verified_stage_findings(self):
+        """test_quote_repair_cannot_drop_previously_verified_stage_findings() 无效新首答不解除旧发现，续答仍须由原 account_for 拒绝漏交代。"""
+        self.environment["CLARITY_LANG"] = "en"
+        self.install()
+        self.write("edited.py", "VERSION = 2\n")
+        self.git("add", "edited.py")
+        self.set_mode("delivery_partial_reviewer-1")
+        self.assertEqual(self.review().returncode, 2)
+        before = self.latest_result()
+        settings = json.loads(self.fixture_path.read_text())
+        settings.update(retry_stage="reviewer-1", retry_behavior="quote_then_drop")
+        self.fixture_path.write_text(json.dumps(settings))
+        completed = self.review()
+        self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+        after = self.latest_result()
+        self.assertEqual(after["snapshot_id"], before["snapshot_id"])
+        self.assertEqual({item["id"] for item in after["findings"]}, {item["id"] for item in before["findings"]})
+        self.assertIn("omitted the disposition", after["incomplete_reason"])
+        retried = [call for call in self.calls() if call["retry_behavior"] == "quote_then_drop"]
+        self.assertEqual(sorted(call["native_turn"] for call in retried), [1, 2])
+        second = next(call for call in retried if call["native_turn"] == 2)
+        self.assertIn("Preserve or explicitly resolve", second["native_feedback"])
 
     def test_same_session_feedback_failure_or_invalid_audit_retains_first_valid_findings(self):
         """test_same_session_feedback_failure_or_invalid_audit_retains_first_valid_findings() 续接失败及反馈前损坏审计都保留已核验首轮证据。"""
